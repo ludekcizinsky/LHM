@@ -2644,11 +2644,9 @@ def create(
         SMPLX, MANO or FLAME
     """
 
-    # If it's a folder, assume
-    if osp.isdir(model_path):
-        model_path = os.path.join(model_path, model_type)
-    else:
-        model_type = osp.basename(model_path).split("_")[0].lower()
+    # Hack: just hardcode the model path for now
+    model_path_all = "/scratch/izar/cizinsky/pretrained/pretrained_models/human_model_files"
+    model_path = os.path.join(model_path_all, model_type)
 
     if model_type.lower() == "smpl":
         return SMPL(model_path, **kwargs)

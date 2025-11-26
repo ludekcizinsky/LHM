@@ -52,7 +52,7 @@ except Exception as e:
 
 
 class AutoModelQuery:
-    def __init__(self, save_dir='./pretrained_models', hf_kwargs=None, ms_kwargs=None):
+    def __init__(self, save_dir='/scratch/izar/cizinsky/pretrained', hf_kwargs=None, ms_kwargs=None):
         """
         :param save_dir: Base directory to store models.
         """

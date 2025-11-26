@@ -15,9 +15,10 @@
 
 import argparse
 import pdb
+import os
 
 from LHM.runners import REGISTRY_RUNNERS
-
+os.environ["HF_HOME"] = "/scratch/izar/cizinsky/.cache"
 
 def main():
 

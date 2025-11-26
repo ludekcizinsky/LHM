@@ -1,5 +1,9 @@
 #!/bin/bash
 # given pose sequence, generating animation video .
+# usage: bash inference.sh LHM-500M-HF train_data/example_imgs/14.JPG train_data/motion_video/mimo1/smplx_params
+
+source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
+conda activate lhm
 
 MODEL_NAME=LHM-1B
 IMAGE_INPUT="./train_data/example_imgs/"

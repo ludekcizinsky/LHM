@@ -317,7 +317,7 @@ class SMPLX_Mesh(object):
     def register_constrain_prior(self):
         """As video cannot provide insufficient supervision for the canonical space, we add some human prior to constrain the rotation. Although it is a trick, it is very effective."""
         constrain_body = np.load(
-            "./pretrained_models/voxel_grid/human_prior_constrain.npz"
+            "/scratch/izar/cizinsky/pretrained/pretrained_models/voxel_grid/human_prior_constrain.npz"
         )["masks"]
 
         self.constrain_body_vertex_idx = np.where(constrain_body > 0)[0]
@@ -533,7 +533,7 @@ class SMPLXVoxelMeshModel(nn.Module):
 
     def dense_sample(self, body_face_ratio, dense_sample_points):
 
-        buff_path = f"./pretrained_models/dense_sample_points/{self.cano_pose_type}_{dense_sample_points}.ply"
+        buff_path = f"/scratch/izar/cizinsky/pretrained/pretrained_models/dense_sample_points/{self.cano_pose_type}_{dense_sample_points}.ply"
 
         if os.path.exists(buff_path):
             dense_sample_pts, _ = load_ply(buff_path)
@@ -714,10 +714,10 @@ class SMPLXVoxelMeshModel(nn.Module):
         coordinates = coordinates.view(-1, 3).float()
         coordinates = coordinates.cuda()
 
-        if os.path.exists(f"./pretrained_models/voxel_grid/voxel_{voxel_size}.pth"):
+        if os.path.exists(f"/scratch/izar/cizinsky/pretrained/pretrained_models/voxel_grid/voxel_{voxel_size}.pth"):
             print(f"load voxel_grid voxel_{voxel_size}.pth")
             voxel_flat = torch.load(
-                os.path.join(f"pretrained_models/voxel_grid/voxel_{voxel_size}.pth"),
+                os.path.join(f"/scratch/izar/cizinsky/pretrained/pretrained_models/voxel_grid/voxel_{voxel_size}.pth"),
                 map_location=avaliable_device(),
             )
         else:
@@ -727,7 +727,7 @@ class SMPLXVoxelMeshModel(nn.Module):
 
             torch.save(
                 voxel_flat,
-                os.path.join(f"pretrained_models/voxel_grid/voxel_{voxel_size}.pth"),
+                os.path.join(f"/scratch/izar/cizinsky/pretrained/pretrained_models/voxel_grid/voxel_{voxel_size}.pth"),
             )
 
         N, LBS_F = voxel_flat.shape

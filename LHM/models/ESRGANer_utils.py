@@ -385,7 +385,7 @@ class IOConsumer(threading.Thread):
 
 class ESRGANEasyModel:
     def __init__(
-        self, model_path="./pretrained_models/RealESRGAN_x4plus.pth", face_enhance=True
+        self, model_path="/scratch/izar/cizinsky/pretrained/pretrained_models/RealESRGAN_x4plus.pth", face_enhance=True
     ):
         model = RRDBNet(
             num_in_ch=3,

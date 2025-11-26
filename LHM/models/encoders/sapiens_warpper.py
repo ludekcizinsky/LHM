@@ -135,6 +135,8 @@ class SapiensWrapper(nn.Module):
         antialias: bool = True,
     ):
         super().__init__()
+        # todo: hack, not sure where to specify the model path
+        model_name = "/scratch/izar/cizinsky/pretrained/pretrained_models/sapiens/pretrained/checkpoints/sapiens_1b/sapiens_1b_epoch_173_torchscript.pt2"
         self.model = self._build_sapiens(model_name)
         self.resolution = resolution
 

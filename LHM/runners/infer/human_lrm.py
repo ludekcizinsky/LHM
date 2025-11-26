@@ -24,6 +24,7 @@ from engine.SegmentAPI.base import Bbox
 # from LHM.utils.model_download_utils import AutoModelQuery
 from LHM.utils.model_download_utils import AutoModelQuery
 
+from rembg import remove
 try:
     from engine.SegmentAPI.SAM import SAM2Seg
 except:
@@ -55,11 +56,12 @@ from LHM.utils.model_card import MODEL_CARD, MODEL_CONFIG
 
 
 def download_geo_files():
-    if not os.path.exists('./pretrained_models/dense_sample_points/1_20000.ply'):
-        download_from_url('https://virutalbuy-public.oss-cn-hangzhou.aliyuncs.com/share/aigc3d/data/LHM/1_20000.ply','./pretrained_models/dense_sample_points/')
+    if not os.path.exists('/scratch/izar/cizinsky/pretrained/dense_sample_points/1_20000.ply'):
+        os.makedirs('/scratch/izar/cizinsky/pretrained/dense_sample_points/', exist_ok=True)
+        download_from_url('https://virutalbuy-public.oss-cn-hangzhou.aliyuncs.com/share/aigc3d/data/LHM/1_20000.ply','/scratch/izar/cizinsky/pretrained/dense_sample_points/')
 
 def prior_check():
-    if not os.path.exists('./pretrained_models'):
+    if not os.path.exists('/scratch/izar/cizinsky/pretrained'):
         prior_data = MODEL_CARD['prior_model']
         download_extract_tar_from_url(prior_data)
 
@@ -304,7 +306,7 @@ def parse_configs():
         model_name = cli_cfg.model_name
         model_path= query_model.query(model_name) 
         cli_cfg.model_name = model_path 
-    
+
     model_config = query_model_config(model_name)
 
     if model_config is not None:
@@ -368,11 +370,11 @@ class HumanLRMInferrer(Inferrer):
         prior_check()
 
         self.facedetect = FaceDetector(
-            "./pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
+            "/scratch/izar/cizinsky/pretrained/pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
             device=avaliable_device(),
         )
         self.pose_estimator = PoseEstimator(
-            "./pretrained_models/human_model_files/", device=avaliable_device()
+            "/scratch/izar/cizinsky/pretrained/pretrained_models/human_model_files/", device=avaliable_device()
         )
         try:
             self.parsingnet = SAM2Seg()

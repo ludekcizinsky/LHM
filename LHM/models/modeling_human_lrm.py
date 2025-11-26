@@ -70,6 +70,7 @@ class ModelHumanLRM(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        human_model_path = "/scratch/izar/cizinsky/pretrained/pretrained_models/human_model_files"
 
         self.gradient_checkpointing = tf_grad_ckpt
         self.encoder_gradient_checkpointing = encoder_grad_ckpt
