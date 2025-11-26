@@ -1115,9 +1115,11 @@ class GS3DRenderer(nn.Module):
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=torch.float32):
                 # print(smplx_data["betas"].shape, smplx_data["face_offset"].shape, smplx_data["joint_offset"].shape)
-                positions, _, transform_mat_neutral_pose = (
+                positions, pos_wo_upsample, transform_mat_neutral_pose = (
                     self.smplx_model.get_query_points(smplx_data, device=device)
                 )  # [B, N, 3]
+                print(f"[DEBUG] query points num after upsample: {positions.shape} query pts before upsample: {pos_wo_upsample.shape}")
+
         smplx_data["transform_mat_neutral_pose"] = (
             transform_mat_neutral_pose  # [B, 55, 4, 4]
         )
@@ -1372,6 +1374,7 @@ class GS3DRenderer(nn.Module):
         N_view = smplx_data["root_pose"].shape[1]
 
         for b in range(batch_size):
+            # step 1: animate gs model = canonical -> posed view
             gs_attr = gs_attr_list[b]
             query_pt = query_points[b]
             # len(animatable_gs_model_list) = num_view
@@ -1386,7 +1389,7 @@ class GS3DRenderer(nn.Module):
 
             assert len(animatable_gs_model_list) == c2w.shape[1]
 
-            # gs render animated gs model.
+            # step 2: gs render animated gs model = posed view -> render image
             out_list.append(
                 self.forward_single_batch(
                     animatable_gs_model_list,

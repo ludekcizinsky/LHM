@@ -6,6 +6,6 @@ conda activate lhm
 cd /home/cizinsky/LHM
 
 video_path=$1
-output_path=/home/cizinsky/LHM/train_data/custom_motion
+output_path=$2/motion
 mkdir -p $output_path
 python engine/pose_estimation/video2motion.py --video_path $video_path --output_path $output_path --visualize

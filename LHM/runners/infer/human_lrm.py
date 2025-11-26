@@ -9,6 +9,7 @@ import argparse
 import os
 import pdb
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -284,6 +285,10 @@ def parse_configs():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--infer", type=str)
+    parser.add_argument(
+        "--save_dir",
+        type=Path
+    )
     args, unknown = parser.parse_known_args()
 
     cfg = OmegaConf.create()
@@ -360,6 +365,10 @@ class HumanLRMInferrer(Inferrer):
         super().__init__()
 
         self.cfg, cfg_train = parse_configs()
+        os.makedirs(self.cfg.save_dir, exist_ok=True)
+        print("----- Inference with config:")
+        print(OmegaConf.to_yaml(self.cfg))
+        print("-"*50)
 
         configure_logger(
             stream_level=self.cfg.logger,
@@ -638,6 +647,7 @@ class HumanLRMInferrer(Inferrer):
         aspect_standard = 5.0 / 3
         motion_img_need_mask = self.cfg.get("motion_img_need_mask", False)  # False
         vis_motion = self.cfg.get("vis_motion", False)  # False
+        print(f"[DEBUG] motion_img_need_mask: {motion_img_need_mask}, vis_motion: {vis_motion}")
 
 
         if self.parsingnet is not None:
@@ -662,10 +672,13 @@ class HumanLRMInferrer(Inferrer):
             multiply=14,
             need_mask=True,
         )
+
+        # prepare head image
+        print(f"[DEBUG] preparing head image for {image_path}")
         try:
             src_head_rgb = self.crop_face_image(image_path)
         except:
-            print("w/o head input!")
+            print("[WARNING] w/o head input!")
             src_head_rgb = np.zeros((112, 112, 3), dtype=np.uint8)
 
 
@@ -692,17 +705,29 @@ class HumanLRMInferrer(Inferrer):
             np.uint8
         )
         Image.fromarray(vis_ref_img).save(save_ref_img_path)
+        print(f"[DEBUG] saved refer image to {save_ref_img_path}")
+
+        # save head image for vis
+        save_head_img_path = os.path.join(
+            dump_tmp_dir, "head_" + os.path.basename(image_path)
+        )
+        vis_head_img = (src_head_rgb[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
+            np.uint8
+        )
+        Image.fromarray(vis_head_img).save(save_head_img_path)
+        print(f"[DEBUG] saved head image to {save_head_img_path}")
 
         # read motion seq
-
         motion_name = os.path.dirname(
             motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
         )
         motion_name = os.path.basename(motion_name)
 
         if motion_name in self.motion_dict:
+            print(f"[DEBUG] using cached motion sequence for {motion_name}")
             motion_seq = self.motion_dict[motion_name]
         else:
+            print(f"[DEBUG] preparing motion sequence for {motion_name}")
             motion_seq = prepare_motion_seqs(
                 motion_seqs_dir,
                 motion_img_dir,
@@ -718,8 +743,12 @@ class HumanLRMInferrer(Inferrer):
             )
             self.motion_dict[motion_name] = motion_seq
 
-        camera_size = len(motion_seq["motion_seqs"])
+        # TODO: save motion seq
+        motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
+        torch.save(motion_seq, motion_seq_save_path)
+        print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
 
+        # Infer canonical gs model and query points
         device = "cuda"
         dtype = torch.float32
         shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
@@ -739,10 +768,36 @@ class HumanLRMInferrer(Inferrer):
                 k: v.to(device) for k, v in smplx_params.items()
             },
         )
+        # TODO: save gs model, query points and transform_mat_neutral_pose
+        gs_model_save_path = Path(self.cfg.save_dir) / "gs_model_list.pt"
+        query_points_save_path = Path(self.cfg.save_dir) / "query_points.pt"
+        transform_mat_save_path = Path(self.cfg.save_dir) / "transform_mat_neutral_pose.pt"
+        torch.save(gs_model_list, gs_model_save_path)
+        torch.save(query_points, query_points_save_path)
+        torch.save(transform_mat_neutral_pose, transform_mat_save_path)
+        print(f"[DEBUG] saved gs model list to {gs_model_save_path}")
+        print(f"[DEBUG] saved query points to {query_points_save_path}")
+        print(f"[DEBUG] saved transform matrix to {transform_mat_save_path}")
 
+#         print(f"[DEBUG] render_c2ws shape: {motion_seq['render_c2ws'].shape}")
+        # print(f"[DEBUG] finished infer canonical gs model for {image_path}")
+        # print(f"[DEBUG] Len of gs_model_list: {len(gs_model_list)}")
+        # print(f"[DEBUG] First gs model type: {type(gs_model_list[0])}")
+        # print(f"[DEBUG] First gs model shape of offset xyz: {gs_model_list[0].offset_xyz.shape}")
+        # print(f"[DEBUG] First gs model shape of opacity: {gs_model_list[0].opacity.shape}")
+        # print(f"[DEBUG] First gs model shape of rotation: {gs_model_list[0].rotation.shape}")
+        # print(f"[DEBUG] First gs model shape of scaling: {gs_model_list[0].scaling.shape}")
+        # print(f"[DEBUG] First gs model shape of shs: {gs_model_list[0].shs.shape}")
+        # print(f"[DEBUG] First gs model use rgb: {gs_model_list[0].use_rgb}")
+        # print(f"[DEBUG] query_points shape: {query_points.shape}")
+        # print(f"[DEBUG] transform_mat_neutral_pose shape: {transform_mat_neutral_pose.shape}")
+        return 
+
+        # Use the motion sequence to animate the gs model and render video
         batch_list = [] 
         batch_size = 40  # avoid memeory out!
 
+        camera_size = len(motion_seq["motion_seqs"])
         for batch_i in range(0, camera_size, batch_size):
             with torch.no_grad():
                 # TODO check device and dtype
@@ -829,6 +884,8 @@ class HumanLRMInferrer(Inferrer):
                         image_paths.append(os.path.join(root, file))
             image_paths.sort()
 
+        print(f"[DEBUG] total {len(image_paths)} images to process. Path to the first image: {image_paths[0]}")
+
         # alloc to each DDP worker
         image_paths = image_paths[
             self.accelerator.process_index :: self.accelerator.num_processes
@@ -850,6 +907,7 @@ class HumanLRMInferrer(Inferrer):
 
             # setting config
             motion_seqs_dir = self.cfg.motion_seqs_dir
+            print(f"[DEBUG] motion_seqs_dir: {motion_seqs_dir}")
             motion_name = os.path.dirname(
                 motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
             )
@@ -872,8 +930,19 @@ class HumanLRMInferrer(Inferrer):
             os.makedirs(dump_image_dir, exist_ok=True)
             os.makedirs(dump_tmp_dir, exist_ok=True)
             os.makedirs(dump_mesh_dir, exist_ok=True)
+            print(f"[DEBUG] dump_video_path: {dump_video_path}")
+            print(f"[DEBUG] dump_image_dir: {dump_image_dir}")
+            print(f"[DEBUG] dump_mesh_dir: {dump_mesh_dir}")
+            print(f"[DEBUG] dump_tmp_dir: {dump_tmp_dir}")
 
             shape_pose = self.pose_estimator(image_path)
+            print(f"[DEBUG] estimated body ratio: {shape_pose.ratio}")
+            print(f"[DEBUG] estimated body shape parameters: {shape_pose.beta.shape}")
+
+            # TODO: save shape pose beta
+            beta_save_path = Path(self.cfg.save_dir) / "shape_params.npy"
+            np.save(beta_save_path, shape_pose.beta)
+            print(f"[DEBUG] saved shape parameters to {beta_save_path}")
 
             try:
                 assert shape_pose.ratio>0.4, f"body ratio is too small: {shape_pose.ratio}"
@@ -1090,7 +1159,6 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
             subdir_path = (
                 subdir_path[1:] if subdir_path.startswith("/") else subdir_path
             )
-            print("subdir_path and uid:", subdir_path, uid)
 
             # setting config
             motion_seqs_dir = self.cfg.motion_seqs_dir

@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from math import sqrt
+from pathlib import Path
 
 current_dir_path = os.path.dirname(__file__)
 sys.path.append(current_dir_path + "/../pose_estimation")
@@ -323,21 +324,23 @@ class Video2MotionPipeline:
         for frame in all_frames:
             self.keypoint_detector.track(frame, self.fps, len(all_frames))
         tracking_results = self.keypoint_detector.process(self.fps)
-        # note: only surpport pose estimation for one character
-        main_character = None
-        max_frame_length = -1
-        for _id in tracking_results.keys():
-            if len(tracking_results[_id]["frame_id"]) > max_frame_length:
-                max_frame_length = len(tracking_results[_id]["frame_id"])
-                main_character = _id
+        
+        all_bboxes = []
+        all_frame_ids = []
+        all_frames_tracked = []
+        for char_id in tracking_results.keys():
 
-        bboxes = tracking_results[main_character]["bbox"]
-        frame_ids = tracking_results[main_character]["frame_id"]
-        frames = [all_frames[i] for i in frame_ids]
-        assert not (bboxes[0][0] == 0 and bboxes[0][2] == 0)
+            bboxes = tracking_results[char_id]["bbox"]
+            frame_ids = tracking_results[char_id]["frame_id"]
+            frames = [all_frames[i] for i in frame_ids]
+            assert not (bboxes[0][0] == 0 and bboxes[0][2] == 0)
 
-        return bboxes, frame_ids, frames
+            all_bboxes.append(bboxes)
+            all_frame_ids.append(frame_ids)
+            all_frames_tracked.append(frames)
 
+        return all_bboxes, all_frame_ids, all_frames_tracked
+    
     def detect_keypoint2d(self, bboxes, frames):
         if self.kp_mode == "vitpose":
             keypoints, bboxes = self.keypoint_detector.batch_detection(bboxes, frames)
@@ -497,7 +500,7 @@ class Video2MotionPipeline:
             with open(os.path.join(out_path, f"{(i+1):05}.json"), "w") as fp:
                 json.dump(smplx_param, fp)
 
-    def __call__(self, video_path, output_path, is_file_only=False):
+    def __call__(self, video_path, output_path: Path):
         start = time.time()
         all_frames, raw_H, raw_W, fps, offset_w, offset_h = load_video(
             video_path, pad_ratio=self.pad_ratio, max_resolution=self.MAX_RESOLUTION
@@ -511,38 +514,34 @@ class Video2MotionPipeline:
         raw_K[..., 0, -1] = raw_W / 2
         raw_K[..., 1, -1] = raw_H / 2
 
-        bboxes, frame_ids, frames = self.track(all_frames)
-        bboxes, keypoints = self.detect_keypoint2d(bboxes, frames)
-        gc.collect()
-        torch.cuda.empty_cache()
+        all_bboxes, all_frame_ids, all_frames_tracked = self.track(all_frames)
+        track_id = 0
+        for bboxes, frame_ids, frames in zip(all_bboxes, all_frame_ids, all_frames_tracked):
+            print(f"Processing track {track_id:02} with {len(frame_ids)} frames.")
+            bboxes, keypoints = self.detect_keypoint2d(bboxes, frames)
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        poses, betas, transl, verts = self.estimate_pose(
-            frame_ids, frames, keypoints, bboxes, raw_K, video_length
-        )
-
-        if is_file_only:
-            output_folder = output_path
-        else:
-            output_folder = os.path.join(
-                output_path, video_path.split("/")[-1].split(".")[0]
-            )
-        os.makedirs(output_folder, exist_ok=True)
-
-        if self.visualize:
-            self.save_video(
-                all_frames, frame_ids, bboxes, keypoints, verts, raw_K, output_folder
+            poses, betas, transl, verts = self.estimate_pose(
+                frame_ids, frames, keypoints, bboxes, raw_K, video_length
             )
 
-        smplx_output_folder = os.path.join(output_folder, "smplx_params")
-        os.makedirs(smplx_output_folder, exist_ok=True)
-        self.save_results(
-            smplx_output_folder, frame_ids, poses, betas, transl, raw_K, (raw_W, raw_H)
-        )
-        duration = time.time() - start
-        print(f"{video_path} processing completed, duration: {duration:.2f}s")
+            output_folder = output_path / f"{track_id:02}"
+            os.makedirs(output_folder, exist_ok=True)
 
-        return smplx_output_folder
+            if self.visualize:
+                self.save_video(
+                    all_frames, frame_ids, bboxes, keypoints, verts, raw_K, output_folder
+                )
 
+            smplx_output_folder = os.path.join(output_folder, "smplx_params")
+            os.makedirs(smplx_output_folder, exist_ok=True)
+            self.save_results(
+                smplx_output_folder, frame_ids, poses, betas, transl, raw_K, (raw_W, raw_H)
+            )
+            duration = time.time() - start
+            print(f"{video_path} processing completed, duration: {duration:.2f}s. Results saved to {output_folder}.")
+            track_id += 1
 
 def get_parse():
     parser = argparse.ArgumentParser(description="")
@@ -599,4 +598,4 @@ if __name__ == "__main__":
         pad_ratio=opt.pad_ratio,
         fov=FOV,
     )
-    pipeline(opt.video_path, opt.output_path)
+    pipeline(opt.video_path, Path(opt.output_path))

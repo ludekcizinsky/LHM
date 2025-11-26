@@ -483,6 +483,7 @@ class ModelHumanLRM(nn.Module):
             image[:, 0], camera=None, query_points=query_points
         )  # [B, N, C]
 
+        # gs model list contains canonical pose gs model
         gs_model_list, query_points, smplx_params = self.renderer.forward_gs(
             gs_hidden_features=latent_points,
             query_points=query_points,
@@ -764,12 +765,14 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
 
         assert image.shape[0] == 1
 
+        # Geometry tokens
         query_points = None
         if self.latent_query_points_type.startswith("e2e_smplx"):
             query_points, smplx_params = self.renderer.get_query_points(
                 smplx_params, device=image.device
             )
 
+        # Image tokens
         latent_points, image_feats = self.forward_latent_points(
             image[:, 0], head_image[:, 0], camera=None, query_points=query_points
         )  # [B, N, C]
