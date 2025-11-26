@@ -42,6 +42,8 @@ class MultiHumanInferrer(Inferrer):
     def load_gs_model(self, root_gs_model_dir: Path):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         track_ids = os.listdir(root_gs_model_dir)
+        track_ids = sorted([track_id for track_id in track_ids if (root_gs_model_dir / track_id).is_dir()])
+        print(f"[DEBUG] Found {len(track_ids)} humans for inference: {track_ids}")
         self.all_model_list = []
         for track_id in track_ids:
             gs_model_dir = root_gs_model_dir / track_id
@@ -52,7 +54,7 @@ class MultiHumanInferrer(Inferrer):
             shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).unsqueeze(0).to(device)
             model = (gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_params)
             self.all_model_list.append(model)
-        print(f"Loaded GS models for {len(self.all_model_list)} humans.")
+        print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
 
     def infer_single(self, *args, **kwargs):
         pass
@@ -140,7 +142,8 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--gs_model_dir", type=Path)
     parser.add_argument("--save_dir", type=Path)
+    parser.add_argument("--track_id", type=int)
     args = parser.parse_args()
 
     inferrer = MultiHumanInferrer(gs_model_dir=args.gs_model_dir, save_dir=args.save_dir)
-    inferrer.infer(track_idx=0)
+    inferrer.infer(track_idx=args.track_id)
