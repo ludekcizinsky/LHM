@@ -551,7 +551,7 @@ def get_parse():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="./pretrained_models/human_model_files",
+        default="/scratch/izar/cizinsky/pretrained/pretrained_models/human_model_files",
         help="model_path",
     )
     parser.add_argument(
