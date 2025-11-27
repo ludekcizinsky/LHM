@@ -26,12 +26,14 @@ from LHM.utils.ffmpeg_utils import images_to_video
 class MultiHumanInferrer(Inferrer):
     EXP_TYPE = "multi_human_infer"
 
-    def __init__(self, gs_model_dir: Path, save_dir: Path):
+    def __init__(self, gs_model_dir: Path, save_dir: Path, scene_name: str):
         super().__init__()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.load_gs_model(gs_model_dir)
         self.model : ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(device)
         self.save_dir = save_dir
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.scene_name = scene_name
 
     def _build_model(self):
         hf_model_cls = wrap_model_hub(ModelHumanLRMSapdinoBodyHeadSD3_5)
@@ -59,10 +61,51 @@ class MultiHumanInferrer(Inferrer):
     def infer_single(self, *args, **kwargs):
         pass
 
-    def infer(self, track_idx: int):
+    def _get_joined_inference_inputs(self):
+
+        gs_model_list = []
+        query_points = None
+        transform_mat_neutral_pose = None
+        motion_seq = None
+        shape_param = None
+        for track_idx in range(len(self.all_model_list)):
+            p_gs_model_list, p_query_points, p_transform_mat_neutral_pose, p_motion_seq, p_shape_param = self.all_model_list[track_idx]
+            gs_model_list.extend(p_gs_model_list)
+            if query_points is None:
+                query_points = p_query_points
+            else:
+                query_points = torch.cat([query_points, p_query_points], dim=0)
+            
+            if transform_mat_neutral_pose is None:
+                transform_mat_neutral_pose = p_transform_mat_neutral_pose
+            else:
+                transform_mat_neutral_pose = torch.cat([transform_mat_neutral_pose, p_transform_mat_neutral_pose], dim=0)   
+            
+            if motion_seq is None:
+                motion_seq = p_motion_seq
+            else:
+                for key in motion_seq["smplx_params"].keys():
+                    motion_seq["smplx_params"][key] = torch.cat([motion_seq["smplx_params"][key], p_motion_seq["smplx_params"][key]], dim=0)
+            
+            if shape_param is None:
+                shape_param = p_shape_param
+            else:
+                shape_param = torch.cat([shape_param, p_shape_param], dim=0)
+
+        print(f"[DEBUG] len of gs model list: {len(gs_model_list)}")
+        print(f"[DEBUG] shape of query points: {query_points.shape}")
+        print(f"[DEBUG] shape of transform_mat_neutral_pose: {transform_mat_neutral_pose.shape}")
+        print(f"[DEBUG] shape of shape param: {shape_param.shape}")
+        for k, v in motion_seq["smplx_params"].items():
+            print(f"[DEBUG] motion_seq smplx_params key:{k}, shape:{v.shape}")
+
+        return gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param
+
+    def infer(self):
         # parse inputs for given track idx
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param = self.all_model_list[track_idx]
+
+        gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param = self._get_joined_inference_inputs()
 
         batch_list = [] 
         batch_size = 40  # avoid memeory out!
@@ -97,7 +140,7 @@ class MultiHumanInferrer(Inferrer):
                         :, batch_i : batch_i + batch_size
                     ].to(device)
 
-                res = self.model.animation_infer(gs_model_list, query_points, batch_smplx_params,
+                res = self.model.animation_infer_custom(gs_model_list, query_points, batch_smplx_params,
                     render_c2ws=motion_seq["render_c2ws"][
                         :, batch_i : batch_i + batch_size
                     ].to(device),
@@ -122,7 +165,7 @@ class MultiHumanInferrer(Inferrer):
             torch.cuda.empty_cache()
         
         rgb = np.concatenate(batch_list, axis=0)
-        dump_video_path = self.save_dir / f"human_{track_idx:02d}_inference.mp4"
+        dump_video_path = self.save_dir / f"{self.scene_name}.mp4"
 
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
 
@@ -142,8 +185,8 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--gs_model_dir", type=Path)
     parser.add_argument("--save_dir", type=Path)
-    parser.add_argument("--track_id", type=int)
+    parser.add_argument("--scene_name", type=str)
     args = parser.parse_args()
 
-    inferrer = MultiHumanInferrer(gs_model_dir=args.gs_model_dir, save_dir=args.save_dir)
-    inferrer.infer(track_idx=args.track_id)
+    inferrer = MultiHumanInferrer(gs_model_dir=args.gs_model_dir, save_dir=args.save_dir, scene_name=args.scene_name)
+    inferrer.infer()

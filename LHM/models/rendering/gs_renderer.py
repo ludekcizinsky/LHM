@@ -958,6 +958,136 @@ class GS3DRenderer(nn.Module):
 
         return ret
 
+    def animate_gs_model_custom(
+        self, gs_attr: GaussianAppOutput, query_points, smplx_data
+    ):
+        """
+        query_points: [N, 3]
+        """
+
+        device = gs_attr.offset_xyz.device
+
+        # build cano_dependent_pose
+        cano_smplx_data_keys = [
+            "root_pose",
+            "body_pose",
+            "jaw_pose",
+            "leye_pose",
+            "reye_pose",
+            "lhand_pose",
+            "rhand_pose",
+            "expr",
+            "trans",
+        ]
+
+        # Build a pose batch containing both the provided poses and an added canonical pose.
+        merge_smplx_data = dict()
+        for cano_smplx_data_key in cano_smplx_data_keys:
+            # Incoming pose(s) for this key: shape [Nv, ...].
+            warp_data = smplx_data[cano_smplx_data_key]
+            # One canonical pose slot to append: shape [1, ...], zero-initialized.
+            cano_pose = torch.zeros_like(warp_data[:1])
+
+            if cano_smplx_data_key == "body_pose":
+                # Define canonical body pose as a light A-pose (rotate shoulders).
+                cano_pose[0, 15, -1] = -math.pi / 6
+                cano_pose[0, 16, -1] = +math.pi / 6
+
+            # Stack the posed input and an extra canonical pose for each key.
+            merge_pose = torch.cat([warp_data, cano_pose], dim=0)
+            merge_smplx_data[cano_smplx_data_key] = merge_pose
+
+        # Copy over shape params and neutral-pose transforms unchanged.
+        merge_smplx_data["betas"] = smplx_data["betas"]
+        merge_smplx_data["transform_mat_neutral_pose"] = smplx_data[
+            "transform_mat_neutral_pose"
+        ]
+
+        with torch.autocast(device_type=device.type, dtype=torch.float32):
+            # Start from canonical points offset by learned xyz.
+            mean_3d = (
+                query_points + gs_attr.offset_xyz
+            )  # [N, 3]  # canonical space offset.
+
+            # matrix to warp predefined pose to zero-pose
+            transform_mat_neutral_pose = merge_smplx_data[
+                "transform_mat_neutral_pose"
+            ]  # [55, 4, 4]
+            num_view = merge_smplx_data["body_pose"].shape[0]  # [Nv, 21, 3]
+            # Broadcast inputs across all poses/canonical view.
+            mean_3d = mean_3d.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, N, 3]
+            query_points = query_points.unsqueeze(0).repeat(num_view, 1, 1)
+            transform_mat_neutral_pose = transform_mat_neutral_pose.unsqueeze(0).repeat(
+                num_view, 1, 1, 1
+            )
+
+            # print(mean_3d.shape, transform_mat_neutral_pose.shape, query_points.shape, smplx_data["body_pose"].shape, smplx_data["betas"].shape)
+            mean_3d, transform_matrix = (
+                self.smplx_model.transform_to_posed_verts_from_neutral_pose(
+                    mean_3d,
+                    merge_smplx_data,
+                    query_points,
+                    transform_mat_neutral_pose=transform_mat_neutral_pose,  # from predefined pose to zero-pose matrix
+                    device=device,
+                )
+            )  # [B, N, 3]
+
+            # rotation appearance from canonical space to view_posed
+            num_view, N, _, _ = transform_matrix.shape
+            transform_rotation = transform_matrix[:, :, :3, :3]
+
+            # Convert per-point rotation to quaternion and normalize.
+            rigid_rotation_matrix = torch.nn.functional.normalize(
+                matrix_to_quaternion(transform_rotation), dim=-1
+            )
+            I = matrix_to_quaternion(torch.eye(3)).to(device)
+
+            # inference constrain
+            is_constrain_body = self.smplx_model.is_constrain_body
+            rigid_rotation_matrix[:, is_constrain_body] = I
+            # Canonical gaussian rotations replicated per view.
+            rotation_neutral_pose = gs_attr.rotation.unsqueeze(0).repeat(num_view, 1, 1)
+
+
+            # TODO do not move underarm gs
+
+            # QUATERNION MULTIPLY
+            rotation_pose_verts = quaternion_multiply(
+                rigid_rotation_matrix, rotation_neutral_pose
+            )
+            # rotation_pose_verts = rotation_neutral_pose
+
+        gs_list = []
+        cano_gs_list = []
+        for i in range(num_view):
+#             print(f"[DEBUG] Generating GS for view {i+1}/{num_view}")
+            # print(f"  Mean 3D shape: {mean_3d[i].shape}")
+            # print(f"  Opacity shape: {gs_attr.opacity.shape}")
+            # print(f"  Rotation shape: {rotation_pose_verts[i].shape}")
+            # print(f"  Scaling shape: {gs_attr.scaling.shape}")
+            # print(f"  SHs shape: {gs_attr.shs.shape}")
+            # print(f"  Use RGB: {self.gs_net.use_rgb}")
+
+            gs_copy = GaussianModel(
+                xyz=mean_3d[i],
+                opacity=gs_attr.opacity,
+                # rotation=gs_attr.rotation,
+                rotation=rotation_pose_verts[i],
+                scaling=gs_attr.scaling,
+                shs=gs_attr.shs,
+                use_rgb=self.gs_net.use_rgb,
+            )  # [N, 3]
+
+            if i == num_view - 1:
+                # print(f"  Appending to canonical GS list.")
+                cano_gs_list.append(gs_copy)
+            else:
+                # print(f"  Appending to GS list.")
+                gs_list.append(gs_copy)
+
+        return gs_list, cano_gs_list
+
+
     def animate_gs_model(
         self, gs_attr: GaussianAppOutput, query_points, smplx_data, debug=False
     ):
@@ -1212,6 +1342,48 @@ class GS3DRenderer(nn.Module):
 
         return out
 
+    def forward_single_batch_custom(
+        self,
+        gs_list: list[GaussianModel],
+        c2ws: Float[Tensor, "Nv 4 4"],
+        intrinsics: Float[Tensor, "Nv 4 4"],
+        height: int,
+        width: int,
+        background_color: Optional[Float[Tensor, "Nv 3"]],
+        debug: bool = False,
+    ):
+        out_list = []
+        self.device = gs_list[0].xyz.device
+
+        for v_idx, (c2w, intrinsic) in enumerate(zip(c2ws, intrinsics)):
+            out_list.append(
+                self.forward_single_view(
+                    gs_list[v_idx],
+                    Camera.from_c2w(c2w, intrinsic, height, width),
+                    background_color[v_idx],
+                )
+            )
+
+        out = defaultdict(list)
+        for out_ in out_list:
+            for k, v in out_.items():
+                out[k].append(v)
+        out = {k: torch.stack(v, dim=0) for k, v in out.items()}
+        out["3dgs"] = gs_list
+
+        # debug = True
+        if debug:
+            import cv2
+
+            cv2.imwrite(
+                "fuck.png",
+                (out["comp_rgb"].detach().cpu().numpy()[0, ..., ::-1] * 255).astype(
+                    np.uint8
+                ),
+            )
+
+        return out
+
     @torch.no_grad()
     def forward_cano_batch(
         self,
@@ -1303,9 +1475,10 @@ class GS3DRenderer(nn.Module):
         return smpl_data_single_batch
 
     def get_single_view_smpl_data(self, smpl_data, vidx):
+        # print(f"[DEBUG] Getting single view smpl data for view index: {vidx}")
         smpl_data_single_view = {}
         for k, v in smpl_data.items():
-            assert v.shape[0] == 1
+            # assert v.shape[0] == 1
             if (
                 k == "betas"
                 or (k == "joint_offset")
@@ -1313,10 +1486,12 @@ class GS3DRenderer(nn.Module):
                 or (k == "transform_mat_neutral_pose")
             ):
                 smpl_data_single_view[k] = v  # e.g. betas: [1, 100] -> [1, 100]
+                # print(f"  Key {k} shape: {smpl_data_single_view[k].shape}")
             else:
                 smpl_data_single_view[k] = v[
                     :, vidx : vidx + 1
                 ]  # e.g. body_pose: [1, N_v, 21, 3] -> [1, 1, 21, 3]
+                # print(f"  Key {k} shape: {smpl_data_single_view[k].shape}")
         return smpl_data_single_view
 
     def forward_gs(
@@ -1401,6 +1576,91 @@ class GS3DRenderer(nn.Module):
                     debug=debug,
                 )
             )
+
+        out = defaultdict(list)
+        for out_ in out_list:
+            for k, v in out_.items():
+                out[k].append(v)
+        for k, v in out.items():
+            if isinstance(v[0], torch.Tensor):
+                out[k] = torch.stack(v, dim=0)
+            else:
+                out[k] = v
+
+        out["comp_rgb"] = out["comp_rgb"].permute(
+            0, 1, 4, 2, 3
+        )  # [B, NV, H, W, 3] -> [B, NV, 3, H, W]
+        out["comp_mask"] = out["comp_mask"].permute(
+            0, 1, 4, 2, 3
+        )  # [B, NV, H, W, 3] -> [B, NV, 1, H, W]
+        out["comp_depth"] = out["comp_depth"].permute(
+            0, 1, 4, 2, 3
+        )  # [B, NV, H, W, 3] -> [B, NV, 1, H, W]
+        return out
+
+    def forward_animate_gs_custom(
+        self,
+        gs_attr_list,
+        query_points,
+        smplx_data,
+        c2w,
+        intrinsic,
+        height,
+        width,
+        background_color,
+        debug=False,
+        df_data=None,  # deepfashion-style dataset
+    ):
+        batch_size = len(gs_attr_list)
+        out_list = []
+        cano_out_list = []  # inference DO NOT use
+
+        N_view = smplx_data["root_pose"].shape[1]
+        # print(f"[DEBUG] N_view: {N_view}")
+
+        all_posed_gs_list = []
+        for person_idx in range(batch_size):
+            # step 1: animate gs model = canonical -> posed view
+            gs_attr = gs_attr_list[person_idx]
+            query_pt = query_points[person_idx]
+            # len(animatable_gs_model_list) = num_view
+            posed_gs_list, _ = self.animate_gs_model_custom(
+                gs_attr,
+                query_pt,
+                self.get_single_batch_smpl_data(smplx_data, person_idx),
+            )
+            posed_gs = posed_gs_list[0] 
+            all_posed_gs_list.append(posed_gs)
+
+        # merge the gs of all persons
+        merged_xyz = torch.cat([gs.xyz for gs in all_posed_gs_list], dim=0)
+        merged_opacity = torch.cat([gs.opacity for gs in all_posed_gs_list], dim=0)
+        merged_rotation = torch.cat([gs.rotation for gs in all_posed_gs_list], dim=0)
+        merged_scaling = torch.cat([gs.scaling for gs in all_posed_gs_list], dim=0)
+        merged_shs = torch.cat([gs.shs for gs in all_posed_gs_list], dim=0)
+        animatable_gs_model_list = [
+            GaussianModel(
+                xyz=merged_xyz,
+                opacity=merged_opacity,
+                rotation=merged_rotation,
+                scaling=merged_scaling,
+                shs=merged_shs,
+                use_rgb=self.gs_net.use_rgb,
+            )
+        ]
+
+        # step 2: gs render animated gs model = posed view -> render image
+        b = 0
+        render_result = self.forward_single_batch_custom(
+                animatable_gs_model_list,
+                c2w[b],
+                intrinsic[b],
+                height,
+                width,
+                background_color[b] if background_color is not None else None,
+                debug=debug,
+        )
+        out_list.append(render_result)
 
         out = defaultdict(list)
         for out_ in out_list:
