@@ -505,6 +505,13 @@ class Video2MotionPipeline:
         all_frames, raw_H, raw_W, fps, offset_w, offset_h = load_video(
             video_path, pad_ratio=self.pad_ratio, max_resolution=self.MAX_RESOLUTION
         )
+
+        frames_output_path = output_path.parent / "frames"
+        os.makedirs(frames_output_path, exist_ok=True)
+        for i, frame in enumerate(all_frames):
+            cv2.imwrite(
+                os.path.join(frames_output_path, f"{i:04}.png"), frame
+            )
         self.fps = fps
         video_length = len(all_frames)
 
