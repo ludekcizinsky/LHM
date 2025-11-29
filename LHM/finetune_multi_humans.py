@@ -1,34 +1,135 @@
 """
-Usage:
-    python LHM/infer_multi_humans.py --gs_model_dir /path/to/gs
+Finetune canonical Gaussian params for multiple humans using original frames as supervision.
 
-Example:
-    python LHM/infer_multi_humans.py --gs_model_dir=/scratch/izar/cizinsky/multiply-output/preprocessing/data/taichi/lhm/inference_results
+Trains offset_xyz, rotation, scaling, opacity, and SH/RGB while keeping SMPL-X motion fixed.
+Supervision:
+  - L_rgb: MSE between rendered RGB (masked) and GT frame * union mask (weight 1.0)
+  - L_sil: MSE between rendered mask and GT union mask (weight 0.5)
+  - L_lpips: masked LPIPS (weight 1.0)
+
+Expects:
+  output_dir/initial_scene_recon/<track_id>/* (loaded canonical state)
+  output_dir/frames/<0000.png...> and output_dir/masks/union/<0000.png...> for supervision.
+Saves finetuned state to output_dir/refined_scene_recon/<track_id>/...
 """
 
-
-import math
 import os
 import sys
+from argparse import ArgumentParser
+from dataclasses import fields
+from pathlib import Path
+from typing import List, Tuple
+from tqdm import tqdm
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+
+import pyiqa
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from argparse import ArgumentParser
-from pathlib import Path
-
 from LHM.models import ModelHumanLRMSapdinoBodyHeadSD3_5
-from LHM.utils.hf_hub import wrap_model_hub
-from LHM.runners.infer.base_inferrer import Inferrer
-
-import torch
-import numpy as np
-
 from LHM.outputs.output import GaussianAppOutput
+from LHM.runners.infer.base_inferrer import Inferrer
+from LHM.utils.hf_hub import wrap_model_hub
 
-from dataclasses import fields
 
-def enable_gaussian_grads(gauss: GaussianAppOutput, *, detach_to_leaf=False):
+# ---------------------------------------------------------------------------
+# Loss helpers (LPIPS masked)
+# ---------------------------------------------------------------------------
+_LPIPS_METRIC = None
+
+
+def _get_lpips_net(device: torch.device) -> torch.nn.Module:
+    global _LPIPS_METRIC
+    if _LPIPS_METRIC is None:
+        _LPIPS_METRIC = pyiqa.create_metric(
+            "lpips", device=device, net="vgg", spatial=True, as_loss=False
+        ).eval()
+        for p in _LPIPS_METRIC.parameters():
+            p.requires_grad = False
+    return _LPIPS_METRIC.to(device)
+
+
+def _ensure_nchw(t: torch.Tensor) -> torch.Tensor:
+    return t.permute(0, 3, 1, 2).contiguous()
+
+
+def masked_lpips(images: torch.Tensor, masks: torch.Tensor, renders: torch.Tensor) -> torch.Tensor:
+    """LPIPS averaged over masked region per sample."""
+    target = _ensure_nchw(images.clamp(0.0, 1.0))
+    preds = _ensure_nchw(renders.clamp(0.0, 1.0))
+    if masks.dim() == 4 and masks.shape[-1] == 1:
+        mask = masks[..., 0]
+    else:
+        mask = masks
+    mask = mask.unsqueeze(1).float()  # [B,1,H,W]
+
+    net = _get_lpips_net(preds.device)
+    dmap = net(preds, target)
+
+    if dmap.shape[-2:] != mask.shape[-2:]:
+        mask_resized = F.interpolate(mask, size=dmap.shape[-2:], mode="nearest")
+    else:
+        mask_resized = mask
+
+    numerator = (dmap * mask_resized).sum(dim=(1, 2, 3))
+    denom = mask_resized.sum(dim=(1, 2, 3)).clamp_min(1e-6)
+    vals = numerator / denom
+    vals = torch.where(denom < 1e-5, torch.zeros_like(vals), vals)
+    return vals.mean()
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+class FrameMaskDataset(Dataset):
+    def __init__(self, frames_dir: Path, masks_dir: Path, device: torch.device):
+        self.frames_dir = frames_dir
+        self.masks_dir = masks_dir
+        self.device = device
+
+        self.frame_paths = sorted(frames_dir.glob("*.png"))
+        if not self.frame_paths:
+            raise RuntimeError(f"No frames found in {frames_dir}")
+        self.mask_paths = [masks_dir / p.name for p in self.frame_paths]
+        missing = [p for p in self.mask_paths if not p.exists()]
+        if missing:
+            raise RuntimeError(f"Missing masks for frames: {missing[:5]}")
+
+    def __len__(self):
+        return len(self.frame_paths)
+
+    def _load_img(self, path: Path) -> torch.Tensor:
+        img = Image.open(path).convert("RGB")
+        arr = torch.from_numpy(np.array(img)).float() / 255.0
+        return arr.to(self.device)
+
+    def _load_mask(self, path: Path) -> torch.Tensor:
+        mask = Image.open(path).convert("L")
+        arr = torch.from_numpy(np.array(mask)).float() / 255.0
+        return arr.unsqueeze(-1).to(self.device)
+
+    def __getitem__(self, idx: int):
+        frame = self._load_img(self.frame_paths[idx])
+        mask = self._load_mask(self.mask_paths[idx])
+        return torch.tensor(idx, device=self.device, dtype=torch.long), frame, mask
+
+
+# ---------------------------------------------------------------------------
+# Utility to make Gaussian params trainable
+# ---------------------------------------------------------------------------
+def enable_gaussian_grads(
+    gauss: GaussianAppOutput,
+    train_fields: Tuple[str, ...],
+    detach_to_leaf: bool = False,
+):
     for f in fields(gauss):
+        if f.name not in train_fields:
+            continue
         v = getattr(gauss, f.name)
         if torch.is_tensor(v):
             if detach_to_leaf:
@@ -38,155 +139,295 @@ def enable_gaussian_grads(gauss: GaussianAppOutput, *, detach_to_leaf=False):
                 v.requires_grad_(True)
 
 
+# ---------------------------------------------------------------------------
+# Finetuner
+# ---------------------------------------------------------------------------
 class MultiHumanFinetuner(Inferrer):
     EXP_TYPE = "multi_human_finetune"
 
-    def __init__(self, output_dir: Path, render_save_dir: Path, scene_name: str):
+    def __init__(
+        self,
+        output_dir: Path,
+        render_save_dir: Path,
+        scene_name: str,
+        epochs: int,
+        batch_size: int,
+        lr: float,
+        weight_decay: float,
+        grad_clip: float,
+    ):
         super().__init__()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.load_gs_model(output_dir)
-        self.model : ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(device)
+        self.tuner_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.output_dir = output_dir
         self.render_save_dir = render_save_dir
         self.render_save_dir.mkdir(parents=True, exist_ok=True)
         self.scene_name = scene_name
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.grad_clip = grad_clip
 
+        self._load_gs_model(output_dir)
+        self._prepare_joined_inputs()
+        self.model: ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(self.tuner_device)
+
+        self.frames_dir = output_dir / "frames"
+        self.masks_dir = output_dir / "masks" / "union"
+
+    # ---------------- Model / data loading ----------------
     def _build_model(self):
         hf_model_cls = wrap_model_hub(ModelHumanLRMSapdinoBodyHeadSD3_5)
         model_name = "/scratch/izar/cizinsky/pretrained/huggingface/models--3DAIGC--LHM-1B/snapshots/cd8a1cc900a557d83187cfc2e0a91cef3eba969d/"
-        model = hf_model_cls.from_pretrained(model_name)
-        return model
+        return hf_model_cls.from_pretrained(model_name)
 
-    def load_gs_model(self, root_output_dir: Path):
+    def _load_gs_model(self, root_output_dir: Path):
         root_gs_model_dir = root_output_dir / "initial_scene_recon"
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        track_ids = os.listdir(root_gs_model_dir)
-        track_ids = sorted([track_id for track_id in track_ids if (root_gs_model_dir / track_id).is_dir()])
-        print(f"[DEBUG] Found {len(track_ids)} humans for inference: {track_ids}")
+        track_ids = sorted(
+            [
+                track_id
+                for track_id in os.listdir(root_gs_model_dir)
+                if (root_gs_model_dir / track_id).is_dir()
+            ]
+        )
+        print(f"[DEBUG] Found {len(track_ids)} humans for finetuning: {track_ids}")
         self.all_model_list = []
+        self.track_meta = []
         for track_id in track_ids:
             gs_model_dir = root_gs_model_dir / track_id
-            gs_model_list = torch.load(gs_model_dir / "gs_model_list.pt", map_location=device)
-            query_points = torch.load(gs_model_dir / "query_points.pt", map_location=device)
-            transform_mat_neutral_pose = torch.load(gs_model_dir / "transform_mat_neutral_pose.pt", map_location=device)
-            motion_seq = torch.load(gs_model_dir / "motion_seq.pt", map_location=device)
-            shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).unsqueeze(0).to(device)
+            gs_model_list = torch.load(gs_model_dir / "gs_model_list.pt", map_location=self.tuner_device)
+            query_points = torch.load(gs_model_dir / "query_points.pt", map_location=self.tuner_device)
+            transform_mat_neutral_pose = torch.load(
+                gs_model_dir / "transform_mat_neutral_pose.pt", map_location=self.tuner_device
+            )
+            motion_seq = torch.load(gs_model_dir / "motion_seq.pt", map_location=self.tuner_device)
+            shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).unsqueeze(0).to(self.tuner_device)
             model = (gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_params)
             self.all_model_list.append(model)
+            self.track_meta.append(
+                {
+                    "track_id": track_id,
+                    "gs_count": len(gs_model_list),
+                    "query_count": query_points.shape[0],
+                    "transform_count": transform_mat_neutral_pose.shape[0],
+                    "motion_seq": motion_seq,
+                    "shape_params": shape_params,
+                }
+            )
         print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
 
-    def infer_single(self, *args, **kwargs):
-        pass
+    def _prepare_joined_inputs(self):
+        train_fields = ("offset_xyz", "rotation", "scaling", "opacity", "shs")
+        self.gs_model_list: List[GaussianAppOutput] = []
+        self.query_points = None
+        self.transform_mat_neutral_pose = None
+        self.motion_seq = None
+        self.shape_param = None
 
-    def infer(self):
-        pass
+        self.gs_track_offsets = []
+        self.query_track_offsets = []
 
-    def _get_joined_inference_inputs(self):
+        gs_cursor = 0
+        query_cursor = 0
 
-        gs_model_list = []
-        query_points = None
-        transform_mat_neutral_pose = None
-        motion_seq = None
-        shape_param = None
-        for track_idx in range(len(self.all_model_list)):
-            p_gs_model_list, p_query_points, p_transform_mat_neutral_pose, p_motion_seq, p_shape_param = self.all_model_list[track_idx]
-            enable_gaussian_grads(p_gs_model_list[0], detach_to_leaf=True)
-            gs_model_list.extend(p_gs_model_list)
-            if query_points is None:
-                query_points = p_query_points
+        for track_idx, packed in enumerate(self.all_model_list):
+            (
+                p_gs_model_list,
+                p_query_points,
+                p_transform_mat_neutral_pose,
+                p_motion_seq,
+                p_shape_param,
+            ) = packed
+
+            # Make specified fields trainable.
+            enable_gaussian_grads(p_gs_model_list[0], train_fields, detach_to_leaf=True)
+
+            self.gs_track_offsets.append((gs_cursor, len(p_gs_model_list)))
+            self.query_track_offsets.append((query_cursor, p_query_points.shape[0], p_transform_mat_neutral_pose.shape[0]))
+            gs_cursor += len(p_gs_model_list)
+            query_cursor += p_query_points.shape[0]
+
+            self.gs_model_list.extend(p_gs_model_list)
+
+            if self.query_points is None:
+                self.query_points = p_query_points
             else:
-                query_points = torch.cat([query_points, p_query_points], dim=0)
- 
-            if transform_mat_neutral_pose is None:
-                transform_mat_neutral_pose = p_transform_mat_neutral_pose
+                self.query_points = torch.cat([self.query_points, p_query_points], dim=0)
+
+            if self.transform_mat_neutral_pose is None:
+                self.transform_mat_neutral_pose = p_transform_mat_neutral_pose
             else:
-                transform_mat_neutral_pose = torch.cat([transform_mat_neutral_pose, p_transform_mat_neutral_pose], dim=0)
-            
-            if motion_seq is None:
-                motion_seq = p_motion_seq
-            else:
-                for key in motion_seq["smplx_params"].keys():
-                    motion_seq["smplx_params"][key] = torch.cat([motion_seq["smplx_params"][key], p_motion_seq["smplx_params"][key]], dim=0)
-            
-            if shape_param is None:
-                shape_param = p_shape_param
-            else:
-                shape_param = torch.cat([shape_param, p_shape_param], dim=0)
-
-        print(f"[DEBUG] len of gs model list: {len(gs_model_list)}")
-        print(f"[DEBUG] shape of query points: {query_points.shape}")
-        print(f"[DEBUG] shape of transform_mat_neutral_pose: {transform_mat_neutral_pose.shape}")
-        print(f"[DEBUG] shape of shape param: {shape_param.shape}")
-        for k, v in motion_seq["smplx_params"].items():
-            print(f"[DEBUG] motion_seq smplx_params key:{k}, shape:{v.shape}")
-
-        return gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param
-
-    def finetune(self):
-        # Prepare inputs
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param = self._get_joined_inference_inputs()
-
-        batch_size = 40  # avoid memeory out!
-
-        camera_size = len(motion_seq["motion_seqs"])
-        for batch_i in range(0, camera_size, batch_size):
-            print(f"[DEBUG] batch: {batch_i}, total: {camera_size //batch_size +1} ")
-
-            keys = [
-                "root_pose",
-                "body_pose",
-                "jaw_pose",
-                "leye_pose",
-                "reye_pose",
-                "lhand_pose",
-                "rhand_pose",
-                "trans",
-                "focal",
-                "princpt",
-                "img_size_wh",
-                "expr",
-            ]
-
-
-            batch_smplx_params = dict()
-            batch_smplx_params["betas"] = shape_param.to(device)
-            batch_smplx_params['transform_mat_neutral_pose'] = transform_mat_neutral_pose
-            for key in keys:
-                batch_smplx_params[key] = motion_seq["smplx_params"][key][
-                    :, batch_i : batch_i + batch_size
-                ].to(device)
-
-            res = self.model.animation_infer_custom(gs_model_list, query_points, batch_smplx_params,
-                render_c2ws=motion_seq["render_c2ws"][
-                    :, batch_i : batch_i + batch_size
-                ].to(device),
-                render_intrs=motion_seq["render_intrs"][
-                    :, batch_i : batch_i + batch_size
-                ].to(device),
-                render_bg_colors=motion_seq["render_bg_colors"][
-                    :, batch_i : batch_i + batch_size
-                ].to(device),
+                self.transform_mat_neutral_pose = torch.cat(
+                    [self.transform_mat_neutral_pose, p_transform_mat_neutral_pose], dim=0
                 )
 
-            comp_rgb = res["comp_rgb"] # [Nv, H, W, 3], 0-1
-            comp_mask = res["comp_mask"] # [Nv, H, W, 3], 0-1
-            comp_mask[comp_mask < 0.5] = 0.0
-            batch_rgb = comp_rgb * comp_mask + (1 - comp_mask) * 1
-            
-            # assert batch rgb to have grad
-            assert batch_rgb.requires_grad, "[ERROR] batch_rgb does not have grad!"
+            if self.motion_seq is None:
+                self.motion_seq = p_motion_seq
+            else:
+                for key in self.motion_seq["smplx_params"].keys():
+                    self.motion_seq["smplx_params"][key] = torch.cat(
+                        [self.motion_seq["smplx_params"][key], p_motion_seq["smplx_params"][key]],
+                        dim=0,
+                    )
 
-            del res
-            torch.cuda.empty_cache()
-        
+            if self.shape_param is None:
+                self.shape_param = p_shape_param
+            else:
+                self.shape_param = torch.cat([self.shape_param, p_shape_param], dim=0)
 
+        print(f"[DEBUG] len of gs model list: {len(self.gs_model_list)}")
+        print(f"[DEBUG] shape of query points: {self.query_points.shape}")
+        print(f"[DEBUG] shape of transform_mat_neutral_pose: {self.transform_mat_neutral_pose.shape}")
+        print(f"[DEBUG] shape of shape param: {self.shape_param.shape}")
+        for k, v in self.motion_seq["smplx_params"].items():
+            print(f"[DEBUG] motion_seq smplx_params key:{k}, shape:{v.shape}")
+
+    # ---------------- Training utilities ----------------
+    def _trainable_tensors(self) -> List[torch.Tensor]:
+        params = []
+        for gauss in self.gs_model_list:
+            for name in ("offset_xyz", "rotation", "scaling", "opacity", "shs"):
+                t = getattr(gauss, name, None)
+                if torch.is_tensor(t) and t.requires_grad:
+                    params.append(t)
+        return params
+
+    def _slice_motion(self, frame_indices: torch.Tensor):
+        keys = [
+            "root_pose",
+            "body_pose",
+            "jaw_pose",
+            "leye_pose",
+            "reye_pose",
+            "lhand_pose",
+            "rhand_pose",
+            "trans",
+            "focal",
+            "princpt",
+            "img_size_wh",
+            "expr",
+        ]
+        smplx = {"betas": self.shape_param.to(self.tuner_device)}
+        smplx["transform_mat_neutral_pose"] = self.transform_mat_neutral_pose
+        for key in keys:
+            smplx[key] = torch.index_select(
+                self.motion_seq["smplx_params"][key], 1, frame_indices.to(self.motion_seq["smplx_params"][key].device)
+            ).to(self.tuner_device)
+
+        render_c2ws = torch.index_select(self.motion_seq["render_c2ws"], 1, frame_indices).to(self.tuner_device)
+        render_intrs = torch.index_select(self.motion_seq["render_intrs"], 1, frame_indices).to(self.tuner_device)
+        render_bg_colors = torch.index_select(self.motion_seq["render_bg_colors"], 1, frame_indices).to(self.tuner_device)
+        return smplx, render_c2ws, render_intrs, render_bg_colors
+
+    def _render_batch(self, frame_indices: torch.Tensor):
+        smplx_params, render_c2ws, render_intrs, render_bg_colors = self._slice_motion(frame_indices)
+        return self.model.animation_infer_custom(
+            self.gs_model_list,
+            self.query_points,
+            smplx_params,
+            render_c2ws=render_c2ws,
+            render_intrs=render_intrs,
+            render_bg_colors=render_bg_colors,
+        )
+
+    # ---------------- Training loop ----------------
+    def train_loop(self):
+        dataset = FrameMaskDataset(self.frames_dir, self.masks_dir, self.tuner_device)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0, drop_last=False)
+
+        params = self._trainable_tensors()
+        optimizer = torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+
+        for epoch in range(self.epochs):
+            running_loss = 0.0
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.epochs}", leave=False)
+            for frame_indices, frames, masks in pbar:
+                optimizer.zero_grad(set_to_none=True)
+
+                frame_indices = frame_indices.to(self.tuner_device)
+                res = self._render_batch(frame_indices)
+                comp_rgb = res["comp_rgb"]  # [B, H, W, 3], 0-1
+                comp_mask = res["comp_mask"][..., :1]  # [B, H, W, 1]
+
+                mask3 = masks
+                if mask3.shape[-1] == 1:
+                    mask3 = mask3.repeat(1, 1, 1, 3)
+                gt_masked = frames * mask3
+                pred_masked = comp_rgb * mask3
+
+                rgb_loss = F.mse_loss(pred_masked, gt_masked)
+                sil_loss = F.mse_loss(comp_mask, masks)
+                lpips_loss = masked_lpips(gt_masked, masks, comp_rgb)
+
+                loss = rgb_loss + 0.5 * sil_loss + lpips_loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, self.grad_clip)
+                optimizer.step()
+
+                running_loss += loss.item()
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            avg_loss = running_loss / max(1, len(loader))
+            print(f"[Epoch {epoch+1}/{self.epochs}] loss={avg_loss:.4f}")
+
+        self._save_refined_models()
+
+    # ---------------- Saving ----------------
+    def _save_refined_models(self):
+        save_root = self.output_dir / "refined_scene_recon"
+        save_root.mkdir(parents=True, exist_ok=True)
+
+        for idx, meta in enumerate(self.track_meta):
+            track_id = meta["track_id"]
+            gs_start, gs_count = self.gs_track_offsets[idx]
+            q_start, q_count, t_count = self.query_track_offsets[idx]
+
+            track_dir = save_root / track_id
+            track_dir.mkdir(parents=True, exist_ok=True)
+
+            gs_slice = self.gs_model_list[gs_start : gs_start + gs_count]
+            query_slice = self.query_points[q_start : q_start + q_count].detach().cpu()
+            transform_slice = self.transform_mat_neutral_pose[q_start : q_start + t_count].detach().cpu()
+
+            torch.save(gs_slice, track_dir / "gs_model_list.pt")
+            torch.save(query_slice, track_dir / "query_points.pt")
+            torch.save(transform_slice, track_dir / "transform_mat_neutral_pose.pt")
+            torch.save(meta["motion_seq"], track_dir / "motion_seq.pt")
+            np.save(track_dir / "shape_params.npy", meta["shape_params"].cpu().numpy())
+
+        print(f"[INFO] Saved refined models to {save_root}")
+
+    def infer(self):
+        # keep this here for compatibility
+        pass
+
+    def infer_single(self):
+        # keep this here for compatibility
+        pass
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-
     parser = ArgumentParser()
-    parser.add_argument("--output_dir", type=Path)
-    parser.add_argument("--render_save_dir", type=Path)
-    parser.add_argument("--scene_name", type=str)
+    parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--render_save_dir", type=Path, required=True)
+    parser.add_argument("--scene_name", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=4e-4)
+    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--grad_clip", type=float, default=0.1)
     args = parser.parse_args()
 
-    tuner = MultiHumanFinetuner(output_dir=args.output_dir, render_save_dir=args.render_save_dir, scene_name=args.scene_name)
-    tuner.finetune()
+    tuner = MultiHumanFinetuner(
+        output_dir=args.output_dir,
+        render_save_dir=args.render_save_dir,
+        scene_name=args.scene_name,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+    )
+    tuner.train_loop()
