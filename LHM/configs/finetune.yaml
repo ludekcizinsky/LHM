@@ -1,0 +1,35 @@
+scene_name: ???
+output_dir: /scratch/izar/cizinsky/thesis/preprocessing/${scene_name}/lhm
+exp_name: "dev"
+epochs: 300
+batch_size: 5
+lr: 4e-4
+weight_decay: 5e-4
+grad_clip: 0.1
+train_params:
+  - offset_xyz
+  - rotation
+  - scaling
+  - opacity
+  - shs
+
+wandb:
+  enable: true
+  project: "hybrid-lhm"
+  entity: "ludekcizinsky"
+  tags:
+    - v2
+
+loss_weights:
+  rgb: 1.0
+  sil: 0.5
+  lpips: 1.0
+  reg_asap: 50.0
+  reg_acap: 10.0
+
+
+hydra:
+  run:
+    dir: /scratch/izar/cizinsky/thesis/hydra/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  job:
+    chdir: False

@@ -15,13 +15,16 @@ Saves finetuned state to output_dir/refined_scene_recon/<track_id>/...
 
 import os
 import sys
-from argparse import ArgumentParser
 from dataclasses import fields
 from pathlib import Path
 from typing import List, Tuple
 import copy
 from tqdm import tqdm
 
+from omegaconf import DictConfig
+from hydra.core.global_hydra import GlobalHydra
+GlobalHydra.instance().clear()
+import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,7 +33,6 @@ from torch.utils.data import DataLoader, Dataset
 
 import pyiqa
 import wandb
-
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -148,35 +150,20 @@ def enable_gaussian_grads(
 class MultiHumanFinetuner(Inferrer):
     EXP_TYPE = "multi_human_finetune"
 
-    def __init__(
-        self,
-        output_dir: Path,
-        exp_name: str,
-        scene_name: str,
-        epochs: int,
-        batch_size: int,
-        lr: float,
-        weight_decay: float,
-        grad_clip: float,
-    ):
+    def __init__(self, cfg: DictConfig):
         super().__init__()
+        self.cfg = cfg
         self.tuner_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = output_dir
-        self.exp_name = exp_name
-        self.scene_name = scene_name
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.grad_clip = grad_clip
+        self.output_dir = Path(cfg.output_dir).expanduser()
+        self.train_params = tuple(cfg.train_params)
         self.wandb_run = None
 
-        self._load_gs_model(output_dir)
+        self._load_gs_model(self.output_dir)
         self._prepare_joined_inputs()
         self.model: ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(self.tuner_device)
 
-        self.frames_dir = output_dir / "frames"
-        self.masks_dir = output_dir / "masks" / "union"
+        self.frames_dir = self.output_dir / "frames"
+        self.masks_dir = self.output_dir / "masks" / "union"
 
     # ---------------- Model / data loading ----------------
     def _build_model(self):
@@ -223,7 +210,7 @@ class MultiHumanFinetuner(Inferrer):
         # print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
 
     def _prepare_joined_inputs(self):
-        train_fields = ("offset_xyz", "rotation", "scaling", "opacity", "shs")
+        train_fields = tuple(self.train_params)
         self.gs_model_list: List[GaussianAppOutput] = []
         self.query_points = None
         self.transform_mat_neutral_pose = None
@@ -292,7 +279,7 @@ class MultiHumanFinetuner(Inferrer):
     def _trainable_tensors(self) -> List[torch.Tensor]:
         params = []
         for gauss in self.gs_model_list:
-            for name in ("offset_xyz", "rotation", "scaling", "opacity", "shs"):
+            for name in self.train_params:
                 t = getattr(gauss, name, None)
                 if torch.is_tensor(t) and t.requires_grad:
                     params.append(t)
@@ -361,22 +348,31 @@ class MultiHumanFinetuner(Inferrer):
 
         asap_loss = torch.stack(asap_terms).mean()
         acap_loss = torch.stack(acap_terms).mean()
-        reg_loss = 50.0 * asap_loss + 10.0 * acap_loss
+        reg_loss = self.cfg.loss_weights["reg_asap"] * asap_loss + self.cfg.loss_weights["reg_acap"] * acap_loss
         return reg_loss, asap_loss, acap_loss
 
     # ---------------- Logging utilities ----------------
     def _init_wandb(self):
+        if not self.cfg.wandb.enable or wandb is None:
+            return
         if self.wandb_run is None:
             self.wandb_run = wandb.init(
-                project="hybrid-lhm",
-                entity="ludekcizinsky",
+                project=self.cfg.wandb.project,
+                entity=self.cfg.wandb.entity,
                 config={
-                    "epochs": self.epochs,
-                    "batch_size": self.batch_size,
-                    "lr": self.lr,
-                    "weight_decay": self.weight_decay,
-                    "grad_clip": self.grad_clip,
+                    "epochs": self.cfg.epochs,
+                    "batch_size": self.cfg.batch_size,
+                    "lr": self.cfg.lr,
+                    "weight_decay": self.cfg.weight_decay,
+                    "grad_clip": self.cfg.grad_clip,
+                    "train_params": self.train_params,
+                    "exp_name": self.cfg.exp_name,
+                    "scene_name": self.cfg.scene_name,
+                    "output_dir": str(self.output_dir),
+                    "loss_weights": self.cfg.loss_weights,
                 },
+                name=self.cfg.exp_name,
+                tags=list(self.cfg.wandb.tags) if "tags" in self.cfg.wandb else None,
             )
 
     # ---------------- Training loop ----------------
@@ -385,14 +381,16 @@ class MultiHumanFinetuner(Inferrer):
             self._init_wandb()
 
         dataset = FrameMaskDataset(self.frames_dir, self.masks_dir, self.tuner_device)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0, drop_last=False)
+        loader = DataLoader(
+            dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, drop_last=False
+        )
 
         params = self._trainable_tensors()
-        optimizer = torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        optimizer = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
-        for epoch in range(self.epochs):
+        for epoch in range(self.cfg.epochs):
             running_loss = 0.0
-            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.epochs}", leave=False)
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.cfg.epochs}", leave=False)
             for frame_indices, frames, masks in pbar:
                 optimizer.zero_grad(set_to_none=True)
 
@@ -412,9 +410,14 @@ class MultiHumanFinetuner(Inferrer):
                 lpips_loss = masked_lpips(gt_masked, masks, comp_rgb)
                 reg_loss, asap_loss, acap_loss = self._canonical_regularization()
 
-                loss = rgb_loss + 0.5 * sil_loss + lpips_loss + reg_loss
+                loss = (
+                    self.cfg.loss_weights["rgb"] * rgb_loss
+                    + self.cfg.loss_weights["sil"] * sil_loss
+                    + self.cfg.loss_weights["lpips"] * lpips_loss
+                    + reg_loss
+                )
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, self.grad_clip)
+                torch.nn.utils.clip_grad_norm_(params, self.cfg.grad_clip)
                 optimizer.step()
 
                 running_loss += loss.item()
@@ -438,7 +441,7 @@ class MultiHumanFinetuner(Inferrer):
                     )
 
             avg_loss = running_loss / max(1, len(loader))
-            print(f"[Epoch {epoch+1}/{self.epochs}] loss={avg_loss:.4f}")
+            print(f"[Epoch {epoch+1}/{self.cfg.epochs}] loss={avg_loss:.4f}")
             if self.wandb_run is not None:
                 wandb.log({"loss/combined_epoch": avg_loss, "epoch": epoch + 1})
 
@@ -448,7 +451,7 @@ class MultiHumanFinetuner(Inferrer):
 
     # ---------------- Saving ----------------
     def _save_refined_models(self):
-        save_root = self.output_dir / "refined_scene_recon" / self.exp_name
+        save_root = self.output_dir / "refined_scene_recon" / self.cfg.exp_name
         save_root.mkdir(parents=True, exist_ok=True)
 
         # print(f"[INFO] Saving refined models to {save_root}...")
@@ -481,29 +484,14 @@ class MultiHumanFinetuner(Inferrer):
         # keep this here for compatibility
         pass
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--exp_name", type=str, default="dev")
-    parser.add_argument("--scene_name", type=str, required=True)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch_size", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=4e-4)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
-    parser.add_argument("--grad_clip", type=float, default=0.1)
-    args = parser.parse_args()
 
-    tuner = MultiHumanFinetuner(
-        output_dir=args.output_dir,
-        exp_name=args.exp_name,
-        scene_name=args.scene_name,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        grad_clip=args.grad_clip,
-    )
+@hydra.main(config_path="configs", config_name="finetune", version_base="1.3")
+def main(cfg: DictConfig):
+    tuner = MultiHumanFinetuner(cfg)
     tuner.train_loop()
+
+
+if __name__ == "__main__":
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    main()

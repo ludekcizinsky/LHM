@@ -11,15 +11,12 @@
 
 # Change to the directory where the script is located
 cd /home/cizinsky/LHM
+conda deactivate && conda activate lhm
 
 # --- Shared settings
 seq_name="taichi"
-path_to_video="/home/cizinsky/in_the_wild/bilibili/taichi.mp4"
-lr=0.0004
-wd=0.0005
-gclip=0.1
 
-# --- Expriments
+# --- V1
 # exp_name="default"
 # bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd $gclip
 
@@ -47,5 +44,9 @@ gclip=0.1
 # exp_name="gclip2"
 # bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.2
 
-exp_name="gclip4"
-bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.4
+# exp_name="gclip4"
+# bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.4
+
+# --- V2
+exp_name="dev"
+python LHM/finetune_multi_humans.py scene_name=$seq_name 

@@ -15,9 +15,9 @@ cd /home/cizinsky/LHM
 seq_name=$1
 input_video=$2
 exp_name=$3
-lr=$4
-wd=$5
-gclip=$6
+
+
+# for now default settings
 default_ref_frame_idx=0
 
 # derived paths
@@ -57,9 +57,9 @@ mkdir -p $refined_gs_model_dir
 
 echo "--- [5/?] Running finetuning for multi-human LHM"
 conda deactivate && conda activate lhm
-python LHM/finetune_multi_humans.py --output_dir=$output_dir --scene_name=$seq_name --exp_name=$exp_name --lr=$lr --weight_decay=$wd --grad_clip=$gclip
+python LHM/finetune_multi_humans.py output_dir=$output_dir scene_name=$seq_name exp_name=$exp_name 
 
-echo "--- [6/?] Running inference for multi-human LHM"
-conda deactivate && conda activate lhm
-python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir/$exp_name --scene_name=$seq_name --nv_rot_degree=0
-python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir/$exp_name --scene_name=$seq_name --nv_rot_degree=90
+# echo "--- [6/?] Running inference for multi-human LHM"
+# conda deactivate && conda activate lhm
+# python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir/$exp_name --scene_name=$seq_name --nv_rot_degree=0
+# python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir/$exp_name --scene_name=$seq_name --nv_rot_degree=90
