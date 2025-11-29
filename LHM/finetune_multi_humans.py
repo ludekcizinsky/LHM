@@ -43,6 +43,56 @@ from LHM.outputs.output import GaussianAppOutput
 from LHM.runners.infer.base_inferrer import Inferrer
 from LHM.utils.hf_hub import wrap_model_hub
 
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+import math
+
+def compute_frame_centers_from_smplx(smplx_params: dict) -> torch.Tensor:
+    """
+    smplx_params: dict containing key "trans" of shape [num_people, T, 3]
+    returns: centers of shape [1, T, 3] (mean of all people per frame)
+    """
+    trans = smplx_params["trans"]  # [num_people, T, 3]
+    centers = trans.mean(dim=0, keepdim=True)  # [1, T, 3]
+    return centers
+
+def rotate_c2ws_y_about_center(c2ws: torch.Tensor, centers: torch.Tensor, degrees: float) -> torch.Tensor:
+    """
+    Yaw cameras around a per-frame center on the world Y-axis.
+    c2ws: [..., 4, 4]
+    centers: [..., 3] matching leading dims of c2ws
+    returns: same shape as c2ws
+    """
+    # Ensure dtype/device alignment
+    centers = centers.to(dtype=c2ws.dtype, device=c2ws.device)
+
+    rad = math.radians(-degrees)
+    cos, sin = math.cos(rad), math.sin(rad)
+    R = torch.tensor(
+        [[cos, 0.0, sin, 0.0],
+         [0.0, 1.0, 0.0, 0.0],
+         [-sin, 0.0, cos, 0.0],
+         [0.0, 0.0, 0.0, 1.0]],
+        dtype=c2ws.dtype,
+        device=c2ws.device,
+    )
+
+    # Broadcast R to leading dims
+    while R.dim() < c2ws.dim():
+        R = R.unsqueeze(0)
+
+    # Build T(-center) and T(center) with shapes matching c2ws leading dims.
+    leading_shape = c2ws.shape[:-2]
+    I = torch.eye(4, dtype=c2ws.dtype, device=c2ws.device)
+    T_neg = I.expand(*leading_shape, 4, 4).clone()
+    T_pos = I.expand(*leading_shape, 4, 4).clone()
+    T_neg[..., :3, 3] = -centers
+    T_pos[..., :3, 3] = centers
+
+    # Apply: T(center) @ R_y @ T(-center) @ c2w
+    return T_pos @ (R @ (T_neg @ c2ws))
+
 
 # ---------------------------------------------------------------------------
 # Loss helpers (LPIPS masked)
@@ -169,10 +219,10 @@ class MultiHumanFinetuner(Inferrer):
         self.frames_dir = self.output_dir / "frames"
         self.masks_dir = self.output_dir / "masks" / "union"
 
-        # clean this dir
-        save_root = self.output_dir / "refined_scene_recon" / self.cfg.exp_name
-        if save_root.exists():
-            shutil.rmtree(save_root)
+#        # clean this dir
+        #save_root = self.output_dir / "refined_scene_recon" / self.cfg.exp_name
+        #if save_root.exists():
+            #shutil.rmtree(save_root)
 
     # ---------------- Model / data loading ----------------
     def _build_model(self):
@@ -400,6 +450,11 @@ class MultiHumanFinetuner(Inferrer):
         params = self._trainable_tensors()
         optimizer = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
+        # Pre-optimization visualization (epoch 0).
+        if self.cfg.vis_every_epoch > 0:
+            for tidx in range(len(self.track_meta)):
+                self._canonical_vis_for_track(tidx, 0)
+
         for epoch in range(self.cfg.epochs):
             running_loss = 0.0
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.cfg.epochs}", leave=False)
@@ -488,31 +543,47 @@ class MultiHumanFinetuner(Inferrer):
             else:
                 smplx_params[k] = v[:, 0:1].to(self.tuner_device)
 
-        render_c2ws = motion_seq["render_c2ws"][:, 0:1].to(self.tuner_device)
-        render_intrs = motion_seq["render_intrs"][:, 0:1].to(self.tuner_device)
-        render_bg_colors = motion_seq["render_bg_colors"][:, 0:1].to(self.tuner_device)
+        centers = compute_frame_centers_from_smplx(motion_seq["smplx_params"]).to(self.tuner_device)
 
-        with torch.no_grad():
-            res = self.model.animation_infer_custom(
-                gs_slice,
-                query_slice,
-                smplx_params,
-                render_c2ws=render_c2ws,
-                render_intrs=render_intrs,
-                render_bg_colors=render_bg_colors,
+        view_degs = [0, 90, 180, 270]
+        for deg in view_degs:
+            if deg == 0:
+                render_c2ws = motion_seq["render_c2ws"][:, 0:1].to(self.tuner_device)
+            else:
+                rotated = rotate_c2ws_y_about_center(
+                    motion_seq["render_c2ws"], centers, degrees=deg
+                ).to(self.tuner_device)
+                render_c2ws = rotated[:, 0:1]
+
+            render_intrs = motion_seq["render_intrs"][:, 0:1].to(self.tuner_device)
+            render_bg_colors = motion_seq["render_bg_colors"][:, 0:1].to(self.tuner_device)
+
+            with torch.no_grad():
+                res = self.model.animation_infer_custom(
+                    gs_slice,
+                    query_slice,
+                    smplx_params,
+                    render_c2ws=render_c2ws,
+                    render_intrs=render_intrs,
+                    render_bg_colors=render_bg_colors,
+                )
+                img = res["comp_rgb"][0].detach().cpu().clamp(0, 1).numpy()
+
+            img_uint8 = (img * 255).astype(np.uint8)
+            save_dir = (
+                self.output_dir
+                / "refined_scene_recon"
+                / self.cfg.exp_name
+                / "visualisations"
+                / meta["track_id"]
+                / f"view_deg{deg}"
             )
-            img = res["comp_rgb"][0].detach().cpu().clamp(0, 1).numpy()
-
-        img_uint8 = (img * 255).astype(np.uint8)
-        save_dir = self.output_dir / "refined_scene_recon" / self.cfg.exp_name / "visualisations" / "canon" / meta[
-            "track_id"
-        ]
-        save_dir.mkdir(parents=True, exist_ok=True)
-        epoch_name = f"{epoch:04d}.png"
-        epoch_path = save_dir / epoch_name
-        Image.fromarray(img_uint8).save(epoch_path)
-        # Copy to last.png
-        Image.fromarray(img_uint8).save(save_dir / "last.png")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            epoch_name = f"{epoch:04d}.png"
+            epoch_path = save_dir / epoch_name
+            Image.fromarray(img_uint8).save(epoch_path)
+            # Copy to last.png
+            Image.fromarray(img_uint8).save(save_dir / "last.png")
 
     # ---------------- Saving ----------------
     def _save_refined_models(self):

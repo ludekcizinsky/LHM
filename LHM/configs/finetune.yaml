@@ -3,17 +3,17 @@ output_dir: /scratch/izar/cizinsky/thesis/preprocessing/${scene_name}/lhm
 exp_name: "dev"
 epochs: 300
 batch_size: 5
-lr: 4e-4
+lr: 1e-4
 weight_decay: 5e-4
 grad_clip: 0.1
 sample_every: 1
 vis_every_epoch: 2
 train_params:
   - offset_xyz
-  - rotation
-  - scaling
+  #- rotation
+  # - scaling
   - opacity
-  - shs
+  #- shs
 
 wandb:
   enable: true
@@ -25,9 +25,9 @@ wandb:
 loss_weights:
   rgb: 1.0
   sil: 0.5
-  lpips: 1.0
-  reg_asap: 50.0
-  reg_acap: 10.0
+  lpips: 0.0
+  reg_asap: 0.0
+  reg_acap: 0.0
 
 
 hydra:
