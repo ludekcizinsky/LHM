@@ -14,9 +14,8 @@ cd /home/cizinsky/LHM
 # configurable settings
 seq_name=$1
 input_video=$2
-nv_rot_degree=$3
+exp_name=$3
 default_ref_frame_idx=0
-exp_name="dev"
 
 # derived paths
 preprocess_dir=/scratch/izar/cizinsky/thesis/preprocessing/$seq_name
@@ -50,12 +49,14 @@ mkdir -p $refined_gs_model_dir
 
 # echo "--- [4/?] Running inference for multi-human LHM"
 # conda deactivate && conda activate lhm
-# python LHM/infer_multi_humans.py --gs_model_dir=$initial_gs_model_dir --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree
+# python LHM/infer_multi_humans.py --gs_model_dir=$initial_gs_model_dir --scene_name=$seq_name --nv_rot_degree=0
+# python LHM/infer_multi_humans.py --gs_model_dir=$initial_gs_model_dir --scene_name=$seq_name --nv_rot_degree=90
 
-# echo "--- [5/?] Running finetuning for multi-human LHM"
-# conda deactivate && conda activate lhm
-# python LHM/finetune_multi_humans.py --output_dir=$output_dir --scene_name=$seq_name  --epochs=10 --batch_size=5 --exp_name=$exp_name
+echo "--- [5/?] Running finetuning for multi-human LHM"
+conda deactivate && conda activate lhm
+python LHM/finetune_multi_humans.py --output_dir=$output_dir --scene_name=$seq_name  --epochs=10 --batch_size=5 --exp_name=$exp_name
 
 echo "--- [6/?] Running inference for multi-human LHM"
 conda deactivate && conda activate lhm
-python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir/$exp_name --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree
+python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir/$exp_name --scene_name=$seq_name --nv_rot_degree=0
+python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir/$exp_name --scene_name=$seq_name --nv_rot_degree=90

@@ -29,6 +29,8 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 import pyiqa
+import wandb
+
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -167,6 +169,7 @@ class MultiHumanFinetuner(Inferrer):
         self.lr = lr
         self.weight_decay = weight_decay
         self.grad_clip = grad_clip
+        self.wandb_run = None
 
         self._load_gs_model(output_dir)
         self._prepare_joined_inputs()
@@ -361,8 +364,26 @@ class MultiHumanFinetuner(Inferrer):
         reg_loss = 50.0 * asap_loss + 10.0 * acap_loss
         return reg_loss, asap_loss, acap_loss
 
+    # ---------------- Logging utilities ----------------
+    def _init_wandb(self):
+        if self.wandb_run is None:
+            self.wandb_run = wandb.init(
+                project="hybrid-lhm",
+                entity="ludekcizinsky",
+                config={
+                    "epochs": self.epochs,
+                    "batch_size": self.batch_size,
+                    "lr": self.lr,
+                    "weight_decay": self.weight_decay,
+                    "grad_clip": self.grad_clip,
+                },
+            )
+
     # ---------------- Training loop ----------------
     def train_loop(self):
+        if self.wandb_run is None:
+            self._init_wandb()
+
         dataset = FrameMaskDataset(self.frames_dir, self.masks_dir, self.tuner_device)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0, drop_last=False)
 
@@ -403,10 +424,27 @@ class MultiHumanFinetuner(Inferrer):
                     acap=f"{acap_loss.item():.4f}",
                 )
 
+                if self.wandb_run is not None:
+                    wandb.log(
+                        {
+                            "loss/combined": loss.item(),
+                            "loss/rgb": rgb_loss.item(),
+                            "loss/sil": sil_loss.item(),
+                            "loss/lpips": lpips_loss.item(),
+                            "loss/reg": reg_loss.item(),
+                            "loss/asap": asap_loss.item(),
+                            "loss/acap": acap_loss.item(),
+                        }
+                    )
+
             avg_loss = running_loss / max(1, len(loader))
             print(f"[Epoch {epoch+1}/{self.epochs}] loss={avg_loss:.4f}")
+            if self.wandb_run is not None:
+                wandb.log({"loss/combined_epoch": avg_loss, "epoch": epoch + 1})
 
         self._save_refined_models()
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
 
     # ---------------- Saving ----------------
     def _save_refined_models(self):
