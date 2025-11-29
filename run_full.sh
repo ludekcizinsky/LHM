@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e # exit on error
 # This script runs the full LHM pipeline: data preparation and inference.
+# Example usage:
+#   bash run_full.sh taichi /home/cizinsky/in_the_wild/bilibili/taichi.mp4 0
 
 # activate conda environment
 source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
@@ -22,12 +24,11 @@ output_dir=$preprocess_dir/lhm
 mkdir -p $output_dir
 frame_folder=$output_dir/frames
 mkdir -p $frame_folder
-gs_model_dir=$output_dir/inference_results
+gs_model_dir=$output_dir/initial_scene_recon
 mkdir -p $gs_model_dir
 render_save_dir=/scratch/izar/cizinsky/thesis/evaluation/videos/renders/custom/lhm
 
 
-# ------------ Start of the pipeline
 # echo "--- [1/?] Running preprocess.sh to generate motion sequences"
 # conda deactivate && conda activate lhm
 # bash preprocess.sh $input_video $output_dir
@@ -46,13 +47,10 @@ render_save_dir=/scratch/izar/cizinsky/thesis/evaluation/videos/renders/custom/l
 # bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B
 # TODO: add script that will visualize each canonical human gs in 3D
 
-echo "--- [4/?] Running inference for multi-human LHM"
-conda deactivate && conda activate lhm
-python LHM/infer_multi_humans.py --gs_model_dir=$gs_model_dir --save_dir=$render_save_dir --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree
-
-# echo "--- [4/?] Running finetuning for multi-human LHM"
-# cd /home/cizinsky/LHM
+# echo "--- [4/?] Running inference for multi-human LHM"
 # conda deactivate && conda activate lhm
-# gs_model_dir=/scratch/izar/cizinsky/multiply-output/preprocessing/data/$seq_name/lhm/inference_results
-# save_dir=/scratch/izar/cizinsky/thesis/evaluation/videos/renders/custom/lhm_finetuned
-# python LHM/finetune_multi_humans.py --gs_model_dir=$gs_model_dir --save_dir=$save_dir --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree
+# python LHM/infer_multi_humans.py --gs_model_dir=$gs_model_dir --save_dir=$render_save_dir --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree
+
+echo "--- [5/?] Running finetuning for multi-human LHM"
+conda deactivate && conda activate lhm
+python LHM/finetune_multi_humans.py --output_dir=$output_dir --render_save_dir=$render_save_dir --scene_name=$seq_name 

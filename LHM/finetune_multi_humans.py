@@ -23,7 +23,6 @@ from LHM.runners.infer.base_inferrer import Inferrer
 import torch
 import numpy as np
 
-from LHM.utils.ffmpeg_utils import images_to_video
 from LHM.outputs.output import GaussianAppOutput
 
 from dataclasses import fields
@@ -39,61 +38,16 @@ def enable_gaussian_grads(gauss: GaussianAppOutput, *, detach_to_leaf=False):
                 v.requires_grad_(True)
 
 
-def compute_frame_centers_from_smplx(smplx_params: dict) -> torch.Tensor:
-    """
-    smplx_params: dict containing key "trans" of shape [num_people, T, 3]
-    returns: centers of shape [1, T, 3] (mean of all people per frame)
-    """
-    trans = smplx_params["trans"]  # [num_people, T, 3]
-    centers = trans.mean(dim=0, keepdim=True)  # [1, T, 3]
-    return centers
+class MultiHumanFinetuner(Inferrer):
+    EXP_TYPE = "multi_human_finetune"
 
-def rotate_c2ws_y_about_center(c2ws: torch.Tensor, centers: torch.Tensor, degrees: float) -> torch.Tensor:
-    """
-    Yaw cameras around a per-frame center on the world Y-axis.
-    c2ws: [..., 4, 4]
-    centers: [..., 3] matching leading dims of c2ws
-    returns: same shape as c2ws
-    """
-    # Ensure dtype/device alignment
-    centers = centers.to(dtype=c2ws.dtype, device=c2ws.device)
-
-    rad = math.radians(-degrees)
-    cos, sin = math.cos(rad), math.sin(rad)
-    R = torch.tensor(
-        [[cos, 0.0, sin, 0.0],
-         [0.0, 1.0, 0.0, 0.0],
-         [-sin, 0.0, cos, 0.0],
-         [0.0, 0.0, 0.0, 1.0]],
-        dtype=c2ws.dtype,
-        device=c2ws.device,
-    )
-
-    # Broadcast R to leading dims
-    while R.dim() < c2ws.dim():
-        R = R.unsqueeze(0)
-
-    # Build T(-center) and T(center) with shapes matching c2ws leading dims.
-    leading_shape = c2ws.shape[:-2]
-    I = torch.eye(4, dtype=c2ws.dtype, device=c2ws.device)
-    T_neg = I.expand(*leading_shape, 4, 4).clone()
-    T_pos = I.expand(*leading_shape, 4, 4).clone()
-    T_neg[..., :3, 3] = -centers
-    T_pos[..., :3, 3] = centers
-
-    # Apply: T(center) @ R_y @ T(-center) @ c2w
-    return T_pos @ (R @ (T_neg @ c2ws))
-
-class MultiHumanInferrer(Inferrer):
-    EXP_TYPE = "multi_human_infer"
-
-    def __init__(self, gs_model_dir: Path, save_dir: Path, scene_name: str):
+    def __init__(self, output_dir: Path, render_save_dir: Path, scene_name: str):
         super().__init__()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.load_gs_model(gs_model_dir)
+        self.load_gs_model(output_dir)
         self.model : ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(device)
-        self.save_dir = save_dir
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.render_save_dir = render_save_dir
+        self.render_save_dir.mkdir(parents=True, exist_ok=True)
         self.scene_name = scene_name
 
     def _build_model(self):
@@ -102,7 +56,8 @@ class MultiHumanInferrer(Inferrer):
         model = hf_model_cls.from_pretrained(model_name)
         return model
 
-    def load_gs_model(self, root_gs_model_dir: Path):
+    def load_gs_model(self, root_output_dir: Path):
+        root_gs_model_dir = root_output_dir / "initial_scene_recon"
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         track_ids = os.listdir(root_gs_model_dir)
         track_ids = sorted([track_id for track_id in track_ids if (root_gs_model_dir / track_id).is_dir()])
@@ -120,6 +75,9 @@ class MultiHumanInferrer(Inferrer):
         print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
 
     def infer_single(self, *args, **kwargs):
+        pass
+
+    def infer(self):
         pass
 
     def _get_joined_inference_inputs(self):
@@ -163,23 +121,16 @@ class MultiHumanInferrer(Inferrer):
 
         return gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param
 
-    def infer(self, nv_rot_degree=0):
+    def finetune(self):
         # Prepare inputs
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param = self._get_joined_inference_inputs()
 
-        if nv_rot_degree != 0:
-            print(f"[DEBUG] Rotate cameras by {nv_rot_degree} degrees around world Y axis.")
-            centers = compute_frame_centers_from_smplx(motion_seq["smplx_params"])
-            print(f"[DEBUG] centers shape: {centers.shape}")
-            motion_seq["render_c2ws"] = rotate_c2ws_y_about_center(motion_seq["render_c2ws"], centers, nv_rot_degree)
-
-        batch_list = [] 
         batch_size = 40  # avoid memeory out!
 
         camera_size = len(motion_seq["motion_seqs"])
         for batch_i in range(0, camera_size, batch_size):
-            print(f"batch: {batch_i}, total: {camera_size //batch_size +1} ")
+            print(f"[DEBUG] batch: {batch_i}, total: {camera_size //batch_size +1} ")
 
             keys = [
                 "root_pose",
@@ -205,7 +156,6 @@ class MultiHumanInferrer(Inferrer):
                     :, batch_i : batch_i + batch_size
                 ].to(device)
 
-            print(f"[DEBUG] Does first 3D gauss have grad? {gs_model_list[0].offset_xyz.requires_grad}")
             res = self.model.animation_infer_custom(gs_model_list, query_points, batch_smplx_params,
                 render_c2ws=motion_seq["render_c2ws"][
                     :, batch_i : batch_i + batch_size
@@ -221,49 +171,22 @@ class MultiHumanInferrer(Inferrer):
             comp_rgb = res["comp_rgb"] # [Nv, H, W, 3], 0-1
             comp_mask = res["comp_mask"] # [Nv, H, W, 3], 0-1
             comp_mask[comp_mask < 0.5] = 0.0
-            print(f"[DEBUG] does comp rgb have grad? {comp_rgb.requires_grad}, comp mask grad? {comp_mask.requires_grad}")
-            quit()
-
             batch_rgb = comp_rgb * comp_mask + (1 - comp_mask) * 1
-            batch_rgb = (batch_rgb.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
-            batch_list.append(batch_rgb)
+            
+            # assert batch rgb to have grad
+            assert batch_rgb.requires_grad, "[ERROR] batch_rgb does not have grad!"
 
             del res
             torch.cuda.empty_cache()
         
-        rgb = np.concatenate(batch_list, axis=0)
-
-        # if nv_rot_degree != 0, need to create a new save dir
-        # 1. replace "renders" in the save dir path with "renders_rot{nv_rot_degree}"
-        # 2. create the new save dir if it does not exist
-        if nv_rot_degree != 0:
-            new_save_dir_str = str(self.save_dir).replace("renders", f"renders_rot{nv_rot_degree}")
-            self.save_dir = Path(new_save_dir_str)
-            self.save_dir.mkdir(parents=True, exist_ok=True)
-
-        dump_video_path = self.save_dir / f"{self.scene_name}.mp4"
-
-        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
-
-        print(f"save video to {dump_video_path}")
-
-
-        images_to_video(
-            rgb,
-            output_path=dump_video_path,
-            fps=20,
-            gradio_codec=False,
-            verbose=True,
-        )
 
 if __name__ == "__main__":
 
     parser = ArgumentParser()
-    parser.add_argument("--gs_model_dir", type=Path)
-    parser.add_argument("--save_dir", type=Path)
+    parser.add_argument("--output_dir", type=Path)
+    parser.add_argument("--render_save_dir", type=Path)
     parser.add_argument("--scene_name", type=str)
-    parser.add_argument("--nv_rot_degree", type=int, default=0)
     args = parser.parse_args()
 
-    inferrer = MultiHumanInferrer(gs_model_dir=args.gs_model_dir, save_dir=args.save_dir, scene_name=args.scene_name)
-    inferrer.infer(nv_rot_degree=args.nv_rot_degree)
+    tuner = MultiHumanFinetuner(output_dir=args.output_dir, render_save_dir=args.render_save_dir, scene_name=args.scene_name)
+    tuner.finetune()
