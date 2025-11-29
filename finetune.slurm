@@ -15,7 +15,37 @@ cd /home/cizinsky/LHM
 # --- Shared settings
 seq_name="taichi"
 path_to_video="/home/cizinsky/in_the_wild/bilibili/taichi.mp4"
+lr=0.0004
+wd=0.0005
+gclip=0.1
 
 # --- Expriments
-exp_name="dev"
-bash run_full.sh $seq_name $path_to_video $exp_name
+# exp_name="default"
+# bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd $gclip
+
+# exp_name="lr001"
+# bash run_full.sh $seq_name $path_to_video $exp_name 0.001 $wd $gclip
+
+# exp_name="lr005"
+# bash run_full.sh $seq_name $path_to_video $exp_name 0.005 $wd $gclip
+
+# exp_name="lr01"
+# bash run_full.sh $seq_name $path_to_video $exp_name 0.01 $wd $gclip
+
+# exp_name="wd001"
+# bash run_full.sh $seq_name $path_to_video $exp_name $lr 0.001 $gclip
+
+# exp_name="wd005"
+# bash run_full.sh $seq_name $path_to_video $exp_name $lr 0.005 $gclip
+
+# exp_name="wd01"
+# bash run_full.sh $seq_name $path_to_video $exp_name $lr 0.01 $gclip
+
+# exp_name="gclip05"
+# bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.05
+
+# exp_name="gclip2"
+# bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.2
+
+exp_name="gclip4"
+bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.4

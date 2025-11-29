@@ -1,0 +1,87 @@
+{
+  "os": "Linux-5.14.0-70.30.1.el9_0.x86_64-x86_64-with-glibc2.34",
+  "python": "CPython 3.10.19",
+  "startedAt": "2025-11-29T16:50:15.119495Z",
+  "args": [
+    "--output_dir=/scratch/izar/cizinsky/thesis/preprocessing/taichi/lhm",
+    "--scene_name=taichi",
+    "--exp_name=wd001",
+    "--lr=0.0004",
+    "--weight_decay=0.001",
+    "--grad_clip=0.1"
+  ],
+  "program": "/home/cizinsky/LHM/LHM/finetune_multi_humans.py",
+  "codePath": "LHM/finetune_multi_humans.py",
+  "codePathLocal": "LHM/finetune_multi_humans.py",
+  "git": {
+    "remote": "git@github.com:ludekcizinsky/LHM.git",
+    "commit": "be83bf89f361923d348129ebd65768e39ecb7e8e"
+  },
+  "email": "ludekcizinsky11@gmail.com",
+  "root": "/home/cizinsky/LHM",
+  "host": "i61",
+  "executable": "/scratch/izar/cizinsky/venvs/lhm/bin/python",
+  "cpu_count": 40,
+  "cpu_count_logical": 40,
+  "gpu": "Tesla V100-PCIE-32GB",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "53660876800",
+      "used": "8677412864"
+    }
+  },
+  "memory": {
+    "total": "404847284224"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "Tesla V100-PCIE-32GB",
+      "memoryTotal": "34359738368",
+      "cudaCores": 5120,
+      "architecture": "Volta",
+      "uuid": "GPU-3e4e6d9e-95bf-4bdb-ccab-4855b283af02"
+    }
+  ],
+  "cudaVersion": "12.2",
+  "slurm": {
+    "cluster_name": "izar",
+    "conf": "/var/spool/slurmd/conf-cache/slurm.conf",
+    "cpus_on_node": "8",
+    "cpus_per_task": "8",
+    "gpus_on_node": "1",
+    "gtids": "0",
+    "job_account": "master",
+    "job_cpus_per_node": "8",
+    "job_end_time": "1764438544",
+    "job_gid": "30145",
+    "job_gpus": "0",
+    "job_id": "2737599",
+    "job_name": "lhm",
+    "job_nodelist": "i61",
+    "job_num_nodes": "1",
+    "job_partition": "gpu",
+    "job_qos": "normal",
+    "job_start_time": "1764434944",
+    "job_uid": "278297",
+    "job_user": "cizinsky",
+    "jobid": "2737599",
+    "localid": "0",
+    "mem_per_node": "32768",
+    "nnodes": "1",
+    "nodeid": "0",
+    "nodelist": "i61",
+    "nprocs": "1",
+    "ntasks": "1",
+    "procid": "0",
+    "script_context": "prolog_task",
+    "submit_dir": "/home/cizinsky/LHM",
+    "submit_host": "i30",
+    "task_pid": "371977",
+    "tasks_per_node": "1",
+    "topology_addr": "t1.ibsw1.i61",
+    "topology_addr_pattern": "switch.switch.node",
+    "tres_per_task": "cpu:8"
+  },
+  "writerId": "b1fytr1l6oz8nc7e2hx6q5h8hmjxhwjk"
+}
