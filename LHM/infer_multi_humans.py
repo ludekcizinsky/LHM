@@ -72,13 +72,12 @@ def rotate_c2ws_y_about_center(c2ws: torch.Tensor, centers: torch.Tensor, degree
 class MultiHumanInferrer(Inferrer):
     EXP_TYPE = "multi_human_infer"
 
-    def __init__(self, gs_model_dir: Path, save_dir: Path, scene_name: str):
+    def __init__(self, gs_model_dir: Path, scene_name: str):
         super().__init__()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.gs_model_dir = gs_model_dir
         self.load_gs_model(gs_model_dir)
         self.model : ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(device)
-        self.save_dir = save_dir
-        self.save_dir.mkdir(parents=True, exist_ok=True)
         self.scene_name = scene_name
 
     def _build_model(self):
@@ -94,12 +93,15 @@ class MultiHumanInferrer(Inferrer):
         print(f"[DEBUG] Found {len(track_ids)} humans for inference: {track_ids}")
         self.all_model_list = []
         for track_id in track_ids:
+            print(f"      Loading GS model for human: {track_id}")
             gs_model_dir = root_gs_model_dir / track_id
             gs_model_list = torch.load(gs_model_dir / "gs_model_list.pt", map_location=device)
             query_points = torch.load(gs_model_dir / "query_points.pt", map_location=device)
             transform_mat_neutral_pose = torch.load(gs_model_dir / "transform_mat_neutral_pose.pt", map_location=device)
             motion_seq = torch.load(gs_model_dir / "motion_seq.pt", map_location=device)
-            shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).unsqueeze(0).to(device)
+            shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).to(device)
+            if shape_params.dim() == 1:
+                shape_params = shape_params.unsqueeze(0)
             model = (gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_params)
             self.all_model_list.append(model)
         print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
@@ -214,24 +216,11 @@ class MultiHumanInferrer(Inferrer):
 
             del res
             torch.cuda.empty_cache()
-        
+
+        # Save video 
         rgb = np.concatenate(batch_list, axis=0)
-
-        # if nv_rot_degree != 0, need to create a new save dir
-        # 1. replace "renders" in the save dir path with "renders_rot{nv_rot_degree}"
-        # 2. create the new save dir if it does not exist
-        if nv_rot_degree != 0:
-            new_save_dir_str = str(self.save_dir).replace("renders", f"renders_rot{nv_rot_degree}")
-            self.save_dir = Path(new_save_dir_str)
-            self.save_dir.mkdir(parents=True, exist_ok=True)
-
-        dump_video_path = self.save_dir / f"{self.scene_name}.mp4"
-
+        dump_video_path = self.gs_model_dir / f"{self.scene_name}_nv{nv_rot_degree}.mp4"
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
-
-        print(f"save video to {dump_video_path}")
-
-
         images_to_video(
             rgb,
             output_path=dump_video_path,
@@ -239,16 +228,16 @@ class MultiHumanInferrer(Inferrer):
             gradio_codec=False,
             verbose=True,
         )
+        print(f"[INFO] Saved video to {dump_video_path}")
 
 if __name__ == "__main__":
 
     parser = ArgumentParser()
     parser.add_argument("--gs_model_dir", type=Path)
-    parser.add_argument("--save_dir", type=Path)
     parser.add_argument("--scene_name", type=str)
     parser.add_argument("--nv_rot_degree", type=int, default=0)
     parser.add_argument("--fps", type=int, default=10)
     args = parser.parse_args()
 
-    inferrer = MultiHumanInferrer(gs_model_dir=args.gs_model_dir, save_dir=args.save_dir, scene_name=args.scene_name)
+    inferrer = MultiHumanInferrer(gs_model_dir=args.gs_model_dir, scene_name=args.scene_name)
     inferrer.infer(nv_rot_degree=args.nv_rot_degree, fps=args.fps)

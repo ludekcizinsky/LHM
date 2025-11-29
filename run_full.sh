@@ -24,10 +24,10 @@ output_dir=$preprocess_dir/lhm
 mkdir -p $output_dir
 frame_folder=$output_dir/frames
 mkdir -p $frame_folder
-gs_model_dir=$output_dir/initial_scene_recon
-mkdir -p $gs_model_dir
-render_save_dir=/scratch/izar/cizinsky/thesis/evaluation/videos/renders/custom/lhm
-
+initial_gs_model_dir=$output_dir/initial_scene_recon
+mkdir -p $initial_gs_model_dir
+refined_gs_model_dir=$output_dir/refined_scene_recon
+mkdir -p $refined_gs_model_dir
 
 # echo "--- [1/?] Running preprocess.sh to generate motion sequences"
 # conda deactivate && conda activate lhm
@@ -49,8 +49,12 @@ render_save_dir=/scratch/izar/cizinsky/thesis/evaluation/videos/renders/custom/l
 
 # echo "--- [4/?] Running inference for multi-human LHM"
 # conda deactivate && conda activate lhm
-# python LHM/infer_multi_humans.py --gs_model_dir=$gs_model_dir --save_dir=$render_save_dir --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree
+# python LHM/infer_multi_humans.py --gs_model_dir=$initial_gs_model_dir --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree
 
-echo "--- [5/?] Running finetuning for multi-human LHM"
+# echo "--- [5/?] Running finetuning for multi-human LHM"
+# conda deactivate && conda activate lhm
+# python LHM/finetune_multi_humans.py --output_dir=$output_dir --render_save_dir=$render_save_dir --scene_name=$seq_name  --epochs=10
+
+echo "--- [6/?] Running inference for multi-human LHM"
 conda deactivate && conda activate lhm
-python LHM/finetune_multi_humans.py --output_dir=$output_dir --render_save_dir=$render_save_dir --scene_name=$seq_name 
+python LHM/infer_multi_humans.py --gs_model_dir=$refined_gs_model_dir --scene_name=$seq_name --nv_rot_degree=$nv_rot_degree

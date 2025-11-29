@@ -19,6 +19,7 @@ from argparse import ArgumentParser
 from dataclasses import fields
 from pathlib import Path
 from typing import List, Tuple
+import copy
 from tqdm import tqdm
 
 import numpy as np
@@ -190,10 +191,11 @@ class MultiHumanFinetuner(Inferrer):
                 if (root_gs_model_dir / track_id).is_dir()
             ]
         )
-        print(f"[DEBUG] Found {len(track_ids)} humans for finetuning: {track_ids}")
+        # print(f"[DEBUG] Found {len(track_ids)} humans for finetuning: {track_ids}")
         self.all_model_list = []
         self.track_meta = []
         for track_id in track_ids:
+            # print(f"    Loading GS model for track_id: {track_id}")
             gs_model_dir = root_gs_model_dir / track_id
             gs_model_list = torch.load(gs_model_dir / "gs_model_list.pt", map_location=self.tuner_device)
             query_points = torch.load(gs_model_dir / "query_points.pt", map_location=self.tuner_device)
@@ -201,20 +203,22 @@ class MultiHumanFinetuner(Inferrer):
                 gs_model_dir / "transform_mat_neutral_pose.pt", map_location=self.tuner_device
             )
             motion_seq = torch.load(gs_model_dir / "motion_seq.pt", map_location=self.tuner_device)
+            # print(f"       Motion_seq root_pose shape: {motion_seq['smplx_params']['root_pose'].shape}")
             shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).unsqueeze(0).to(self.tuner_device)
             model = (gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_params)
             self.all_model_list.append(model)
+            motion_seq_for_save = copy.deepcopy(motion_seq)
             self.track_meta.append(
                 {
                     "track_id": track_id,
                     "gs_count": len(gs_model_list),
                     "query_count": query_points.shape[0],
                     "transform_count": transform_mat_neutral_pose.shape[0],
-                    "motion_seq": motion_seq,
+                    "motion_seq": motion_seq_for_save,
                     "shape_params": shape_params,
                 }
             )
-        print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
+        # print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
 
     def _prepare_joined_inputs(self):
         train_fields = ("offset_xyz", "rotation", "scaling", "opacity", "shs")
@@ -262,7 +266,7 @@ class MultiHumanFinetuner(Inferrer):
                 )
 
             if self.motion_seq is None:
-                self.motion_seq = p_motion_seq
+                self.motion_seq = copy.deepcopy(p_motion_seq)
             else:
                 for key in self.motion_seq["smplx_params"].keys():
                     self.motion_seq["smplx_params"][key] = torch.cat(
@@ -377,8 +381,10 @@ class MultiHumanFinetuner(Inferrer):
         save_root = self.output_dir / "refined_scene_recon"
         save_root.mkdir(parents=True, exist_ok=True)
 
+        # print(f"[INFO] Saving refined models to {save_root}...")
         for idx, meta in enumerate(self.track_meta):
             track_id = meta["track_id"]
+            # print(f"    Saving refined model for track_id: {track_id}")
             gs_start, gs_count = self.gs_track_offsets[idx]
             q_start, q_count, t_count = self.query_track_offsets[idx]
 
@@ -393,7 +399,7 @@ class MultiHumanFinetuner(Inferrer):
             torch.save(query_slice, track_dir / "query_points.pt")
             torch.save(transform_slice, track_dir / "transform_mat_neutral_pose.pt")
             torch.save(meta["motion_seq"], track_dir / "motion_seq.pt")
-            np.save(track_dir / "shape_params.npy", meta["shape_params"].cpu().numpy())
+            np.save(track_dir / "shape_params.npy", meta["shape_params"].squeeze(0).cpu().numpy())
 
         print(f"[INFO] Saved refined models to {save_root}")
 
