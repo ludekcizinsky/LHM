@@ -149,7 +149,7 @@ class MultiHumanFinetuner(Inferrer):
     def __init__(
         self,
         output_dir: Path,
-        render_save_dir: Path,
+        exp_name: str,
         scene_name: str,
         epochs: int,
         batch_size: int,
@@ -160,8 +160,7 @@ class MultiHumanFinetuner(Inferrer):
         super().__init__()
         self.tuner_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output_dir = output_dir
-        self.render_save_dir = render_save_dir
-        self.render_save_dir.mkdir(parents=True, exist_ok=True)
+        self.exp_name = exp_name
         self.scene_name = scene_name
         self.epochs = epochs
         self.batch_size = batch_size
@@ -334,6 +333,34 @@ class MultiHumanFinetuner(Inferrer):
             render_bg_colors=render_bg_colors,
         )
 
+    def _canonical_regularization(self):
+        """Return combined canonical regularization and its components."""
+        asap_terms = []
+        acap_terms = []
+        margin = 0.0525  # meters
+        for gauss in self.gs_model_list:
+            # Gaussian Shape Regularization (ASAP): encourage isotropic scales.
+            scales = gauss.scaling
+            # If scaling is stored in log-space, exp() keeps positivity; otherwise it’s a smooth surrogate.
+            scales_pos = torch.exp(scales)
+            asap = ((scales_pos - scales_pos.mean(dim=-1, keepdim=True)) ** 2).sum(dim=-1).mean()
+            asap_terms.append(asap)
+
+            # Positional anchoring (ACAP): hinge on offset magnitude beyond margin.
+            offsets = gauss.offset_xyz
+            acap = torch.clamp(offsets.norm(dim=-1) - margin, min=0.0).mean()
+            acap_terms.append(acap)
+
+        if len(asap_terms) == 0:
+            return torch.tensor(0.0, device=self.tuner_device), torch.tensor(0.0, device=self.tuner_device), torch.tensor(
+                0.0, device=self.tuner_device
+            )
+
+        asap_loss = torch.stack(asap_terms).mean()
+        acap_loss = torch.stack(acap_terms).mean()
+        reg_loss = 50.0 * asap_loss + 10.0 * acap_loss
+        return reg_loss, asap_loss, acap_loss
+
     # ---------------- Training loop ----------------
     def train_loop(self):
         dataset = FrameMaskDataset(self.frames_dir, self.masks_dir, self.tuner_device)
@@ -362,14 +389,19 @@ class MultiHumanFinetuner(Inferrer):
                 rgb_loss = F.mse_loss(pred_masked, gt_masked)
                 sil_loss = F.mse_loss(comp_mask, masks)
                 lpips_loss = masked_lpips(gt_masked, masks, comp_rgb)
+                reg_loss, asap_loss, acap_loss = self._canonical_regularization()
 
-                loss = rgb_loss + 0.5 * sil_loss + lpips_loss
+                loss = rgb_loss + 0.5 * sil_loss + lpips_loss + reg_loss
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, self.grad_clip)
                 optimizer.step()
 
                 running_loss += loss.item()
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    asap=f"{asap_loss.item():.4f}",
+                    acap=f"{acap_loss.item():.4f}",
+                )
 
             avg_loss = running_loss / max(1, len(loader))
             print(f"[Epoch {epoch+1}/{self.epochs}] loss={avg_loss:.4f}")
@@ -378,7 +410,7 @@ class MultiHumanFinetuner(Inferrer):
 
     # ---------------- Saving ----------------
     def _save_refined_models(self):
-        save_root = self.output_dir / "refined_scene_recon"
+        save_root = self.output_dir / "refined_scene_recon" / self.exp_name
         save_root.mkdir(parents=True, exist_ok=True)
 
         # print(f"[INFO] Saving refined models to {save_root}...")
@@ -417,7 +449,7 @@ class MultiHumanFinetuner(Inferrer):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--render_save_dir", type=Path, required=True)
+    parser.add_argument("--exp_name", type=str, default="dev")
     parser.add_argument("--scene_name", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -428,7 +460,7 @@ if __name__ == "__main__":
 
     tuner = MultiHumanFinetuner(
         output_dir=args.output_dir,
-        render_save_dir=args.render_save_dir,
+        exp_name=args.exp_name,
         scene_name=args.scene_name,
         epochs=args.epochs,
         batch_size=args.batch_size,
