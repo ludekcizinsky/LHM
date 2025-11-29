@@ -147,7 +147,7 @@ class MultiHumanInferrer(Inferrer):
 
         return gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param
 
-    def infer(self, nv_rot_degree=0):
+    def infer(self, nv_rot_degree=0, fps=10):
         # Prepare inputs
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_param = self._get_joined_inference_inputs()
@@ -235,7 +235,7 @@ class MultiHumanInferrer(Inferrer):
         images_to_video(
             rgb,
             output_path=dump_video_path,
-            fps=20,
+            fps=fps,
             gradio_codec=False,
             verbose=True,
         )
@@ -247,7 +247,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=Path)
     parser.add_argument("--scene_name", type=str)
     parser.add_argument("--nv_rot_degree", type=int, default=0)
+    parser.add_argument("--fps", type=int, default=10)
     args = parser.parse_args()
 
     inferrer = MultiHumanInferrer(gs_model_dir=args.gs_model_dir, save_dir=args.save_dir, scene_name=args.scene_name)
-    inferrer.infer(nv_rot_degree=args.nv_rot_degree)
+    inferrer.infer(nv_rot_degree=args.nv_rot_degree, fps=args.fps)

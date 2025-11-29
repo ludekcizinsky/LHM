@@ -14,12 +14,13 @@ ref_frame_idx=$3
 model_name=$4
 
 # derived paths
-preprocess_dir="/scratch/izar/cizinsky/multiply-output/preprocessing/data/$seq_name/lhm"
+preprocess_dir="/scratch/izar/cizinsky/thesis/preprocessing/$seq_name/lhm"
 track_dir=$(printf "%02d" "$track_idx")
 frame_file=$(printf "%04d.png" "$ref_frame_idx")
 image_input="$preprocess_dir/masked_images/$track_dir/$frame_file"
 motion_seqs_dir="$preprocess_dir/motion/$track_dir/smplx_params"
 save_dir=$preprocess_dir/inference_results/$track_dir
+mkdir -p $save_dir
 
 # default settings 
 MOTION_IMG_DIR=None
@@ -30,7 +31,6 @@ MOTION_VIDEO_READ_FPS=30
 EXPORT_VIDEO=True
 
 # inference
-echo "INFERENCE VIDEO"
 python -m LHM.launch infer.human_lrm model_name=$model_name \
         image_input=$image_input \
         export_video=$EXPORT_VIDEO \

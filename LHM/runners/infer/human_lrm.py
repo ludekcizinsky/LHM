@@ -743,7 +743,7 @@ class HumanLRMInferrer(Inferrer):
             )
             self.motion_dict[motion_name] = motion_seq
 
-        # TODO: save motion seq
+        # Save motion seq
         motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
         torch.save(motion_seq, motion_seq_save_path)
         print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
@@ -768,7 +768,7 @@ class HumanLRMInferrer(Inferrer):
                 k: v.to(device) for k, v in smplx_params.items()
             },
         )
-        # TODO: save gs model, query points and transform_mat_neutral_pose
+        # Save gs model, query points and transform_mat_neutral_pose
         gs_model_save_path = Path(self.cfg.save_dir) / "gs_model_list.pt"
         query_points_save_path = Path(self.cfg.save_dir) / "query_points.pt"
         transform_mat_save_path = Path(self.cfg.save_dir) / "transform_mat_neutral_pose.pt"
@@ -779,95 +779,8 @@ class HumanLRMInferrer(Inferrer):
         print(f"[DEBUG] saved query points to {query_points_save_path}")
         print(f"[DEBUG] saved transform matrix to {transform_mat_save_path}")
 
-#         print(f"[DEBUG] render_c2ws shape: {motion_seq['render_c2ws'].shape}")
-        # print(f"[DEBUG] finished infer canonical gs model for {image_path}")
-        # print(f"[DEBUG] Len of gs_model_list: {len(gs_model_list)}")
-        # print(f"[DEBUG] First gs model type: {type(gs_model_list[0])}")
-        # print(f"[DEBUG] First gs model shape of offset xyz: {gs_model_list[0].offset_xyz.shape}")
-        # print(f"[DEBUG] First gs model shape of opacity: {gs_model_list[0].opacity.shape}")
-        # print(f"[DEBUG] First gs model shape of rotation: {gs_model_list[0].rotation.shape}")
-        # print(f"[DEBUG] First gs model shape of scaling: {gs_model_list[0].scaling.shape}")
-        # print(f"[DEBUG] First gs model shape of shs: {gs_model_list[0].shs.shape}")
-        # print(f"[DEBUG] First gs model use rgb: {gs_model_list[0].use_rgb}")
-        # print(f"[DEBUG] query_points shape: {query_points.shape}")
-        # print(f"[DEBUG] transform_mat_neutral_pose shape: {transform_mat_neutral_pose.shape}")
         return 
 
-        # Use the motion sequence to animate the gs model and render video
-        batch_list = [] 
-        batch_size = 40  # avoid memeory out!
-
-        camera_size = len(motion_seq["motion_seqs"])
-        for batch_i in range(0, camera_size, batch_size):
-            with torch.no_grad():
-                # TODO check device and dtype
-                # dict_keys(['comp_rgb', 'comp_rgb_bg', 'comp_mask', 'comp_depth', '3dgs'])
-
-                print(f"batch: {batch_i}, total: {camera_size //batch_size +1} ")
-
-                keys = [
-                    "root_pose",
-                    "body_pose",
-                    "jaw_pose",
-                    "leye_pose",
-                    "reye_pose",
-                    "lhand_pose",
-                    "rhand_pose",
-                    "trans",
-                    "focal",
-                    "princpt",
-                    "img_size_wh",
-                    "expr",
-                ]
-
-
-                batch_smplx_params = dict()
-                batch_smplx_params["betas"] = shape_param.to(device)
-                batch_smplx_params['transform_mat_neutral_pose'] = transform_mat_neutral_pose
-                for key in keys:
-                    batch_smplx_params[key] = motion_seq["smplx_params"][key][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device)
-
-                # def animation_infer(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_h, render_w):
-                res = self.model.animation_infer(gs_model_list, query_points, batch_smplx_params,
-                    render_c2ws=motion_seq["render_c2ws"][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device),
-                    render_intrs=motion_seq["render_intrs"][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device),
-                    render_bg_colors=motion_seq["render_bg_colors"][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device),
-                    )
-
-            comp_rgb = res["comp_rgb"] # [Nv, H, W, 3], 0-1
-            comp_mask = res["comp_mask"] # [Nv, H, W, 3], 0-1
-
-            comp_mask[comp_mask < 0.5] = 0.0
-
-            batch_rgb = comp_rgb * comp_mask + (1 - comp_mask) * 1
-            batch_rgb = (batch_rgb.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
-            batch_list.append(batch_rgb)
-
-            del res
-            torch.cuda.empty_cache()
-        
-        rgb = np.concatenate(batch_list, axis=0)
-
-        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
-
-        print(f"save video to {dump_video_path}")
-
-
-        images_to_video(
-            rgb,
-            output_path=dump_video_path,
-            fps=render_fps,
-            gradio_codec=False,
-            verbose=True,
-        )
 
     def infer(self):
 
@@ -939,7 +852,7 @@ class HumanLRMInferrer(Inferrer):
             print(f"[DEBUG] estimated body ratio: {shape_pose.ratio}")
             print(f"[DEBUG] estimated body shape parameters: {shape_pose.beta.shape}")
 
-            # TODO: save shape pose beta
+            # Save shape pose beta
             beta_save_path = Path(self.cfg.save_dir) / "shape_params.npy"
             np.save(beta_save_path, shape_pose.beta)
             print(f"[DEBUG] saved shape parameters to {beta_save_path}")
