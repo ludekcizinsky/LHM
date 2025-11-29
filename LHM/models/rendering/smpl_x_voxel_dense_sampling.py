@@ -715,12 +715,13 @@ class SMPLXVoxelMeshModel(nn.Module):
         coordinates = coordinates.cuda()
 
         if os.path.exists(f"/scratch/izar/cizinsky/pretrained/pretrained_models/voxel_grid/voxel_{voxel_size}.pth"):
-            print(f"load voxel_grid voxel_{voxel_size}.pth")
+            print(f"[INFO] Successfully load precomputed voxel grid of size {voxel_size}")
             voxel_flat = torch.load(
                 os.path.join(f"/scratch/izar/cizinsky/pretrained/pretrained_models/voxel_grid/voxel_{voxel_size}.pth"),
                 map_location=avaliable_device(),
             )
         else:
+            print(f"[INFO] Computing voxel grid of size {voxel_size} from scratch")
             voxel_flat = self.voxel_smooth_register(
                 coordinates, template_verts, skinning_weight, k=1, smooth_n=3000
             )
@@ -1164,13 +1165,14 @@ class SMPLXVoxelMeshModel(nn.Module):
         # smplx facial expression offset
 
         try:
+            # print(f"[DEBUG] Adding SMPL-X facial expression offset")
             smplx_expr_offset = (
                 smplx_data["expr"].unsqueeze(1).unsqueeze(1) * self.expr_dirs
             ).sum(
                 -1
             )  # [B, 1, 1, 50] x [N_V, 3, 50] -> [B, N_v, 3]
         except:
-            print("no use flame params")
+            # print("[DEBUG] No SMPL-X expression offset found, setting to zero")
             smplx_expr_offset = 0.0
 
         mean_3d = mean_3d + smplx_expr_offset  # 大 pose

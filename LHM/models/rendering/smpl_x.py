@@ -974,12 +974,14 @@ class SMPLXModel(nn.Module):
 
         # smplx facial expression offset
         try:
+            print(f"[DEBUG] Adding SMPL-X facial expression offset")
             smplx_expr_offset = (
                 smplx_data["expr"].unsqueeze(1).unsqueeze(1) * self.expr_dirs
             ).sum(
                 -1
             )  # [B, 1, 1, 50] x [N_V, 3, 50] -> [B, N_v, 3]
         except:
+            print(f"[DEBUG] No SMPL-X expression offset found, setting to zero")
             smplx_expr_offset = 0.0
 
         mean_3d = mean_3d + smplx_expr_offset  # 大 pose

@@ -107,9 +107,9 @@ class ModelHumanLRM(nn.Module):
         elif self.latent_query_points_type.startswith("e2e_smplx"):
             skip_decoder = True
             self.pcl_embed = PointEmbed(dim=pcl_dim)  # pcl dim 1024
+            print(f"[INFO] skip decoder for e2e_smplx latent points")
         else:
             raise NotImplementedError
-        print(f"==========skip_decoder:{skip_decoder}")
 
         # transformer
         self.transformer = self.build_transformer(

@@ -789,6 +789,7 @@ class GS3DRenderer(nn.Module):
         elif self.smpl_type == "smplx_1":
             raise NotImplementedError("inference version does not support")
         elif self.smpl_type == "smplx_2":
+            print("[INFO] Using SMPLX Voxel Dense Sampling Model")
             self.smplx_model = SMPLXVoxelMeshModel(
                 human_model_path,
                 gender="neutral",
@@ -1016,7 +1017,7 @@ class GS3DRenderer(nn.Module):
             num_view = merge_smplx_data["body_pose"].shape[0]  # [Nv, 21, 3]
             # Broadcast inputs across all poses/canonical view.
             mean_3d = mean_3d.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, N, 3]
-            query_points = query_points.unsqueeze(0).repeat(num_view, 1, 1)
+            query_points = query_points.unsqueeze(0).repeat(num_view, 1, 1) # [Nv, N, 3]
             transform_mat_neutral_pose = transform_mat_neutral_pose.unsqueeze(0).repeat(
                 num_view, 1, 1, 1
             )
@@ -1043,7 +1044,8 @@ class GS3DRenderer(nn.Module):
             I = matrix_to_quaternion(torch.eye(3)).to(device)
 
             # inference constrain
-            is_constrain_body = self.smplx_model.is_constrain_body
+            is_constrain_body = self.smplx_model.is_constrain_body # [N,]
+            # print(f"[DEBUG] Shape of is_constrain_body: {is_constrain_body.shape}")
             rigid_rotation_matrix[:, is_constrain_body] = I
             # Canonical gaussian rotations replicated per view.
             rotation_neutral_pose = gs_attr.rotation.unsqueeze(0).repeat(num_view, 1, 1)
