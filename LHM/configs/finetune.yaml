@@ -6,6 +6,8 @@ batch_size: 5
 lr: 4e-4
 weight_decay: 5e-4
 grad_clip: 0.1
+sample_every: 1
+vis_every_epoch: 2
 train_params:
   - offset_xyz
   - rotation

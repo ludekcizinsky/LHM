@@ -13,8 +13,10 @@ Expects:
 Saves finetuned state to output_dir/refined_scene_recon/<track_id>/...
 """
 
+
 import os
 import sys
+import shutil
 from dataclasses import fields
 from pathlib import Path
 from typing import List, Tuple
@@ -92,12 +94,14 @@ def masked_lpips(images: torch.Tensor, masks: torch.Tensor, renders: torch.Tenso
 # Dataset
 # ---------------------------------------------------------------------------
 class FrameMaskDataset(Dataset):
-    def __init__(self, frames_dir: Path, masks_dir: Path, device: torch.device):
+    def __init__(self, frames_dir: Path, masks_dir: Path, device: torch.device, sample_every: int = 1):
         self.frames_dir = frames_dir
         self.masks_dir = masks_dir
         self.device = device
 
         self.frame_paths = sorted(frames_dir.glob("*.png"))
+        if sample_every > 1:
+            self.frame_paths = self.frame_paths[::sample_every]
         if not self.frame_paths:
             raise RuntimeError(f"No frames found in {frames_dir}")
         self.mask_paths = [masks_dir / p.name for p in self.frame_paths]
@@ -164,6 +168,11 @@ class MultiHumanFinetuner(Inferrer):
 
         self.frames_dir = self.output_dir / "frames"
         self.masks_dir = self.output_dir / "masks" / "union"
+
+        # clean this dir
+        save_root = self.output_dir / "refined_scene_recon" / self.cfg.exp_name
+        if save_root.exists():
+            shutil.rmtree(save_root)
 
     # ---------------- Model / data loading ----------------
     def _build_model(self):
@@ -370,6 +379,7 @@ class MultiHumanFinetuner(Inferrer):
                     "scene_name": self.cfg.scene_name,
                     "output_dir": str(self.output_dir),
                     "loss_weights": self.cfg.loss_weights,
+                    "sample_every": self.cfg.sample_every,
                 },
                 name=self.cfg.exp_name,
                 tags=list(self.cfg.wandb.tags) if "tags" in self.cfg.wandb else None,
@@ -380,7 +390,9 @@ class MultiHumanFinetuner(Inferrer):
         if self.wandb_run is None:
             self._init_wandb()
 
-        dataset = FrameMaskDataset(self.frames_dir, self.masks_dir, self.tuner_device)
+        dataset = FrameMaskDataset(
+            self.frames_dir, self.masks_dir, self.tuner_device, sample_every=self.cfg.sample_every
+        )
         loader = DataLoader(
             dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, drop_last=False
         )
@@ -445,9 +457,62 @@ class MultiHumanFinetuner(Inferrer):
             if self.wandb_run is not None:
                 wandb.log({"loss/combined_epoch": avg_loss, "epoch": epoch + 1})
 
+            if self.cfg.vis_every_epoch > 0 and (epoch + 1) % self.cfg.vis_every_epoch == 0:
+                for tidx in range(len(self.track_meta)):
+                    self._canonical_vis_for_track(tidx, epoch + 1)
+
         self._save_refined_models()
         if self.wandb_run is not None:
             self.wandb_run.finish()
+
+    # ---------------- Visualization ----------------
+    def _canonical_vis_for_track(self, track_idx: int, epoch: int):
+        gs_start, gs_count = self.gs_track_offsets[track_idx]
+        q_start, q_count, t_count = self.query_track_offsets[track_idx]
+
+        gs_slice = self.gs_model_list[gs_start : gs_start + gs_count]
+        query_slice = self.query_points[q_start : q_start + q_count]
+        transform_slice = self.transform_mat_neutral_pose[q_start : q_start + t_count]
+        meta = self.track_meta[track_idx]
+        motion_seq = meta["motion_seq"]
+        shape_params = meta["shape_params"]
+
+        # Use first-frame SMPL-X params (avoid zeroing to keep subject in view).
+        smplx_params = {
+            "betas": shape_params.to(self.tuner_device),  # [1,10]
+            "transform_mat_neutral_pose": transform_slice.to(self.tuner_device),
+        }
+        for k, v in motion_seq["smplx_params"].items():
+            if k == "betas":
+                smplx_params[k] = shape_params.to(self.tuner_device)
+            else:
+                smplx_params[k] = v[:, 0:1].to(self.tuner_device)
+
+        render_c2ws = motion_seq["render_c2ws"][:, 0:1].to(self.tuner_device)
+        render_intrs = motion_seq["render_intrs"][:, 0:1].to(self.tuner_device)
+        render_bg_colors = motion_seq["render_bg_colors"][:, 0:1].to(self.tuner_device)
+
+        with torch.no_grad():
+            res = self.model.animation_infer_custom(
+                gs_slice,
+                query_slice,
+                smplx_params,
+                render_c2ws=render_c2ws,
+                render_intrs=render_intrs,
+                render_bg_colors=render_bg_colors,
+            )
+            img = res["comp_rgb"][0].detach().cpu().clamp(0, 1).numpy()
+
+        img_uint8 = (img * 255).astype(np.uint8)
+        save_dir = self.output_dir / "refined_scene_recon" / self.cfg.exp_name / "visualisations" / "canon" / meta[
+            "track_id"
+        ]
+        save_dir.mkdir(parents=True, exist_ok=True)
+        epoch_name = f"{epoch:04d}.png"
+        epoch_path = save_dir / epoch_name
+        Image.fromarray(img_uint8).save(epoch_path)
+        # Copy to last.png
+        Image.fromarray(img_uint8).save(save_dir / "last.png")
 
     # ---------------- Saving ----------------
     def _save_refined_models(self):
