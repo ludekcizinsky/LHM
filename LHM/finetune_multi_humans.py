@@ -368,6 +368,17 @@ class MultiHumanFinetuner(Inferrer):
                 t = getattr(gauss, name, None)
                 if torch.is_tensor(t) and t.requires_grad:
                     params.append(t)
+
+        if self.cfg.tune_smplx:
+            # enable grads on SMPL-X params inside the renderer if present
+            if hasattr(self.model.renderer, "smplx_model"):
+                smplx = self.model.renderer.smplx_model
+                for attr in ("shape_params", "pose_params", "expr_dirs", "pose_dirs", "shape_dirs"):
+                    if hasattr(smplx, attr):
+                        v = getattr(smplx, attr)
+                        if torch.is_tensor(v):
+                            v.requires_grad_(True)
+                            params.append(v)
         return params
 
     def _slice_motion(self, frame_indices: torch.Tensor):
@@ -433,10 +444,10 @@ class MultiHumanFinetuner(Inferrer):
                 0.0, device=self.tuner_device
             )
 
-        asap_loss = torch.stack(asap_terms).mean()
-        acap_loss = torch.stack(acap_terms).mean()
-        reg_loss = self.cfg.loss_weights["reg_asap"] * asap_loss + self.cfg.loss_weights["reg_acap"] * acap_loss
-        return reg_loss, asap_loss, acap_loss
+        asap_loss = torch.stack(asap_terms).mean() * self.cfg.loss_weights["reg_asap"]
+        acap_loss = torch.stack(acap_terms).mean() * self.cfg.loss_weights["reg_acap"]
+
+        return asap_loss, acap_loss
 
     # ---------------- Logging utilities ----------------
     def _init_wandb(self):
@@ -501,17 +512,14 @@ class MultiHumanFinetuner(Inferrer):
                 gt_masked = frames * mask3
                 pred_masked = comp_rgb # * mask3
 
-                rgb_loss = F.mse_loss(pred_masked, gt_masked)
-                sil_loss = F.mse_loss(comp_mask, masks)
-                lpips_loss = masked_lpips(gt_masked, masks, comp_rgb)
-                reg_loss, asap_loss, acap_loss = self._canonical_regularization()
+                rgb_loss = F.mse_loss(pred_masked, gt_masked) *self.cfg.loss_weights["rgb"]
+                sil_loss = F.mse_loss(comp_mask, masks) * self.cfg.loss_weights["sil"]
+                lpips_loss = masked_lpips(gt_masked, masks, comp_rgb) * self.cfg.loss_weights["lpips"]
+                asap_loss, acap_loss = self._canonical_regularization()
+                reg_loss = asap_loss + acap_loss
 
-                loss = (
-                    self.cfg.loss_weights["rgb"] * rgb_loss
-                    + self.cfg.loss_weights["sil"] * sil_loss
-                    + self.cfg.loss_weights["lpips"] * lpips_loss
-                    + reg_loss
-                )
+                loss = rgb_loss + sil_loss + lpips_loss + reg_loss
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, self.cfg.grad_clip)
                 optimizer.step()

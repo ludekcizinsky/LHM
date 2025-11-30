@@ -9,9 +9,9 @@ grad_clip: 0.1
 sample_every: 1
 vis_every_epoch: 1
 train_params:
-  #- offset_xyz
-  #- rotation
-  #- scaling
+  - offset_xyz
+  - rotation
+  - scaling
   - opacity
   - shs
 
@@ -23,11 +23,13 @@ wandb:
     - v2
 
 loss_weights:
-  rgb: 1.0
-  sil: 0.5
-  lpips: 0.0
-  reg_asap: 0.0
-  reg_acap: 0.0
+  rgb: 10.0
+  sil: 2.0
+  lpips: 0.2
+  reg_asap: 200.0
+  reg_acap: 200.0
+
+tune_smplx: true
 
 
 hydra:
