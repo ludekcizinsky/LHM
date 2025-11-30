@@ -14,7 +14,7 @@ cd /home/cizinsky/LHM
 conda deactivate && conda activate lhm
 
 # --- Shared settings
-seq_name="taichi"
+seq_name="hi4d_pair00_fight"
 
 # --- V1
 # exp_name="default"

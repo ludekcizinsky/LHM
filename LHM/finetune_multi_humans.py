@@ -52,6 +52,37 @@ from LHM.utils.hf_hub import wrap_model_hub
 # ---------------------------------------------------------------------------
 import math
 
+def load_camera_from_npz(
+    camera_npz_path: str | Path, camera_id: int, device: torch.device | None = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load intrinsics and extrinsics for a specific camera ID from a .npz file.
+
+    Expects keys "ids", "intrinsics" [N,3,3], and "extrinsics" [N,3,4] in the file.
+    Returns float tensors (intrinsics, extrinsics) optionally moved to `device`.
+    """
+    camera_npz_path = Path(camera_npz_path)
+    with np.load(camera_npz_path) as cams:
+        missing = [k for k in ("ids", "intrinsics", "extrinsics") if k not in cams.files]
+        if missing:
+            raise KeyError(f"Missing keys {missing} in camera file {camera_npz_path}")
+
+        ids = cams["ids"]
+        matches = np.nonzero(ids == camera_id)[0]
+        if len(matches) == 0:
+            raise ValueError(f"Camera id {camera_id} not found in {camera_npz_path}")
+        idx = int(matches[0])
+
+        intrinsics = torch.from_numpy(cams["intrinsics"][idx]).float()
+        extrinsics = torch.from_numpy(cams["extrinsics"][idx]).float()
+
+    if device is not None:
+        device = torch.device(device)
+        intrinsics = intrinsics.to(device)
+        extrinsics = extrinsics.to(device)
+
+    return intrinsics, extrinsics
+
 def save_image(tensor: torch.Tensor, filename: str):
     """
     Accepts HWC, CHW, or BCHW; if batch > 1, saves the first item.

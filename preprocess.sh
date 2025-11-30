@@ -1,11 +1,53 @@
 #!/bin/bash
-# usage: bash preprocess.sh /scratch/izar/cizinsky/multiply-output/preprocessing/data/taichi/taichi_10fps.mp4
-source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
-conda activate lhm
+set -e # exit on error
+# This script runs the full LHM pipeline: data preparation and inference.
+# Example usage:
+#   bash preprocess.sh taichi /home/cizinsky/in_the_wild/bilibili/taichi.mp4
 
+# activate conda environment
+source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
+module load gcc ffmpeg
+
+# navigate to project directory
 cd /home/cizinsky/LHM
 
-video_path=$1
-output_path=$2/motion
-mkdir -p $output_path
-python engine/pose_estimation/video2motion.py --video_path $video_path --output_path $output_path --visualize
+# configurable settings
+seq_name=$1
+input_video=$2
+
+# for now default settings
+default_ref_frame_idx=0
+
+# derived paths
+preprocess_dir=/scratch/izar/cizinsky/thesis/preprocessing/$seq_name
+mkdir -p $preprocess_dir
+output_dir=$preprocess_dir/lhm
+mkdir -p $output_dir
+frame_folder=$output_dir/frames
+mkdir -p $frame_folder
+initial_gs_model_dir=$output_dir/initial_scene_recon
+mkdir -p $initial_gs_model_dir
+refined_gs_model_dir=$output_dir/refined_scene_recon
+mkdir -p $refined_gs_model_dir
+
+# echo "--- [1/?] Running preprocess.sh to generate motion sequences"
+# conda deactivate && conda activate lhm
+# python engine/pose_estimation/video2motion.py --video_path $input_video --output_path $output_dir/motion --visualize
+
+# TODO: it can happen that sam3 actually fails to detect any humans in the scene, so here I would also need to check if everything went fine.
+# TODO: it can happen that sam3 will fail to detect certain human for a subset of the frames, so be aware of that
+# echo "--- [2/?] Running SAM3 to generate masks and masked images"
+# conda deactivate && conda activate sam3
+# python engine/new_segment_api/run.py --frames $frame_folder --text "a person" --output-dir $output_dir --prompt-frame 75
+
+# echo "[3/?] Running Depth Anything 3 to generate depth maps"
+# conda deactivate && conda activate da3
+# python engine/depth_est_api/run.py --output_dir $output_dir
+
+# TODO: manual inspection needed at this point and making sure that mask track ids match motion track ids.
+# TODO: another todo is to pick a frame index for each person track to be used as reference frame during inference.
+# TODO: I need to ensure I am running over all humans detected in the scene.
+# echo "--- [3/?] Running inference.sh to obtain canonical 3dgs models for each human"
+# conda deactivate && conda activate lhm
+# bash inference.sh $seq_name 0 $default_ref_frame_idx LHM-1B
+# bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B
