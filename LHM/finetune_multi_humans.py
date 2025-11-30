@@ -739,6 +739,7 @@ class MultiHumanFinetuner(Inferrer):
         target_camera_ids: List[int] = self.cfg.nvs_eval.target_camera_ids
         root_gt_dir_path: Path = Path(self.cfg.nvs_eval.root_gt_dir_path)
         camera_params_path: Path = root_gt_dir_path / "cameras" / "rgb_cameras.npz"
+        pad_ratio: float = float(getattr(self.cfg.nvs_eval, "pad_ratio", 0.0))
         root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
         root_save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -763,11 +764,24 @@ class MultiHumanFinetuner(Inferrer):
             scale_y = target_h / orig_h
             intr[0, 0] = intr[0, 0] * scale_x
             intr[1, 1] = intr[1, 1] * scale_y
-            intr[0, 2] = intr[0, 2] * scale_x
-            intr[1, 2] = intr[1, 2] * scale_y
+            intr[0, 2] = target_w / 2.0
+            intr[1, 2] = target_h / 2.0
             return intr
 
-        # Load source camera (used to convert target cameras into source/world coords)
+        def _rescale_intrinsics_batched(intrs: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
+            """Rescale a batched intrinsics tensor [...,4,4] or [...,3,3] to target size (keeps fx/fy scale, recenters cx/cy)."""
+            intrs = intrs.clone()
+            orig_w = intrs[..., 0, 2] * 2.0
+            orig_h = intrs[..., 1, 2] * 2.0
+            scale_x = target_w / orig_w
+            scale_y = target_h / orig_h
+            intrs[..., 0, 0] = intrs[..., 0, 0] * scale_x
+            intrs[..., 1, 1] = intrs[..., 1, 1] * scale_y
+            intrs[..., 0, 2] = target_w / 2.0
+            intrs[..., 1, 2] = target_h / 2.0
+            return intrs
+
+        # Source camera pose: w2c from params, invert to c2w (world = source cam frame)
         src_intr, src_extr = load_camera_from_npz(camera_params_path, source_camera_id, device=self.tuner_device)
         src_w2c = _extr_to_w2c_4x4(src_extr)
         src_c2w = torch.inverse(src_w2c)
@@ -781,13 +795,16 @@ class MultiHumanFinetuner(Inferrer):
                 first_frame = next(iter(sorted(tgt_gt_frames_dir_path.glob("*.png")) or sorted(tgt_gt_frames_dir_path.glob("*.jpg")) or sorted(tgt_gt_frames_dir_path.glob("*.jpeg"))), None)
                 if first_frame is not None:
                     with Image.open(first_frame) as img:
-                        w, h = img.size
-                    tgt_intr = _rescale_intrinsics(tgt_intr, w, h)
+                        gt_w, gt_h = img.size  # PIL gives (width, height)
+                    tgt_intr = _rescale_intrinsics(tgt_intr, gt_w, gt_h)
+            else:
+                gt_w = int(tgt_intr[0, 2] * 2.0)
+                gt_h = int(tgt_intr[1, 2] * 2.0)
             tgt_w2c = _extr_to_w2c_4x4(tgt_extr)
             tgt_c2w_world = torch.inverse(tgt_w2c)
 
-            # Express target camera in source-camera coordinates: S <- W <- T
-            tgt_c2w_in_src = src_w2c @ tgt_c2w_world
+            # Express target camera in source-camera coordinates: c2w_rel = inv(w2c_tgt @ inv(w2c_src))
+            tgt_c2w_in_src = torch.inverse(tgt_w2c @ torch.inverse(src_w2c))
             tgt_intr4 = _intr_to_4x4(tgt_intr)
 
             save_dir = root_save_dir / f"{tgt_cam_id}"
@@ -796,19 +813,21 @@ class MultiHumanFinetuner(Inferrer):
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
             loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=0, drop_last=False)
 
-            # Use target camera pose expressed in source frame.
             tgt_c2w_template = tgt_c2w_in_src.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
             tgt_intr_template = tgt_intr4.unsqueeze(0).unsqueeze(0)      # [1,1,4,4]
 
+            debug_dumped = False
+            debug_dumped_motion = False
             with torch.no_grad():
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
                     frame_indices = frame_indices.to(self.tuner_device)
-                    smplx_params, _, _, render_bg_colors = self._slice_motion(frame_indices)
+                    smplx_params, _, motion_intrs, render_bg_colors = self._slice_motion(frame_indices)
 
                     # Build camera tensors matching render_bg_colors leading dims [B?, F]
                     num_tracks, num_frames = render_bg_colors.shape[0], render_bg_colors.shape[1]
                     render_c2ws = tgt_c2w_template.expand(num_tracks, num_frames, 4, 4)
                     render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4)
+
                     render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32)
 
                     res = self.model.animation_infer_custom(
@@ -819,6 +838,27 @@ class MultiHumanFinetuner(Inferrer):
                         render_intrs=render_intrs,
                         render_bg_colors=render_bg_colors,
                     )
+
+                    if not debug_dumped:
+                        render_h = int(render_intrs[0, 0, 1, 2].item() * 2)
+                        render_w = int(render_intrs[0, 0, 0, 2].item() * 2)
+                        dbg = {
+                            "gt_frame_size": list(frames.shape[1:3]),
+                            "render_size_from_intr": [render_h, render_w],
+                            "tgt_intr_scaled": render_intrs[0, 0, :3, :3].detach().cpu().tolist(),
+                            "motion_intr_example": motion_intrs[0, 0, :3, :3].detach().cpu().tolist(),
+                            "tgt_w2c": tgt_w2c.detach().cpu().tolist(),
+                            "src_w2c": src_w2c.detach().cpu().tolist(),
+                            "render_c2w": render_c2ws[0, 0].detach().cpu().tolist(),
+                        }
+                        debug_path = save_dir / "debug_cam.json"
+                        try:
+                            import json
+                            with open(debug_path, "w") as f:
+                                json.dump(dbg, f, indent=2)
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to write debug cam info: {e}")
+                        debug_dumped = True
 
                     comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
                     # If render size differs from GT, resize render to match
@@ -832,13 +872,69 @@ class MultiHumanFinetuner(Inferrer):
                     masks3 = masks
                     if masks3.shape[-1] == 1:
                         masks3 = masks3.repeat(1, 1, 1, 3)
-                    masked_render = comp_rgb # * masks3
+                    masked_render = comp_rgb * masks3
                     masked_gt = frames * masks3
-                    joined = torch.cat([masked_render, masked_gt], dim=2)  # side-by-side along width
+                    overlay = 0.5 * masked_render + 0.5 * masked_gt
+                    joined = torch.cat([masked_render, masked_gt, overlay], dim=2)  # side-by-side along width
 
                     for bi in range(frames.shape[0]):
                         fname = Path(frame_paths[bi]).name
                         save_image(joined[bi], str(save_dir / fname))
+
+                    # Optional debug render using motion intrinsics (fx/fy) with centered principal point and GT size.
+                    if tgt_cam_id == source_camera_id:
+                        h_gt, w_gt = frames.shape[1:3]
+                        mi = motion_intrs[0, 0]
+                        alt_intr = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
+                        alt_intr[0, 0] = mi[0, 0]
+                        alt_intr[1, 1] = mi[1, 1]
+                        alt_intr[0, 2] = w_gt / 2.0
+                        alt_intr[1, 2] = h_gt / 2.0
+                        alt_intr_template = alt_intr.unsqueeze(0).unsqueeze(0)
+                        render_intrs_alt = alt_intr_template.expand(num_tracks, num_frames, 4, 4)
+                        res_alt = self.model.animation_infer_custom(
+                            self.gs_model_list,
+                            self.query_points,
+                            smplx_params,
+                            render_c2ws=render_c2ws,
+                            render_intrs=render_intrs_alt,
+                            render_bg_colors=render_bg_colors,
+                        )
+                        comp_rgb_alt = res_alt["comp_rgb"]
+                        if comp_rgb_alt.shape[1:3] != frames.shape[1:3]:
+                            comp_rgb_alt = F.interpolate(
+                                comp_rgb_alt.permute(0, 3, 1, 2),
+                                size=frames.shape[1:3],
+                                mode="bilinear",
+                                align_corners=False,
+                            ).permute(0, 2, 3, 1)
+                        masked_render_alt = comp_rgb_alt * masks3
+                        overlay_alt = 0.5 * masked_render_alt + 0.5 * masked_gt
+                        joined_alt = torch.cat([masked_render_alt, masked_gt, overlay_alt], dim=2)
+
+                        alt_dir = save_dir / "debug_motion_intr"
+                        alt_dir.mkdir(parents=True, exist_ok=True)
+                        for bi in range(frames.shape[0]):
+                            fname = Path(frame_paths[bi]).name
+                            save_image(joined_alt[bi], str(alt_dir / fname))
+
+                        if not debug_dumped_motion:
+                            render_h_alt = int(alt_intr[1, 2].item() * 2)
+                            render_w_alt = int(alt_intr[0, 2].item() * 2)
+                            dbg_alt = {
+                                "gt_frame_size": list(frames.shape[1:3]),
+                                "render_size_from_alt_intr": [render_h_alt, render_w_alt],
+                                "alt_intr_used": alt_intr[:3, :3].detach().cpu().tolist(),
+                                "motion_intr_example": mi[:3, :3].detach().cpu().tolist(),
+                            }
+                            debug_alt_path = alt_dir / "debug_alt_cam.json"
+                            try:
+                                import json
+                                with open(debug_alt_path, "w") as f:
+                                    json.dump(dbg_alt, f, indent=2)
+                            except Exception as e:
+                                print(f"[DEBUG] Failed to write debug alt cam info: {e}")
+                            debug_dumped_motion = True
 
 
 
