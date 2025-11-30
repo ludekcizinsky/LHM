@@ -48,6 +48,32 @@ from LHM.utils.hf_hub import wrap_model_hub
 # ---------------------------------------------------------------------------
 import math
 
+def save_image(tensor: torch.Tensor, filename: str):
+    """
+    Accepts HWC, CHW, or BCHW; if batch > 1, saves the first item.
+    Assumes values in [0,1]. If channels are a multiple of 3, tiles them along width.
+    """
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    if tensor.dim() == 3 and tensor.shape[0] % 3 == 0:
+        c = tensor.shape[0]
+        if c not in (1, 3):
+            n = c // 3
+            tensor = tensor.view(n, 3, tensor.shape[1], tensor.shape[2])
+            tensor = torch.cat([tensor[i] for i in range(n)], dim=2)
+        image = tensor.permute(1, 2, 0).detach().cpu().numpy()
+    elif tensor.dim() == 3 and tensor.shape[-1] % 3 == 0:
+        c = tensor.shape[-1]
+        if c not in (1, 3):
+            n = c // 3
+            tensor = tensor.view(tensor.shape[0], tensor.shape[1], n, 3)
+            tensor = torch.cat([tensor[:, :, i] for i in range(n)], axis=1)
+        image = tensor.detach().cpu().numpy()
+    else:
+        raise ValueError(f"Unsupported tensor shape for save_image: {tensor.shape}")
+    image = (image * 255).clip(0, 255).astype("uint8")
+    Image.fromarray(image).save(filename)
+
 def compute_frame_centers_from_smplx(smplx_params: dict) -> torch.Tensor:
     """
     smplx_params: dict containing key "trans" of shape [num_people, T, 3]
@@ -373,6 +399,8 @@ class MultiHumanFinetuner(Inferrer):
 
     def _render_batch(self, frame_indices: torch.Tensor):
         smplx_params, render_c2ws, render_intrs, render_bg_colors = self._slice_motion(frame_indices)
+        # Override background to black
+        render_bg_colors = torch.zeros_like(render_bg_colors)
         return self.model.animation_infer_custom(
             self.gs_model_list,
             self.query_points,
@@ -458,6 +486,7 @@ class MultiHumanFinetuner(Inferrer):
         for epoch in range(self.cfg.epochs):
             running_loss = 0.0
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.cfg.epochs}", leave=False)
+            batch = 0
             for frame_indices, frames, masks in pbar:
                 optimizer.zero_grad(set_to_none=True)
 
@@ -470,7 +499,7 @@ class MultiHumanFinetuner(Inferrer):
                 if mask3.shape[-1] == 1:
                     mask3 = mask3.repeat(1, 1, 1, 3)
                 gt_masked = frames * mask3
-                pred_masked = comp_rgb * mask3
+                pred_masked = comp_rgb # * mask3
 
                 rgb_loss = F.mse_loss(pred_masked, gt_masked)
                 sil_loss = F.mse_loss(comp_mask, masks)
@@ -506,6 +535,29 @@ class MultiHumanFinetuner(Inferrer):
                             "loss/acap": acap_loss.item(),
                         }
                     )
+
+                if batch in [1, 4]:
+                    # define debug save dir
+                    debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name
+                    debug_save_dir.mkdir(parents=True, exist_ok=True)
+
+                    # - create a joined image from pred_masked and gt_masked for debugging
+                    joined_image = torch.cat([pred_masked, gt_masked], dim=3)  # Concatenate along width
+                    debug_image_path = debug_save_dir / f"rgb_loss_input.png"
+                    save_image(joined_image.permute(0, 3, 1, 2), str(debug_image_path))
+
+                    # - create comp mask and masks image 
+                    comp_mask_image = torch.cat([comp_mask.repeat(1, 1, 1, 3), masks.repeat(1, 1, 1, 3)], dim=3)  # Concatenate along width
+                    debug_comp_mask_path = debug_save_dir / f"sil_loss_input.png"
+                    save_image(comp_mask_image.permute(0, 3, 1, 2), str(debug_comp_mask_path))
+
+                    # - create lpips input image
+                    lpips_input_image = torch.cat([comp_rgb, gt_masked], dim=3)  # Concatenate along width
+                    debug_lpips_path = debug_save_dir / f"lpips_loss_input.png"
+                    save_image(lpips_input_image.permute(0, 3, 1, 2), str(debug_lpips_path))
+
+                batch += 1
+
 
             avg_loss = running_loss / max(1, len(loader))
             print(f"[Epoch {epoch+1}/{self.cfg.epochs}] loss={avg_loss:.4f}")
