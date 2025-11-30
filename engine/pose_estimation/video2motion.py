@@ -52,10 +52,10 @@ def load_video(video_path, pad_ratio, max_resolution):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     downsample_factor = -1
-    if (height * width) > max_resolution:
-        downsample_factor = sqrt(max_resolution / (height * width))
-        height = int(height * downsample_factor)
-        width = int(width * downsample_factor)
+#    if (height * width) > max_resolution:
+        #downsample_factor = sqrt(max_resolution / (height * width))
+        #height = int(height * downsample_factor)
+        #width = int(width * downsample_factor)
 
     
     offset_w, offset_h = 0, 0
@@ -300,7 +300,7 @@ class Video2MotionPipeline:
         device,
         kp_mode="vitpose",
         visualize=True,
-        pad_ratio=0.2,
+        pad_ratio=0.0,
         fov=60,
     ):
         self.MAX_RESOLUTION = 1280 * 720
@@ -502,7 +502,7 @@ class Video2MotionPipeline:
     def __call__(self, video_path, output_path: Path):
         start = time.time()
         all_frames, raw_H, raw_W, fps, offset_w, offset_h = load_video(
-            video_path, pad_ratio=self.pad_ratio, max_resolution=self.MAX_RESOLUTION
+            video_path, pad_ratio=0, max_resolution=self.MAX_RESOLUTION
         )
 
         frames_output_path = output_path.parent / "frames"
