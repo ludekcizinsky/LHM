@@ -863,7 +863,8 @@ class SMPLXVoxelMeshModel(nn.Module):
         is_cavity = is_cavity[:, 0] > 0
 
         # self.register_buffer('pos_enc_mesh', xyz)
-        self.register_buffer("skinning_weight", skinning_weight.contiguous())
+        self.skinning_weight = torch.nn.Parameter(skinning_weight.contiguous(), requires_grad=True)
+        print(f"[DEBUG] Shape of skinning_weight: {skinning_weight.shape}")
         self.register_buffer("pose_dirs", pose_dirs.contiguous())
         self.register_buffer("expr_dirs", expr_dirs.contiguous())
         self.register_buffer("shape_dirs", shape_dirs.contiguous())
@@ -880,8 +881,10 @@ class SMPLXVoxelMeshModel(nn.Module):
         self.smpl_x.vertex_num_upsampled = vertex_num_upsampled  # compatible with SMPLX
 
         voxel_skinning_weight, voxel_bbox = self.voxel_skinning_init(voxel_size=192)
-        self.register_buffer("voxel_ws", voxel_skinning_weight)
+        self.voxel_ws = torch.nn.Parameter(voxel_skinning_weight, requires_grad=True)
         self.register_buffer("voxel_bbox", voxel_bbox)
+        # Controls whether to use trainable voxel weights for all points.
+        self.use_trainable_skinning = False
 
         # self.query_voxel_debug()
 
@@ -1059,8 +1062,13 @@ class SMPLXVoxelMeshModel(nn.Module):
         batch_size = transform_mat_joint.shape[0]
 
         query_skinning = self.query_voxel_skinning_weights(query_points)
-        skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)
-        query_skinning[fix_mask] = skinning_weight[fix_mask]
+
+        if self.use_trainable_skinning:
+            # Start from trainable base weights to preserve initialization quality.
+            skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)
+        else:
+            # Original behavior: use base skinning weights (voxel query ignored in final mat).
+            skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)
 
         transform_mat_vertex = torch.matmul(
             skinning_weight,
@@ -1180,15 +1188,9 @@ class SMPLXVoxelMeshModel(nn.Module):
         # get nearest vertex
 
         # for hands and face, assign original vertex index to use sknning weight of the original vertex
-        mask = (
-            ((self.is_rhand + self.is_lhand + self.is_face) > 0)
-            .unsqueeze(0)
-            .repeat(batch_size, 1)
-        )
-
         # compute vertices-LBS function
         transform_mat_null_vertex = self.get_transform_mat_vertex(
-            transform_mat_neutral_pose, mean_3d, mask
+            transform_mat_neutral_pose, mean_3d, None
         )
 
         null_mean_3d = self.lbs(
@@ -1214,7 +1216,7 @@ class SMPLXVoxelMeshModel(nn.Module):
 
         # compute vertices-LBS function
         transform_mat_vertex = self.get_transform_mat_vertex(
-            transform_mat_joint, mean_3d, mask
+            transform_mat_joint, mean_3d, None
         )
 
         posed_mean_3d = self.lbs(

@@ -41,6 +41,10 @@ mkdir -p $refined_gs_model_dir
 # conda deactivate && conda activate sam3
 # python engine/new_segment_api/run.py --frames $frame_folder --text "person" --output-dir $output_dir
 
+echo "[3/?] Running Depth Anything 3 to generate depth maps"
+conda deactivate && conda activate da3
+python engine/depth_est_api/run.py --output_dir $output_dir
+
 # TODO: manual inspection needed at this point and making sure that mask track ids match motion track ids.
 # TODO: another todo is to pick a frame index for each person track to be used as reference frame during inference.
 # TODO: I need to ensure I am running over all humans detected in the scene.
@@ -55,9 +59,9 @@ mkdir -p $refined_gs_model_dir
 # python LHM/infer_multi_humans.py --gs_model_dir=$initial_gs_model_dir --scene_name=$seq_name --nv_rot_degree=0
 # python LHM/infer_multi_humans.py --gs_model_dir=$initial_gs_model_dir --scene_name=$seq_name --nv_rot_degree=90
 
-echo "--- [5/?] Running finetuning for multi-human LHM"
-conda deactivate && conda activate lhm
-python LHM/finetune_multi_humans.py output_dir=$output_dir scene_name=$seq_name exp_name=$exp_name 
+# echo "--- [5/?] Running finetuning for multi-human LHM"
+# conda deactivate && conda activate lhm
+# python LHM/finetune_multi_humans.py output_dir=$output_dir scene_name=$seq_name exp_name=$exp_name 
 
 # echo "--- [6/?] Running inference for multi-human LHM"
 # conda deactivate && conda activate lhm

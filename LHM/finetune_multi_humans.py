@@ -5,7 +5,7 @@ Trains offset_xyz, rotation, scaling, opacity, and SH/RGB while keeping SMPL-X m
 Supervision:
   - L_rgb: MSE between rendered RGB (masked) and GT frame * union mask (weight 1.0)
   - L_sil: MSE between rendered mask and GT union mask (weight 0.5)
-  - L_lpips: masked LPIPS (weight 1.0)
+  - L_ssim: SSIM (weight configurable)
 
 Expects:
   output_dir/initial_scene_recon/<track_id>/* (loaded canonical state)
@@ -17,6 +17,8 @@ Saves finetuned state to output_dir/refined_scene_recon/<track_id>/...
 import os
 import sys
 import shutil
+import subprocess
+import imageio.v2 as imageio
 from dataclasses import fields
 from pathlib import Path
 from typing import List, Tuple
@@ -33,6 +35,8 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+from fused_ssim import fused_ssim
+import matplotlib.cm as cm
 import pyiqa
 import wandb
 
@@ -120,50 +124,33 @@ def rotate_c2ws_y_about_center(c2ws: torch.Tensor, centers: torch.Tensor, degree
     return T_pos @ (R @ (T_neg @ c2ws))
 
 
-# ---------------------------------------------------------------------------
-# Loss helpers (LPIPS masked)
-# ---------------------------------------------------------------------------
-_LPIPS_METRIC = None
-
-
-def _get_lpips_net(device: torch.device) -> torch.nn.Module:
-    global _LPIPS_METRIC
-    if _LPIPS_METRIC is None:
-        _LPIPS_METRIC = pyiqa.create_metric(
-            "lpips", device=device, net="vgg", spatial=True, as_loss=False
-        ).eval()
-        for p in _LPIPS_METRIC.parameters():
-            p.requires_grad = False
-    return _LPIPS_METRIC.to(device)
+def depth_to_color(
+    arr: np.ndarray, mask: np.ndarray | None = None, vmin: float | None = None, vmax: float | None = None
+) -> np.ndarray:
+    """Normalize depth array to 0-1 (optionally over masked region and shared vmin/vmax) and apply magma colormap."""
+    arr = arr.copy()
+    if mask is not None:
+        arr = arr * (mask > 0.5)
+        vals = arr[mask > 0.5]
+    else:
+        vals = arr
+    vals = vals[np.isfinite(vals)]
+    if vmin is None or vmax is None:
+        if vals.size > 0:
+            vmin = vals.min()
+            vmax = vals.max()
+        else:
+            vmin, vmax = 0.0, 1.0
+    if vmax > vmin:
+        norm = (arr - vmin) / (vmax - vmin)
+    else:
+        norm = arr * 0.0
+    norm = np.clip(norm, 0, 1)
+    return (cm.magma(norm)[..., :3] * 255).astype(np.uint8)
 
 
 def _ensure_nchw(t: torch.Tensor) -> torch.Tensor:
     return t.permute(0, 3, 1, 2).contiguous()
-
-
-def masked_lpips(images: torch.Tensor, masks: torch.Tensor, renders: torch.Tensor) -> torch.Tensor:
-    """LPIPS averaged over masked region per sample."""
-    target = _ensure_nchw(images.clamp(0.0, 1.0))
-    preds = _ensure_nchw(renders.clamp(0.0, 1.0))
-    if masks.dim() == 4 and masks.shape[-1] == 1:
-        mask = masks[..., 0]
-    else:
-        mask = masks
-    mask = mask.unsqueeze(1).float()  # [B,1,H,W]
-
-    net = _get_lpips_net(preds.device)
-    dmap = net(preds, target)
-
-    if dmap.shape[-2:] != mask.shape[-2:]:
-        mask_resized = F.interpolate(mask, size=dmap.shape[-2:], mode="nearest")
-    else:
-        mask_resized = mask
-
-    numerator = (dmap * mask_resized).sum(dim=(1, 2, 3))
-    denom = mask_resized.sum(dim=(1, 2, 3)).clamp_min(1e-6)
-    vals = numerator / denom
-    vals = torch.where(denom < 1e-5, torch.zeros_like(vals), vals)
-    return vals.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +188,12 @@ class FrameMaskDataset(Dataset):
     def __getitem__(self, idx: int):
         frame = self._load_img(self.frame_paths[idx])
         mask = self._load_mask(self.mask_paths[idx])
-        return torch.tensor(idx, device=self.device, dtype=torch.long), frame, mask
+        return (
+            torch.tensor(idx, device=self.device, dtype=torch.long),
+            frame,
+            mask,
+            str(self.frame_paths[idx]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -237,13 +229,16 @@ class MultiHumanFinetuner(Inferrer):
         self.output_dir = Path(cfg.output_dir).expanduser()
         self.train_params = tuple(cfg.train_params)
         self.wandb_run = None
+        self.loaded_skinning = None
 
         self._load_gs_model(self.output_dir)
         self._prepare_joined_inputs()
         self.model: ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(self.tuner_device)
+        self._apply_loaded_skinning()
 
         self.frames_dir = self.output_dir / "frames"
         self.masks_dir = self.output_dir / "masks" / "union"
+        self.depth_dir = self.output_dir / "depth_maps" / "raw"
 
 #        # clean this dir
         #save_root = self.output_dir / "refined_scene_recon" / self.cfg.exp_name
@@ -256,8 +251,20 @@ class MultiHumanFinetuner(Inferrer):
         model_name = "/scratch/izar/cizinsky/pretrained/huggingface/models--3DAIGC--LHM-1B/snapshots/cd8a1cc900a557d83187cfc2e0a91cef3eba969d/"
         return hf_model_cls.from_pretrained(model_name)
 
+    def _apply_loaded_skinning(self):
+        if self.loaded_skinning is None:
+            return
+        if not hasattr(self.model.renderer, "smplx_model"):
+            return
+        smplx = self.model.renderer.smplx_model
+        if "voxel_ws" in self.loaded_skinning and hasattr(smplx, "voxel_ws"):
+            smplx.voxel_ws.data.copy_(self.loaded_skinning["voxel_ws"].to(self.tuner_device))
+        if "skinning_weight" in self.loaded_skinning and hasattr(smplx, "skinning_weight"):
+            smplx.skinning_weight.data.copy_(self.loaded_skinning["skinning_weight"].to(self.tuner_device))
+
     def _load_gs_model(self, root_output_dir: Path):
-        root_gs_model_dir = root_output_dir / "initial_scene_recon"
+        refined_dir = root_output_dir / "refined_scene_recon" / self.cfg.exp_name
+        root_gs_model_dir = refined_dir if refined_dir.exists() else root_output_dir / "initial_scene_recon"
         track_ids = sorted(
             [
                 track_id
@@ -293,6 +300,13 @@ class MultiHumanFinetuner(Inferrer):
                 }
             )
         # print(f"[DEBUG] Loaded GS models for {len(self.all_model_list)} humans.")
+        # Load trainable skinning weights if present (shared across tracks)
+        skin_path = root_gs_model_dir.parent if root_gs_model_dir.name == self.cfg.exp_name else root_output_dir
+        skin_file = root_output_dir / "smplx_skinning.pt"
+        if refined_dir.exists():
+            skin_file = refined_dir / "smplx_skinning.pt"
+        if skin_file.exists():
+            self.loaded_skinning = torch.load(skin_file, map_location=self.tuner_device)
 
     def _prepare_joined_inputs(self):
         train_fields = tuple(self.train_params)
@@ -369,16 +383,31 @@ class MultiHumanFinetuner(Inferrer):
                 if torch.is_tensor(t) and t.requires_grad:
                     params.append(t)
 
-        if self.cfg.tune_smplx:
+        if self.cfg.tune_motion:
             # enable grads on SMPL-X params inside the renderer if present
             if hasattr(self.model.renderer, "smplx_model"):
                 smplx = self.model.renderer.smplx_model
-                for attr in ("shape_params", "pose_params", "expr_dirs", "pose_dirs", "shape_dirs"):
+                # enable trainable skinning if available
+                if hasattr(smplx, "use_trainable_skinning"):
+                    print(f"[INFO] Enabling trainable skinning")
+                    smplx.use_trainable_skinning = True
+                for attr in ("shape_params", "pose_params", "expr_dirs", "pose_dirs", "shape_dirs", "voxel_ws", "skinning_weight"):
                     if hasattr(smplx, attr):
                         v = getattr(smplx, attr)
                         if torch.is_tensor(v):
                             v.requires_grad_(True)
                             params.append(v)
+        else:
+            if hasattr(self.model.renderer, "smplx_model"):
+                smplx = self.model.renderer.smplx_model
+                if hasattr(smplx, "use_trainable_skinning"):
+                    print(f"[INFO] Disabling trainable skinning")
+                    smplx.use_trainable_skinning = False
+                for attr in ("voxel_ws", "skinning_weight"):
+                    if hasattr(smplx, attr):
+                        v = getattr(smplx, attr)
+                        if torch.is_tensor(v):
+                            v.requires_grad_(False)
         return params
 
     def _slice_motion(self, frame_indices: torch.Tensor):
@@ -449,6 +478,38 @@ class MultiHumanFinetuner(Inferrer):
 
         return asap_loss, acap_loss
 
+    def _compute_depth_loss(self, pred_depth, masks, frame_paths, render_hw):
+        """Compute masked L1 depth loss and return (loss, gt_depth, valid_mask)."""
+        zero = torch.tensor(0.0, device=self.tuner_device)
+        if pred_depth is None or self.cfg.loss_weights.get("depth", 0) <= 0:
+            return zero, None, None
+
+        gt_depths = []
+        valid_masks = []
+        for i, fp in enumerate(frame_paths):
+            depth_path = self.depth_dir / (Path(fp).stem + ".npy")
+            if depth_path.exists():
+                depth_np = np.load(depth_path)
+                depth_t = torch.from_numpy(depth_np).float().to(self.tuner_device)
+            else:
+                depth_t = torch.zeros(render_hw, device=self.tuner_device)
+            depth_t = depth_t.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+            depth_t = F.interpolate(depth_t, size=render_hw, mode="bilinear", align_corners=False)
+            gt_depths.append(depth_t)
+
+            m = masks[i : i + 1, ..., 0:1].permute(0, 3, 1, 2)  # [1,1,H,W]
+            m = F.interpolate(m, size=render_hw, mode="nearest")
+            valid = torch.isfinite(depth_t) & (depth_t > 0) & (m > 0.5)
+            valid_masks.append(valid.float())
+
+        gt_depth = torch.cat(gt_depths, dim=0)  # [B,1,H,W]
+        valid_mask = torch.cat(valid_masks, dim=0)
+        pred_d = pred_depth.permute(0, 3, 1, 2)  # [B,1,H,W]
+        diff = torch.abs(pred_d - gt_depth) * valid_mask
+        denom = valid_mask.sum().clamp_min(1e-6)
+        depth_loss = diff.sum() / denom
+        return depth_loss, gt_depth, valid_mask
+
     # ---------------- Logging utilities ----------------
     def _init_wandb(self):
         if not self.cfg.wandb.enable or wandb is None:
@@ -498,27 +559,38 @@ class MultiHumanFinetuner(Inferrer):
             running_loss = 0.0
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.cfg.epochs}", leave=False)
             batch = 0
-            for frame_indices, frames, masks in pbar:
+            for frame_indices, frames, masks, frame_paths in pbar:
                 optimizer.zero_grad(set_to_none=True)
 
                 frame_indices = frame_indices.to(self.tuner_device)
                 res = self._render_batch(frame_indices)
                 comp_rgb = res["comp_rgb"]  # [B, H, W, 3], 0-1
                 comp_mask = res["comp_mask"][..., :1]  # [B, H, W, 1]
+                pred_depth = res.get("comp_depth", None)  # [B, H, W, 1] if available
 
                 mask3 = masks
                 if mask3.shape[-1] == 1:
                     mask3 = mask3.repeat(1, 1, 1, 3)
                 gt_masked = frames * mask3
-                pred_masked = comp_rgb # * mask3
-
-                rgb_loss = F.mse_loss(pred_masked, gt_masked) *self.cfg.loss_weights["rgb"]
-                sil_loss = F.mse_loss(comp_mask, masks) * self.cfg.loss_weights["sil"]
-                lpips_loss = masked_lpips(gt_masked, masks, comp_rgb) * self.cfg.loss_weights["lpips"]
+                # Use raw comp_rgb against masked GT; keep weights outside the loss helpers.
+                rgb_loss = F.mse_loss(comp_rgb, gt_masked)
+                sil_loss = F.mse_loss(comp_mask, masks)
+                # SSIM (unmasked) between comp_rgb and masked GT
+                ssim_val = fused_ssim(_ensure_nchw(comp_rgb), _ensure_nchw(gt_masked), padding="valid")
+                ssim_loss = 1.0 - ssim_val
+                depth_loss, gt_depth, valid_mask = self._compute_depth_loss(
+                    pred_depth, masks, frame_paths, comp_rgb.shape[1:3]
+                )
                 asap_loss, acap_loss = self._canonical_regularization()
                 reg_loss = asap_loss + acap_loss
 
-                loss = rgb_loss + sil_loss + lpips_loss + reg_loss
+                loss = (
+                    self.cfg.loss_weights["rgb"] * rgb_loss
+                    + self.cfg.loss_weights["sil"] * sil_loss
+                    + self.cfg.loss_weights["ssim"] * ssim_loss
+                    + self.cfg.loss_weights.get("depth", 0) * depth_loss
+                    + reg_loss
+                )
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, self.cfg.grad_clip)
@@ -529,6 +601,7 @@ class MultiHumanFinetuner(Inferrer):
                     loss=f"{loss.item():.4f}",
                     asap=f"{asap_loss.item():.4f}",
                     acap=f"{acap_loss.item():.4f}",
+                    depth=f"{depth_loss.item():.4f}",
                 )
 
                 if self.wandb_run is not None:
@@ -537,20 +610,21 @@ class MultiHumanFinetuner(Inferrer):
                             "loss/combined": loss.item(),
                             "loss/rgb": rgb_loss.item(),
                             "loss/sil": sil_loss.item(),
-                            "loss/lpips": lpips_loss.item(),
+                            "loss/ssim": ssim_loss.item(),
+                            "loss/depth": depth_loss.item(),
                             "loss/reg": reg_loss.item(),
                             "loss/asap": asap_loss.item(),
                             "loss/acap": acap_loss.item(),
                         }
                     )
 
-                if batch in [1, 4]:
+                if batch in [0,2,4]:
                     # define debug save dir
                     debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name
                     debug_save_dir.mkdir(parents=True, exist_ok=True)
 
                     # - create a joined image from pred_masked and gt_masked for debugging
-                    joined_image = torch.cat([pred_masked, gt_masked], dim=3)  # Concatenate along width
+                    joined_image = torch.cat([comp_rgb, gt_masked], dim=3)  # Concatenate along width
                     debug_image_path = debug_save_dir / f"rgb_loss_input.png"
                     save_image(joined_image.permute(0, 3, 1, 2), str(debug_image_path))
 
@@ -559,10 +633,42 @@ class MultiHumanFinetuner(Inferrer):
                     debug_comp_mask_path = debug_save_dir / f"sil_loss_input.png"
                     save_image(comp_mask_image.permute(0, 3, 1, 2), str(debug_comp_mask_path))
 
-                    # - create lpips input image
-                    lpips_input_image = torch.cat([comp_rgb, gt_masked], dim=3)  # Concatenate along width
-                    debug_lpips_path = debug_save_dir / f"lpips_loss_input.png"
-                    save_image(lpips_input_image.permute(0, 3, 1, 2), str(debug_lpips_path))
+                    # - create ssim input image
+                    ssim_input_image = torch.cat([comp_rgb, gt_masked], dim=3)  # Concatenate along width
+                    debug_ssim_path = debug_save_dir / f"ssim_loss_input.png"
+                    save_image(ssim_input_image.permute(0, 3, 1, 2), str(debug_ssim_path))
+
+                    if pred_depth is not None:
+                        # Depth debug for first sample in batch
+                        pd = pred_depth[0, ..., 0].detach().cpu().numpy()
+                        gd = gt_depth[0, 0].detach().cpu().numpy() if gt_depth is not None else None
+                        vm = valid_mask[0, 0].detach().cpu().numpy() if valid_mask is not None else None
+
+                        # Shared normalization across pred and gt
+                        if gd is not None:
+                            masked_vals = []
+                            if vm is not None:
+                                masked_vals.append(pd[vm > 0.5])
+                                masked_vals.append(gd[vm > 0.5])
+                            else:
+                                masked_vals.append(pd)
+                                masked_vals.append(gd)
+                            vals = np.concatenate([v[np.isfinite(v)] for v in masked_vals if v.size > 0])
+                            if vals.size > 0:
+                                vmin, vmax = vals.min(), vals.max()
+                            else:
+                                vmin, vmax = 0.0, 1.0
+                        else:
+                            vmin = vmax = None
+
+                        pred_color = depth_to_color(pd, vm, vmin, vmax)
+                        if gd is not None:
+                            gt_color = depth_to_color(gd, vm, vmin, vmax)
+                            # Concatenate pred | gt for a single debug view
+                            depth_concat = np.concatenate([pred_color, gt_color], axis=1)
+                            Image.fromarray(depth_concat).save(debug_save_dir / "depth_debug.png")
+                        else:
+                            Image.fromarray(pred_color).save(debug_save_dir / "depth_debug.png")
 
                 batch += 1
 
@@ -592,45 +698,12 @@ class MultiHumanFinetuner(Inferrer):
         motion_seq = meta["motion_seq"]
         shape_params = meta["shape_params"]
 
-        # Use first-frame SMPL-X params (avoid zeroing to keep subject in view).
-        smplx_params = {
-            "betas": shape_params.to(self.tuner_device),  # [1,10]
-            "transform_mat_neutral_pose": transform_slice.to(self.tuner_device),
-        }
-        for k, v in motion_seq["smplx_params"].items():
-            if k == "betas":
-                smplx_params[k] = shape_params.to(self.tuner_device)
-            else:
-                smplx_params[k] = v[:, 0:1].to(self.tuner_device)
-
         centers = compute_frame_centers_from_smplx(motion_seq["smplx_params"]).to(self.tuner_device)
+        num_frames = motion_seq["render_c2ws"].shape[1]
 
         view_degs = [0, 90, 180, 270]
         for deg in view_degs:
-            if deg == 0:
-                render_c2ws = motion_seq["render_c2ws"][:, 0:1].to(self.tuner_device)
-            else:
-                rotated = rotate_c2ws_y_about_center(
-                    motion_seq["render_c2ws"], centers, degrees=deg
-                ).to(self.tuner_device)
-                render_c2ws = rotated[:, 0:1]
-
-            render_intrs = motion_seq["render_intrs"][:, 0:1].to(self.tuner_device)
-            render_bg_colors = motion_seq["render_bg_colors"][:, 0:1].to(self.tuner_device)
-
-            with torch.no_grad():
-                res = self.model.animation_infer_custom(
-                    gs_slice,
-                    query_slice,
-                    smplx_params,
-                    render_c2ws=render_c2ws,
-                    render_intrs=render_intrs,
-                    render_bg_colors=render_bg_colors,
-                )
-                img = res["comp_rgb"][0].detach().cpu().clamp(0, 1).numpy()
-
-            img_uint8 = (img * 255).astype(np.uint8)
-            save_dir = (
+            view_dir = (
                 self.output_dir
                 / "refined_scene_recon"
                 / self.cfg.exp_name
@@ -638,12 +711,56 @@ class MultiHumanFinetuner(Inferrer):
                 / meta["track_id"]
                 / f"view_deg{deg}"
             )
-            save_dir.mkdir(parents=True, exist_ok=True)
-            epoch_name = f"{epoch:04d}.png"
-            epoch_path = save_dir / epoch_name
-            Image.fromarray(img_uint8).save(epoch_path)
-            # Copy to last.png
-            Image.fromarray(img_uint8).save(save_dir / "last.png")
+            view_dir.mkdir(parents=True, exist_ok=True)
+            video_path = view_dir / f"epoch_{epoch:04d}.mp4"
+            if epoch == 0 and video_path.exists():
+                continue
+
+            frames = []
+            for fi in tqdm(range(num_frames), desc=f"Vis track {meta['track_id']} view {deg} epoch {epoch}"):
+                smplx_params = {
+                    "betas": shape_params.to(self.tuner_device),
+                    "transform_mat_neutral_pose": transform_slice.to(self.tuner_device),
+                }
+                for k, v in motion_seq["smplx_params"].items():
+                    if k == "betas":
+                        smplx_params[k] = shape_params.to(self.tuner_device)
+                    else:
+                        smplx_params[k] = v[:, fi : fi + 1].to(self.tuner_device)
+
+                if deg == 0:
+                    render_c2ws = motion_seq["render_c2ws"][:, fi : fi + 1].to(self.tuner_device)
+                else:
+                    rotated = rotate_c2ws_y_about_center(
+                        motion_seq["render_c2ws"], centers, degrees=deg
+                    ).to(self.tuner_device)
+                    render_c2ws = rotated[:, fi : fi + 1]
+
+                render_intrs = motion_seq["render_intrs"][:, fi : fi + 1].to(self.tuner_device)
+                render_bg_colors = motion_seq["render_bg_colors"][:, fi : fi + 1].to(self.tuner_device)
+
+                with torch.no_grad():
+                    res = self.model.animation_infer_custom(
+                        gs_slice,
+                        query_slice,
+                        smplx_params,
+                        render_c2ws=render_c2ws,
+                        render_intrs=render_intrs,
+                        render_bg_colors=render_bg_colors,
+                    )
+                    img = res["comp_rgb"][0].detach().cpu().clamp(0, 1).numpy()
+
+                img_uint8 = (img * 255).astype(np.uint8)
+                frames.append(img_uint8)
+
+            try:
+                writer = imageio.get_writer(video_path, fps=10, codec="libx264", format="ffmpeg")
+                for f in frames:
+                    writer.append_data(f)
+                writer.close()
+                shutil.copy(video_path, view_dir / "last.mp4")
+            except Exception as e:
+                print(f"[WARN] video export failed for view {deg}: {e}")
 
     # ---------------- Saving ----------------
     def _save_refined_models(self):
@@ -671,6 +788,16 @@ class MultiHumanFinetuner(Inferrer):
             np.save(track_dir / "shape_params.npy", meta["shape_params"].squeeze(0).cpu().numpy())
 
         print(f"[INFO] Saved refined models to {save_root}")
+        # Save shared skinning weights if available
+        if hasattr(self.model.renderer, "smplx_model"):
+            smplx = self.model.renderer.smplx_model
+            payload = {}
+            if hasattr(smplx, "voxel_ws"):
+                payload["voxel_ws"] = smplx.voxel_ws.detach().cpu()
+            if hasattr(smplx, "skinning_weight"):
+                payload["skinning_weight"] = smplx.skinning_weight.detach().cpu()
+            if payload:
+                torch.save(payload, save_root / "smplx_skinning.pt")
 
     def infer(self):
         # keep this here for compatibility

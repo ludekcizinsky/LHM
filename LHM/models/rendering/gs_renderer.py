@@ -1620,12 +1620,12 @@ class GS3DRenderer(nn.Module):
         N_view = smplx_data["root_pose"].shape[1]
         # print(f"[DEBUG] N_view: {N_view}")
 
+
+        # step 1: animate gs model = canonical -> posed view
         all_posed_gs_list = []
         for person_idx in range(batch_size):
-            # step 1: animate gs model = canonical -> posed view
             gs_attr = gs_attr_list[person_idx]
             query_pt = query_points[person_idx]
-            # len(animatable_gs_model_list) = num_view
             posed_gs_list, _ = self.animate_gs_model_custom(
                 gs_attr,
                 query_pt,
