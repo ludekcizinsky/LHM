@@ -193,15 +193,26 @@ class FrameMaskDataset(Dataset):
         self.masks_dir = masks_dir
         self.device = device
 
-        self.frame_paths = sorted(frames_dir.glob("*.png"))
+        frame_candidates = []
+        for ext in ("*.png", "*.jpg", "*.jpeg"):
+            frame_candidates.extend(frames_dir.glob(ext))
+        self.frame_paths = sorted(set(frame_candidates))
         if sample_every > 1:
             self.frame_paths = self.frame_paths[::sample_every]
         if not self.frame_paths:
             raise RuntimeError(f"No frames found in {frames_dir}")
-        self.mask_paths = [masks_dir / p.name for p in self.frame_paths]
-        missing = [p for p in self.mask_paths if not p.exists()]
+        self.mask_paths = []
+        missing = []
+        for p in self.frame_paths:
+            base = p.stem
+            candidates = [masks_dir / f"{base}{ext}" for ext in (".png", ".jpg", ".jpeg")]
+            mask_path = next((c for c in candidates if c.exists()), None)
+            if mask_path is None:
+                missing.append(base)
+            else:
+                self.mask_paths.append(mask_path)
         if missing:
-            raise RuntimeError(f"Missing masks for frames: {missing[:5]}")
+            raise RuntimeError(f"Missing masks for frames (by stem): {missing[:5]}")
 
     def __len__(self):
         return len(self.frame_paths)
@@ -295,7 +306,7 @@ class MultiHumanFinetuner(Inferrer):
 
     def _load_gs_model(self, root_output_dir: Path):
         refined_dir = root_output_dir / "refined_scene_recon" / self.cfg.exp_name
-        root_gs_model_dir = refined_dir if refined_dir.exists() else root_output_dir / "initial_scene_recon"
+        root_gs_model_dir = refined_dir if (refined_dir / "00").exists() else root_output_dir / "initial_scene_recon"
         track_ids = sorted(
             [
                 track_id
@@ -585,6 +596,8 @@ class MultiHumanFinetuner(Inferrer):
         if self.cfg.vis_every_epoch > 0:
             for tidx in range(len(self.track_meta)):
                 self._canonical_vis_for_track(tidx, 0)
+        if getattr(self.cfg, "eval_every_epoch", 0) > 0:
+            self.eval_loop(0)
 
         for epoch in range(self.cfg.epochs):
             running_loss = 0.0
@@ -712,10 +725,123 @@ class MultiHumanFinetuner(Inferrer):
             if self.cfg.vis_every_epoch > 0 and (epoch + 1) % self.cfg.vis_every_epoch == 0:
                 for tidx in range(len(self.track_meta)):
                     self._canonical_vis_for_track(tidx, epoch + 1)
+            if getattr(self.cfg, "eval_every_epoch", 0) > 0 and (epoch + 1) % self.cfg.eval_every_epoch == 0:
+                self.eval_loop(epoch + 1)
 
         self._save_refined_models()
         if self.wandb_run is not None:
             self.wandb_run.finish()
+
+    # ---------------- Evaluation -------------------
+    def eval_loop(self, epoch):
+        # Parse the evaluation setup
+        source_camera_id: int = self.cfg.nvs_eval.source_camera_id
+        target_camera_ids: List[int] = self.cfg.nvs_eval.target_camera_ids
+        root_gt_dir_path: Path = Path(self.cfg.nvs_eval.root_gt_dir_path)
+        camera_params_path: Path = root_gt_dir_path / "cameras" / "rgb_cameras.npz"
+        root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
+        root_save_dir.mkdir(parents=True, exist_ok=True)
+
+        def _extr_to_w2c_4x4(extr: torch.Tensor) -> torch.Tensor:
+            w2c = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
+            w2c[:3, :4] = extr.to(self.tuner_device)
+            return w2c
+
+        def _intr_to_4x4(intr: torch.Tensor) -> torch.Tensor:
+            intr4 = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
+            intr4[:3, :3] = intr.to(self.tuner_device)
+            return intr4
+
+        def _rescale_intrinsics(intr: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
+            """Rescale fx/fy/cx/cy if the render resolution differs from the intrinsic's implied size."""
+            intr = intr.clone()
+            orig_w = intr[0, 2] * 2.0
+            orig_h = intr[1, 2] * 2.0
+            if orig_w <= 0 or orig_h <= 0:
+                return intr
+            scale_x = target_w / orig_w
+            scale_y = target_h / orig_h
+            intr[0, 0] = intr[0, 0] * scale_x
+            intr[1, 1] = intr[1, 1] * scale_y
+            intr[0, 2] = intr[0, 2] * scale_x
+            intr[1, 2] = intr[1, 2] * scale_y
+            return intr
+
+        # Load source camera (used to convert target cameras into source/world coords)
+        src_intr, src_extr = load_camera_from_npz(camera_params_path, source_camera_id, device=self.tuner_device)
+        src_w2c = _extr_to_w2c_4x4(src_extr)
+        src_c2w = torch.inverse(src_w2c)
+
+        for tgt_cam_id in target_camera_ids:
+            tgt_gt_frames_dir_path = root_gt_dir_path / "images" / f"{tgt_cam_id}"
+            tgt_gt_masks_dir_path = root_gt_dir_path / "seg" / "img_seg_mask" / f"{tgt_cam_id}" / "all"
+            tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
+            # Match render resolution to GT frames by rescaling intrinsics to the actual image size.
+            if tgt_gt_frames_dir_path.exists():
+                first_frame = next(iter(sorted(tgt_gt_frames_dir_path.glob("*.png")) or sorted(tgt_gt_frames_dir_path.glob("*.jpg")) or sorted(tgt_gt_frames_dir_path.glob("*.jpeg"))), None)
+                if first_frame is not None:
+                    with Image.open(first_frame) as img:
+                        w, h = img.size
+                    tgt_intr = _rescale_intrinsics(tgt_intr, w, h)
+            tgt_w2c = _extr_to_w2c_4x4(tgt_extr)
+            tgt_c2w_world = torch.inverse(tgt_w2c)
+
+            # Express target camera in source-camera coordinates: S <- W <- T
+            tgt_c2w_in_src = src_w2c @ tgt_c2w_world
+            tgt_intr4 = _intr_to_4x4(tgt_intr)
+
+            save_dir = root_save_dir / f"{tgt_cam_id}"
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
+            loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=0, drop_last=False)
+
+            # Use target camera pose expressed in source frame.
+            tgt_c2w_template = tgt_c2w_in_src.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
+            tgt_intr_template = tgt_intr4.unsqueeze(0).unsqueeze(0)      # [1,1,4,4]
+
+            with torch.no_grad():
+                for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
+                    frame_indices = frame_indices.to(self.tuner_device)
+                    smplx_params, _, _, render_bg_colors = self._slice_motion(frame_indices)
+
+                    # Build camera tensors matching render_bg_colors leading dims [B?, F]
+                    num_tracks, num_frames = render_bg_colors.shape[0], render_bg_colors.shape[1]
+                    render_c2ws = tgt_c2w_template.expand(num_tracks, num_frames, 4, 4)
+                    render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4)
+                    render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32)
+
+                    res = self.model.animation_infer_custom(
+                        self.gs_model_list,
+                        self.query_points,
+                        smplx_params,
+                        render_c2ws=render_c2ws,
+                        render_intrs=render_intrs,
+                        render_bg_colors=render_bg_colors,
+                    )
+
+                    comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
+                    # If render size differs from GT, resize render to match
+                    if comp_rgb.shape[1:3] != frames.shape[1:3]:
+                        comp_rgb = F.interpolate(
+                            comp_rgb.permute(0, 3, 1, 2),
+                            size=frames.shape[1:3],
+                            mode="bilinear",
+                            align_corners=False,
+                        ).permute(0, 2, 3, 1)
+                    masks3 = masks
+                    if masks3.shape[-1] == 1:
+                        masks3 = masks3.repeat(1, 1, 1, 3)
+                    masked_render = comp_rgb # * masks3
+                    masked_gt = frames * masks3
+                    joined = torch.cat([masked_render, masked_gt], dim=2)  # side-by-side along width
+
+                    for bi in range(frames.shape[0]):
+                        fname = Path(frame_paths[bi]).name
+                        save_image(joined[bi], str(save_dir / fname))
+
+
+
 
     # ---------------- Visualization ----------------
     def _canonical_vis_for_track(self, track_idx: int, epoch: int):
