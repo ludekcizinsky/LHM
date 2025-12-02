@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e # exit on error
 # given pose sequence, generating animation video .
 # usage: bash inference.sh <seq_name> <track_idx> <ref_frame_idx> <model_name>
 # example: bash inference.sh taichi 0 3 LHM-1B

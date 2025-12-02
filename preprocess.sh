@@ -27,8 +27,6 @@ frame_folder=$output_dir/frames
 mkdir -p $frame_folder
 initial_gs_model_dir=$output_dir/initial_scene_recon
 mkdir -p $initial_gs_model_dir
-refined_gs_model_dir=$output_dir/refined_scene_recon
-mkdir -p $refined_gs_model_dir
 
 # echo "--- [1/?] Running preprocess.sh to generate motion sequences"
 # conda deactivate && conda activate lhm
@@ -50,4 +48,4 @@ mkdir -p $refined_gs_model_dir
 echo "--- [4/?] Running inference.sh to obtain canonical 3dgs models for each human"
 conda deactivate && conda activate lhm
 bash inference.sh $seq_name 0 $default_ref_frame_idx LHM-1B
-# bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B
+bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B

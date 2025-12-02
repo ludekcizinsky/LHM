@@ -462,9 +462,6 @@ class MultiHumanFinetuner(Inferrer):
             "lhand_pose",
             "rhand_pose",
             "trans",
-            "focal",
-            "princpt",
-            "img_size_wh",
             "expr",
         ]
         smplx = {"betas": self.shape_param.to(self.tuner_device)}
@@ -780,12 +777,15 @@ class MultiHumanFinetuner(Inferrer):
             with torch.no_grad():
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
                     frame_indices = frame_indices.to(self.tuner_device)
-                    smplx_params, _, _, render_bg_colors = self._slice_motion(frame_indices)
+                    smplx_params, est_render_c2ws, est_render_intrs, render_bg_colors = self._slice_motion(frame_indices)
+                    # print(f"[DEBUG] Shape of est_render_c2ws: {est_render_c2ws.shape} and est_rendere_intrinsics: {est_rendere_intrinsics.shape}")
 
                     # Build camera tensors matching render_bg_colors leading dims [B?, F]
                     num_tracks, num_frames = render_bg_colors.shape[0], render_bg_colors.shape[1]
-                    render_c2ws = tgt_c2w_template.expand(num_tracks, num_frames, 4, 4)
-                    render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4)
+                    gt_render_c2ws = tgt_c2w_template.expand(num_tracks, num_frames, 4, 4)
+                    # print(f"[DEBUG] Shape of render_c2ws: {render_c2ws.shape}")
+
+                    gt_render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4)
                     render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32)
 
                     # Render with the model
@@ -793,8 +793,8 @@ class MultiHumanFinetuner(Inferrer):
                         self.gs_model_list,
                         self.query_points,
                         smplx_params,
-                        render_c2ws=render_c2ws,
-                        render_intrs=render_intrs,
+                        render_c2ws=gt_render_c2ws,
+                        render_intrs=gt_render_intrs,
                         render_bg_colors=render_bg_colors,
                     )
 

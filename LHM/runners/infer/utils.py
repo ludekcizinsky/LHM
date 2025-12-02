@@ -12,6 +12,7 @@ import os
 import pdb
 from collections import defaultdict
 
+from pathlib import Path
 import cv2
 import decord
 import numpy as np
@@ -82,6 +83,45 @@ def _load_pose(pose):
     c2w = c2w.float()
 
     return c2w, intrinsic
+
+
+def load_human3r_cameras(cameras_npz_path):
+    """
+    Load Human3R camera parameters (cameras.npz) and return torch tensors.
+
+    Returns:
+        c2ws: [N, 4, 4] camera-to-world transforms.
+        intrs: [N, 4, 4] intrinsics with bottom row [0,0,0,1].
+    """
+    data = np.load(cameras_npz_path)
+    required_keys = ["R_world2cam", "t_world2cam", "K"]
+    for k in required_keys:
+        if k not in data:
+            raise KeyError(f"Missing key '{k}' in {cameras_npz_path}")
+
+    order = None
+    if "frame_idx" in data:
+        order = np.argsort(data["frame_idx"])
+
+    def _maybe_reorder(arr):
+        return arr if order is None else arr[order]
+
+    R_w2c = torch.as_tensor(_maybe_reorder(data["R_world2cam"]), dtype=torch.float32)
+    t_w2c = torch.as_tensor(_maybe_reorder(data["t_world2cam"]), dtype=torch.float32)
+    K = torch.as_tensor(_maybe_reorder(data["K"]), dtype=torch.float32)
+
+    R_c2w = R_w2c.transpose(1, 2)
+    t_c2w = -torch.einsum("bij,bj->bi", R_c2w, t_w2c)
+
+    N = R_c2w.shape[0]
+    c2ws = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(N, 1, 1)
+    # c2ws[:, :3, :3] = R_c2w
+    # c2ws[:, :3, 3] = t_c2w
+
+    intrs = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(N, 1, 1)
+    intrs[:, :3, :3] = K
+
+    return c2ws, intrs
 
 
 def img_center_padding(img_np, pad_ratio):
@@ -386,6 +426,67 @@ def render_smplx_mesh(
     mesh_render = np.stack(mesh_render_list)
     return mesh_render
 
+def prepare_motion_seqs_human3r(
+    motion_seqs_dir : Path,
+    bg_color=1.0,
+    motion_size=3000,  # only support 100s videos
+):
+
+    # motion_seqs_dir: directory of smplx_params predicted by human3r
+    motion_seqs = sorted(glob.glob(os.path.join(motion_seqs_dir, "*.json")))
+    motion_seqs = motion_seqs[:motion_size]
+
+    # load smplx params
+    smplx_params, bg_colors = [], []
+    shape_param = None
+
+    for idx, smplx_path in enumerate(motion_seqs):
+        with open(smplx_path) as f:
+            smplx_raw_data = json.load(f)
+            smplx_param = {
+                k: torch.FloatTensor(v)
+                for k, v in smplx_raw_data.items()
+                if "pad_ratio" not in k
+            }
+
+        if idx == 0:
+            shape_param = smplx_param["betas"]
+
+        smplx_param["expr"] = torch.FloatTensor([0.0] * 100)
+
+        bg_colors.append(bg_color)
+        smplx_params.append(smplx_param)
+
+    cameras_npz_path = motion_seqs_dir.parent.parent / "cameras.npz"
+    c2ws, intrs = load_human3r_cameras(cameras_npz_path)
+    bg_colors = (
+        torch.tensor(bg_colors, dtype=torch.float32).unsqueeze(-1).repeat(1, 3)
+    )  # [N, 3]
+
+    smplx_params_tmp = defaultdict(list)
+    for smplx in smplx_params:
+        for k, v in smplx.items():
+            smplx_params_tmp[k].append(v)
+    for k, v in smplx_params_tmp.items():
+        smplx_params_tmp[k] = torch.stack(v)  # [Nv, xx, xx]
+    smplx_params = smplx_params_tmp
+    smplx_params["betas"] = shape_param
+
+    # add batch dim
+    for k, v in smplx_params.items():
+        smplx_params[k] = v.unsqueeze(0)
+    c2ws = c2ws.unsqueeze(0)
+    intrs = intrs.unsqueeze(0)
+    bg_colors = bg_colors.unsqueeze(0)
+
+    motion_seqs_ret = {}
+    motion_seqs_ret["render_c2ws"] = c2ws
+    motion_seqs_ret["render_intrs"] = intrs
+    motion_seqs_ret["render_bg_colors"] = bg_colors
+    motion_seqs_ret["smplx_params"] = smplx_params
+    motion_seqs_ret["motion_seqs"] = motion_seqs
+
+    return motion_seqs_ret
 
 def prepare_motion_seqs(
     motion_seqs_dir,
