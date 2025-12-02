@@ -601,7 +601,7 @@ if __name__ == "__main__":
         device,
         kp_mode=opt.kp_mode,
         visualize=opt.visualize,
-        pad_ratio=opt.pad_ratio,
+        pad_ratio=0,
         fov=FOV,
     )
     pipeline(opt.video_path, Path(opt.output_path))

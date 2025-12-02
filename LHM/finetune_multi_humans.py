@@ -752,7 +752,7 @@ class MultiHumanFinetuner(Inferrer):
             intr4[:3, :3] = intr.to(self.tuner_device)
             return intr4
 
-        # Source camera pose: w2c from params, invert to c2w (world = source cam frame)
+        # Source camera pose: w2c from params
         _, src_extr = load_camera_from_npz(camera_params_path, source_camera_id, device=self.tuner_device)
         src_w2c = _extr_to_w2c_4x4(src_extr)
 
@@ -762,8 +762,10 @@ class MultiHumanFinetuner(Inferrer):
             tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
             tgt_w2c = _extr_to_w2c_4x4(tgt_extr)
 
-            # Express target camera in source-camera coordinates: c2w_rel = inv(w2c_tgt @ inv(w2c_src))
-            tgt_c2w_in_src = torch.inverse(tgt_w2c @ torch.inverse(src_w2c))
+            # Express target camera in source-camera coordinates
+            tgt_c2w_in_src = src_w2c @ torch.inverse(tgt_w2c) 
+
+            # Use the target camera intrinsics as 4x4 matrix
             tgt_intr4 = _intr_to_4x4(tgt_intr)
 
             save_dir = root_save_dir / f"{tgt_cam_id}"
