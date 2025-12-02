@@ -837,9 +837,8 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
         '''Inference code avoid repeat forward.
         '''
 
-        render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(
-            render_intrs[0, 0, 0, 2] * 2
-        )
+        render_h, render_w = 1280, 940
+
         # render target views
         render_res_list = []
         num_views = render_c2ws.shape[1]

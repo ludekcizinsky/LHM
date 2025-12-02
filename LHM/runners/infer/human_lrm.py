@@ -755,6 +755,9 @@ class HumanLRMInferrer(Inferrer):
 
         self.model.to(dtype)
         smplx_params = motion_seq['smplx_params']
+        for k in smplx_params:
+            print(f"[DEBUG] smplx x params key: {k}")
+
         smplx_params['betas'] = shape_param.to(device)
         gs_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
             image.unsqueeze(0).to(device, dtype),

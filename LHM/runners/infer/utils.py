@@ -70,6 +70,11 @@ def _load_pose(pose):
     intrinsic[0, 2] = pose["princpt"][0]
     intrinsic[1, 2] = pose["princpt"][1]
     intrinsic = intrinsic.float()
+    print("[DEBUG] Loaded intrinsic matrix:")
+    print(f"    focal x: {intrinsic[0, 0]}")
+    print(f"    focal y: {intrinsic[1, 1]}")
+    print(f"    principal point x: {intrinsic[0, 2]}")
+    print(f"    principal point y: {intrinsic[1, 2]}")
 
     c2w = torch.eye(4)
     # c2w[:3, :3] = torch.tensor(pose["R"])

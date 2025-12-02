@@ -50,4 +50,4 @@ mkdir -p $refined_gs_model_dir
 echo "--- [4/?] Running inference.sh to obtain canonical 3dgs models for each human"
 conda deactivate && conda activate lhm
 bash inference.sh $seq_name 0 $default_ref_frame_idx LHM-1B
-bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B
+# bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B

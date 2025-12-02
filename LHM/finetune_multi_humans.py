@@ -739,7 +739,6 @@ class MultiHumanFinetuner(Inferrer):
         target_camera_ids: List[int] = self.cfg.nvs_eval.target_camera_ids
         root_gt_dir_path: Path = Path(self.cfg.nvs_eval.root_gt_dir_path)
         camera_params_path: Path = root_gt_dir_path / "cameras" / "rgb_cameras.npz"
-        pad_ratio: float = float(getattr(self.cfg.nvs_eval, "pad_ratio", 0.0))
         root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
         root_save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -753,21 +752,6 @@ class MultiHumanFinetuner(Inferrer):
             intr4[:3, :3] = intr.to(self.tuner_device)
             return intr4
 
-        def _rescale_intrinsics(intr: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
-            """Rescale fx/fy/cx/cy if the render resolution differs from the intrinsic's implied size."""
-            intr = intr.clone()
-            orig_w = intr[0, 2] * 2.0
-            orig_h = intr[1, 2] * 2.0
-            if orig_w <= 0 or orig_h <= 0:
-                return intr
-            scale_x = target_w / orig_w
-            scale_y = target_h / orig_h
-            intr[0, 0] = intr[0, 0] * scale_x
-            intr[1, 1] = intr[1, 1] * scale_y
-            intr[0, 2] = target_w / 2.0
-            intr[1, 2] = target_h / 2.0
-            return intr
-
         # Source camera pose: w2c from params, invert to c2w (world = source cam frame)
         _, src_extr = load_camera_from_npz(camera_params_path, source_camera_id, device=self.tuner_device)
         src_w2c = _extr_to_w2c_4x4(src_extr)
@@ -776,16 +760,6 @@ class MultiHumanFinetuner(Inferrer):
             tgt_gt_frames_dir_path = root_gt_dir_path / "images" / f"{tgt_cam_id}"
             tgt_gt_masks_dir_path = root_gt_dir_path / "seg" / "img_seg_mask" / f"{tgt_cam_id}" / "all"
             tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
-            # Match render resolution to GT frames by rescaling intrinsics to the actual image size.
-            if tgt_gt_frames_dir_path.exists():
-                first_frame = next(iter(sorted(tgt_gt_frames_dir_path.glob("*.png")) or sorted(tgt_gt_frames_dir_path.glob("*.jpg")) or sorted(tgt_gt_frames_dir_path.glob("*.jpeg"))), None)
-                if first_frame is not None:
-                    with Image.open(first_frame) as img:
-                        gt_w, gt_h = img.size  # PIL gives (width, height)
-                    tgt_intr = _rescale_intrinsics(tgt_intr, gt_w, gt_h)
-            else:
-                gt_w = int(tgt_intr[0, 2] * 2.0)
-                gt_h = int(tgt_intr[1, 2] * 2.0)
             tgt_w2c = _extr_to_w2c_4x4(tgt_extr)
 
             # Express target camera in source-camera coordinates: c2w_rel = inv(w2c_tgt @ inv(w2c_src))
@@ -826,7 +800,7 @@ class MultiHumanFinetuner(Inferrer):
                     masks3 = masks
                     if masks3.shape[-1] == 1:
                         masks3 = masks3.repeat(1, 1, 1, 3)
-                    masked_render = comp_rgb * masks3
+                    masked_render = comp_rgb # * masks3
                     masked_gt = frames * masks3
                     overlay = 0.5 * masked_render + 0.5 * masked_gt
                     joined = torch.cat([masked_render, masked_gt, overlay], dim=2)  # side-by-side along width
@@ -834,6 +808,7 @@ class MultiHumanFinetuner(Inferrer):
                     for bi in range(frames.shape[0]):
                         fname = Path(frame_paths[bi]).name
                         save_image(joined[bi], str(save_dir / fname))
+        quit()
 
 
     # ---------------- Visualization ----------------
