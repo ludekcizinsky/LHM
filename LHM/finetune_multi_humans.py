@@ -236,7 +236,7 @@ def smplx_joints_in_camera(
         print(f"[DEBUG] Could not compute SMPL-X joints in camera space: {e}")
         return None
 
-def overlay_smplx_body_joints_on_render(
+def overlay_smplx_body_joints(
     masked_render: torch.Tensor,
     smplx_params: dict,
     render_c2ws: torch.Tensor,
@@ -287,42 +287,58 @@ def overlay_smplx_body_joints_on_render(
     return masked_render
 
 
-def overlay_gt_smpl_joints_from_npz(
-    image: torch.Tensor,
-    frame_path: str | Path,
+def overlay_gt_smpl_joints(
+    images: torch.Tensor,
+    frame_paths: List[str | Path],
     smpl_dir: Path,
-    c2w: torch.Tensor,
-    intr: torch.Tensor,
+    c2ws: torch.Tensor,
+    intrs: torch.Tensor,
     device: torch.device,
     joint_radius: int = 3,
 ) -> torch.Tensor:
     """
-    Load GT SMPL joints (24) from npz and overlay onto the provided image.
-    image: [H, W, 3]
-    c2w: [4,4] camera-to-world
-    intr: [3,3] intrinsics
+    Batch helper: overlay GT SMPL joints on a batch of images.
+
+    Args:
+        images: [F, H, W, 3]
+        frame_paths: List of frame file paths
+        smpl_dir: Path to directory containing SMPL npz files
+        c2ws: [1, 4, 4] 
+        intrs: [1, 4, 4] 
+
+    Returns:
+        torch.Tensor: Images with overlaid GT SMPL joints of shape [F, H, W, 3]
     """
-
+    updated = []
+    F = images.shape[0]
     color = torch.tensor([0.0, 1.0, 0.0], device=device)
+    for fi in range(F): 
+        # Prepare cam params
+        c2w = c2ws[0]
+        w2c = torch.inverse(c2w.to(device))
+        intr = intrs[0][:3, :3]
 
-    stem = Path(frame_path).stem
-    npz_path = smpl_dir / f"{stem}.npz"
-    if not npz_path.exists():
-        raise FileNotFoundError(f"SMPL npz file not found: {npz_path}")
-    data = np.load(npz_path)
-    joints_np = data["joints_3d"]  # [P,24,3]
-    joints = torch.from_numpy(joints_np).to(device=device, dtype=torch.float32)
-    w2c = torch.inverse(c2w.to(device))
-    gt_img = image.clone().unsqueeze(0)
+        # Load gt joints for the given frame
+        stem = Path(frame_paths[fi]).stem
+        npz_path = smpl_dir / f"{stem}.npz"
+        if not npz_path.exists():
+            raise FileNotFoundError(f"SMPL npz file not found: {npz_path}")
+        data = np.load(npz_path)
+        joints_np = data["joints_3d"]  # [P,24,3]
+        joints = torch.from_numpy(joints_np).to(device=device, dtype=torch.float32)
 
-    for person_idx in range(joints.shape[0]):
+        # Prepare image for overlay
+        gt_img = images[fi].clone().unsqueeze(0)
 
-        H, W = gt_img.shape[1], gt_img.shape[2]
-        joints_world = joints[person_idx].unsqueeze(0) # [1,24,3]
-        w2c = w2c.to(device) # [4,4]
-        intr_mat = intr.to(device) # [3,3]
+        for person_idx in range(joints.shape[0]):
+            
+            # Prepare joint and camera parameters
+            H, W = gt_img.shape[1], gt_img.shape[2]
+            joints_world = joints[person_idx].unsqueeze(0) # [1,24,3]
+            w2c = w2c.to(device) # [4,4]
+            intr_mat = intr.to(device) # [3,3]
 
-        try:
+            # Project joints to image plane
             homo = torch.cat([joints_world, torch.ones_like(joints_world[..., :1])], dim=-1)  # [1,N,4]
             cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[..., :3]  # [1,N,3]
             cam_z = cam[..., 2].clamp(min=1e-6)
@@ -334,6 +350,8 @@ def overlay_gt_smpl_joints_from_npz(
             uvy = (fy * cam[..., 1] + cy * cam_z) / cam_z
             u = uvx.round().long().squeeze(0)
             v = uvy.round().long().squeeze(0)
+
+            # Overlay joints on image
             body_joint_ids = list(range(min(24, u.shape[0])))  # SMPL has 24 body joints
             for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
                 if 0 <= ui < W and 0 <= vi < H:
@@ -342,42 +360,10 @@ def overlay_gt_smpl_joints_from_npz(
                     u0 = max(ui - joint_radius, 0)
                     u1 = min(ui + joint_radius + 1, W)
                     gt_img[0, v0:v1, u0:u1, :] = color
-        except Exception as e:
-            print(f"[DEBUG] Could not overlay SMPL joints: {e}")
-
-    return gt_img.squeeze(0)
 
 
-def overlay_gt_smpl_joints_batch(
-    images: torch.Tensor,
-    frame_paths: List[str | Path],
-    smpl_dir: Path,
-    c2ws: torch.Tensor,
-    intrs: torch.Tensor,
-    device: torch.device,
-    joint_radius: int = 3,
-) -> torch.Tensor:
-    """
-    Batch helper: overlay GT SMPL joints on a batch of images.
-    images: [F, H, W, 3]
-    c2ws: [1, 4, 4] 
-    intrs: [1, 4, 4] 
-    """
-    updated = []
-    F = images.shape[0]
-    for fi in range(F): 
-        c2w = c2ws[0]
-        intr = intrs[0][:3, :3]
-        img_over = overlay_gt_smpl_joints_from_npz(
-            images[fi],
-            frame_paths[fi],
-            smpl_dir,
-            c2w,
-            intr,
-            device,
-            joint_radius=joint_radius,
-        )
-        updated.append(img_over)
+        updated.append(gt_img.squeeze(0))
+
     return torch.stack(updated, dim=0)
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +991,7 @@ class MultiHumanFinetuner(Inferrer):
                     masked_gt = frames * masks3
 
                     # Overlay SMPLX body joints on render
-                    masked_render = overlay_smplx_body_joints_on_render(
+                    masked_render = overlay_smplx_body_joints(
                         masked_render,
                         smplx_params,
                         gt_render_c2ws,
@@ -1017,7 +1003,7 @@ class MultiHumanFinetuner(Inferrer):
 
                     # Overlay GT SMPL joints on ground truth images using the global target camera.
                     c2w_global = torch.inverse(tgt_w2c).unsqueeze(0)  # [1,4,4]
-                    masked_gt = overlay_gt_smpl_joints_batch(
+                    masked_gt = overlay_gt_smpl_joints(
                         masked_gt,
                         frame_paths,
                         gt_smpl_dir_path,
