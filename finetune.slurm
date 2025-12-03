@@ -15,6 +15,7 @@ conda deactivate && conda activate lhm
 
 # --- Shared settings
 seq_name="hi4d_pair00_fight"
+num_persons=2
 
 # --- V1
 # exp_name="default"
@@ -49,4 +50,4 @@ seq_name="hi4d_pair00_fight"
 
 # --- V2
 exp_name="dev"
-python LHM/finetune_multi_humans.py scene_name=$seq_name 
+python LHM/finetune_multi_humans.py scene_name=$seq_name num_persons=$num_persons

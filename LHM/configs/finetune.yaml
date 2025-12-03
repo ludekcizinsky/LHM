@@ -1,4 +1,5 @@
 scene_name: ???
+num_persons: ???
 output_dir: /scratch/izar/cizinsky/thesis/preprocessing/${scene_name}/lhm
 exp_name: "dev"
 epochs: 10

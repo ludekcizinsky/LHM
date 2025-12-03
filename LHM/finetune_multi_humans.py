@@ -48,6 +48,60 @@ from LHM.runners.infer.base_inferrer import Inferrer
 from LHM.utils.hf_hub import wrap_model_hub
 
 # ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+class FrameMaskDataset(Dataset):
+    def __init__(self, frames_dir: Path, masks_dir: Path, device: torch.device, sample_every: int = 1):
+        self.frames_dir = frames_dir
+        self.masks_dir = masks_dir
+        self.device = device
+
+        frame_candidates = []
+        for ext in ("*.png", "*.jpg", "*.jpeg"):
+            frame_candidates.extend(frames_dir.glob(ext))
+        self.frame_paths = sorted(set(frame_candidates))
+        if sample_every > 1:
+            self.frame_paths = self.frame_paths[::sample_every]
+        if not self.frame_paths:
+            raise RuntimeError(f"No frames found in {frames_dir}")
+        self.mask_paths = []
+        missing = []
+        for p in self.frame_paths:
+            base = p.stem
+            candidates = [masks_dir / f"{base}{ext}" for ext in (".png", ".jpg", ".jpeg")]
+            mask_path = next((c for c in candidates if c.exists()), None)
+            if mask_path is None:
+                missing.append(base)
+            else:
+                self.mask_paths.append(mask_path)
+        if missing:
+            raise RuntimeError(f"Missing masks for frames (by stem): {missing[:5]}")
+
+    def __len__(self):
+        return len(self.frame_paths)
+
+    def _load_img(self, path: Path) -> torch.Tensor:
+        img = Image.open(path).convert("RGB")
+        arr = torch.from_numpy(np.array(img)).float() / 255.0
+        return arr.to(self.device)
+
+    def _load_mask(self, path: Path) -> torch.Tensor:
+        mask = Image.open(path).convert("L")
+        arr = torch.from_numpy(np.array(mask)).float() / 255.0
+        return arr.unsqueeze(-1).to(self.device)
+
+    def __getitem__(self, idx: int):
+        frame = self._load_img(self.frame_paths[idx])
+        mask = self._load_mask(self.mask_paths[idx])
+        return (
+            torch.tensor(idx, device=self.device, dtype=torch.long),
+            frame,
+            mask,
+            str(self.frame_paths[idx]),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
 import math
@@ -369,58 +423,48 @@ def overlay_gt_smpl_joints(
 
     return torch.stack(updated, dim=0)
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-class FrameMaskDataset(Dataset):
-    def __init__(self, frames_dir: Path, masks_dir: Path, device: torch.device, sample_every: int = 1):
-        self.frames_dir = frames_dir
-        self.masks_dir = masks_dir
-        self.device = device
 
-        frame_candidates = []
-        for ext in ("*.png", "*.jpg", "*.jpeg"):
-            frame_candidates.extend(frames_dir.glob(ext))
-        self.frame_paths = sorted(set(frame_candidates))
-        if sample_every > 1:
-            self.frame_paths = self.frame_paths[::sample_every]
-        if not self.frame_paths:
-            raise RuntimeError(f"No frames found in {frames_dir}")
-        self.mask_paths = []
-        missing = []
-        for p in self.frame_paths:
-            base = p.stem
-            candidates = [masks_dir / f"{base}{ext}" for ext in (".png", ".jpg", ".jpeg")]
-            mask_path = next((c for c in candidates if c.exists()), None)
-            if mask_path is None:
-                missing.append(base)
-            else:
-                self.mask_paths.append(mask_path)
-        if missing:
-            raise RuntimeError(f"Missing masks for frames (by stem): {missing[:5]}")
+def preload_gt_smpl_joints_camera_space(
+    dataset: FrameMaskDataset,
+    smpl_dir: Path,
+    c2w: torch.Tensor,
+    num_persons: int,
+    device: torch.device,
+    preload_frames: int = 10,
+) -> torch.Tensor:
+    """
+    Load GT SMPL joints from npz and transform to camera space for the first `preload_frames` frames.
+    Returns a tensor [F, P, 24, 3] 
+    """
+    preload = min(preload_frames, len(dataset))
+    smpl_joints = []
+    for fp in dataset.frame_paths[:preload]:
+        per_person = []
+        for pid in range(num_persons):
+            cam_j = load_gt_smpl_joints_cam(smpl_dir, fp, pid, c2w, device)
+            if cam_j is not None:
+                per_person.append(cam_j)
+        if per_person:
+            smpl_joints.append(torch.stack(per_person, dim=0))
+        else:
+            smpl_joints.append(torch.empty(0, 24, 3, device=device))
 
-    def __len__(self):
-        return len(self.frame_paths)
+    return torch.stack(smpl_joints, dim=0)
 
-    def _load_img(self, path: Path) -> torch.Tensor:
-        img = Image.open(path).convert("RGB")
-        arr = torch.from_numpy(np.array(img)).float() / 255.0
-        return arr.to(self.device)
 
-    def _load_mask(self, path: Path) -> torch.Tensor:
-        mask = Image.open(path).convert("L")
-        arr = torch.from_numpy(np.array(mask)).float() / 255.0
-        return arr.unsqueeze(-1).to(self.device)
+def preload_pred_smplx_joints_camera_space(smplx_model, smplx_params, num_persons, n_frames, c2w_proj, device):
 
-    def __getitem__(self, idx: int):
-        frame = self._load_img(self.frame_paths[idx])
-        mask = self._load_mask(self.mask_paths[idx])
-        return (
-            torch.tensor(idx, device=self.device, dtype=torch.long),
-            frame,
-            mask,
-            str(self.frame_paths[idx]),
-        )
+    result = list()
+    for fid in range(n_frames):
+        results_per_frame = list()
+        for pid in range(num_persons):
+            joints_cam = smplx_joints_in_camera(
+                smplx_model, smplx_params, pid, fid, c2w_proj, device
+            ) # [55, 3]
+            results_per_frame.append(joints_cam)
+        result.append(torch.stack(results_per_frame, dim=0))
+
+    return torch.stack(result, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -944,21 +988,38 @@ class MultiHumanFinetuner(Inferrer):
             gt_smpl_dir_path = root_gt_dir_path / "smpl"
             tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
             tgt_w2c = _extr_to_w2c_4x4(tgt_extr)
+            tgt_c2w = torch.inverse(tgt_w2c)
 
             # Express target camera in source-camera coordinates
             tgt_c2w_in_src = src_w2c @ torch.inverse(tgt_w2c) 
+            tgt_c2w_template = tgt_c2w_in_src.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
 
             # Use the target camera intrinsics as 4x4 matrix
             tgt_intr4 = _intr_to_4x4(tgt_intr)
+            tgt_intr_template = tgt_intr4.unsqueeze(0).unsqueeze(0)      # [1,1,4,4]
 
-            save_dir = root_save_dir / f"{tgt_cam_id}"
-            save_dir.mkdir(parents=True, exist_ok=True)
-
+            # Prepare dataset and dataloader
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
             loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=0, drop_last=False)
 
-            tgt_c2w_template = tgt_c2w_in_src.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
-            tgt_intr_template = tgt_intr4.unsqueeze(0).unsqueeze(0)      # [1,1,4,4]
+            # Preload GT SMPL joints (camera space) for first few frames.
+            n_frames = 10
+            smpl_joints = preload_gt_smpl_joints_camera_space(
+                dataset, gt_smpl_dir_path, tgt_c2w, self.cfg.num_persons, self.tuner_device, preload_frames=n_frames, 
+            ) # [F, P, 24, 3]
+            print(f"Shape of smpl_joints: {smpl_joints.shape}")
+            frame_indices = torch.arange(n_frames, device=self.tuner_device, dtype=torch.long)
+            smplx_params, _, _, _ = self._slice_motion(frame_indices)
+            smplx_model = self.model.renderer.smplx_model
+            smplx_joints = preload_pred_smplx_joints_camera_space(
+                smplx_model, smplx_params, self.cfg.num_persons, n_frames, tgt_c2w_in_src, self.tuner_device
+            )
+            print(f"Shape of smplx_joints: {smplx_joints.shape}")
+            quit()
+
+            # Prepare paths where to save results
+            save_dir = root_save_dir / f"{tgt_cam_id}"
+            save_dir.mkdir(parents=True, exist_ok=True)
 
             with torch.no_grad():
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
