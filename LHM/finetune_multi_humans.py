@@ -183,6 +183,193 @@ def depth_to_color(
 def _ensure_nchw(t: torch.Tensor) -> torch.Tensor:
     return t.permute(0, 3, 1, 2).contiguous()
 
+def overlay_smpl_body_joints_on_image(
+    image: torch.Tensor,
+    joints_world: torch.Tensor,
+    w2c: torch.Tensor,
+    intr: torch.Tensor,
+    device: torch.device,
+    joint_radius: int = 3,
+    color: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Overlay SMPL (24-body) joints on a GT image.
+    image: [H, W, 3] or [1, H, W, 3]
+    joints_world: [N, 3] or [1, N, 3] in world coords
+    w2c: [4, 4] or [1, 4, 4] world-to-camera
+    intr: [3, 3] or [1, 3, 3] intrinsics
+    """
+    if color is None:
+        color = torch.tensor([1.0, 0.0, 0.0], device=device)
+    single = image.dim() == 3
+    if single:
+        img = image.unsqueeze(0)  # [1,H,W,3]
+    else:
+        img = image
+    H, W = img.shape[1], img.shape[2]
+
+    if joints_world.dim() == 2:
+        joints_world = joints_world.unsqueeze(0)  # [1,N,3]
+    if w2c.dim() == 3:
+        w2c = w2c[0]
+    w2c = w2c.to(device)
+    if intr.dim() == 3:
+        intr_mat = intr[0]
+    else:
+        intr_mat = intr
+    if intr_mat.shape[0] == 4:
+        intr_mat = intr_mat[:3, :3]
+    intr_mat = intr_mat.to(device)
+
+    try:
+        homo = torch.cat([joints_world, torch.ones_like(joints_world[..., :1])], dim=-1)  # [1,N,4]
+        cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[..., :3]  # [1,N,3]
+        cam_z = cam[..., 2].clamp(min=1e-6)
+        fx = intr_mat[0, 0]
+        cx = intr_mat[0, 2]
+        fy = intr_mat[1, 1]
+        cy = intr_mat[1, 2]
+        uvx = (fx * cam[..., 0] + cx * cam_z) / cam_z
+        uvy = (fy * cam[..., 1] + cy * cam_z) / cam_z
+        u = uvx.round().long().squeeze(0)
+        v = uvy.round().long().squeeze(0)
+        body_joint_ids = list(range(min(24, u.shape[0])))  # SMPL has 24 body joints
+        for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
+            if 0 <= ui < W and 0 <= vi < H:
+                v0 = max(vi - joint_radius, 0)
+                v1 = min(vi + joint_radius + 1, H)
+                u0 = max(ui - joint_radius, 0)
+                u1 = min(ui + joint_radius + 1, W)
+                img[0, v0:v1, u0:u1, :] = color
+    except Exception as e:
+        print(f"[DEBUG] Could not overlay SMPL joints: {e}")
+    return img[0] if single else img
+
+def overlay_smplx_body_joints_on_render(
+    masked_render: torch.Tensor,
+    smplx_params: dict,
+    render_c2ws: torch.Tensor,
+    render_intrs: torch.Tensor,
+    smplx_model,
+    device: torch.device,
+    joint_radius: int = 3,
+) -> torch.Tensor:
+    """
+    Draw body joints (root + 21) onto masked_render in-place and return it.
+    masked_render: [B, H, W, 3]
+    render_c2ws: [1, F, 4, 4]
+    render_intrs: [1, F, 4, 4]
+    smplx_params: dict containing per-person poses/trans, shape, and transform_mat_neutral_pose.
+    """
+    if smplx_model is None:
+        return masked_render
+
+    B = masked_render.shape[0]
+    body_joint_ids = list(range(22))
+
+    for bi in range(B):
+        try:
+            c2w_proj = render_c2ws[0, bi]
+            intr_proj = render_intrs[0, bi][:3, :3]
+            w2c = torch.inverse(c2w_proj).unsqueeze(0)  # [1,4,4]
+            H, W = masked_render.shape[1], masked_render.shape[2]
+
+            for pid in range(smplx_params["betas"].shape[0]):
+                smpl_slice = {
+                    "betas": smplx_params["betas"][pid : pid + 1],
+                    "root_pose": smplx_params["root_pose"][pid : pid + 1, bi],
+                    "body_pose": smplx_params["body_pose"][pid : pid + 1, bi],
+                    "jaw_pose": smplx_params["jaw_pose"][pid : pid + 1, bi],
+                    "leye_pose": smplx_params["leye_pose"][pid : pid + 1, bi],
+                    "reye_pose": smplx_params["reye_pose"][pid : pid + 1, bi],
+                    "lhand_pose": smplx_params["lhand_pose"][pid : pid + 1, bi],
+                    "rhand_pose": smplx_params["rhand_pose"][pid : pid + 1, bi],
+                    "trans": smplx_params["trans"][pid : pid + 1, bi],
+                    "transform_mat_neutral_pose": smplx_params["transform_mat_neutral_pose"][pid : pid + 1],
+                }
+                if "expr" in smplx_params:
+                    smpl_slice["expr"] = smplx_params["expr"][pid : pid + 1, bi]
+                for opt_key in ("face_offset", "joint_offset", "locator_offset"):
+                    if opt_key in smplx_params:
+                        smpl_slice[opt_key] = smplx_params[opt_key][pid : pid + 1]
+
+                joint_zero = smplx_model.get_zero_pose_human(
+                    shape_param=smpl_slice["betas"],
+                    device=device,
+                    face_offset=smpl_slice.get("face_offset", None),
+                    joint_offset=smpl_slice.get("joint_offset", None),
+                    return_mesh=False,
+                )
+                _, posed_joints = smplx_model.get_transform_mat_joint(
+                    smpl_slice["transform_mat_neutral_pose"], joint_zero, smpl_slice
+                )
+                joints_world = posed_joints + smpl_slice["trans"]
+
+                homo = torch.cat([joints_world, torch.ones_like(joints_world[..., :1])], dim=-1)  # [1,55,4]
+                cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[..., :3]  # [1,55,3]
+                cam_z = cam[..., 2].clamp(min=1e-6)
+                uvx = (intr_proj[0, 0] * cam[..., 0] + intr_proj[0, 2] * cam_z) / cam_z
+                uvy = (intr_proj[1, 1] * cam[..., 1] + intr_proj[1, 2] * cam_z) / cam_z
+                u = uvx.round().long().squeeze(0)
+                v = uvy.round().long().squeeze(0)
+                for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
+                    if 0 <= ui < W and 0 <= vi < H:
+                        v0 = max(vi - joint_radius, 0)
+                        v1 = min(vi + joint_radius + 1, H)
+                        u0 = max(ui - joint_radius, 0)
+                        u1 = min(ui + joint_radius + 1, W)
+                        masked_render[bi, v0:v1, u0:u1, :] = torch.tensor([1.0, 0.0, 0.0], device=device)
+        except Exception as e:
+            print(f"[DEBUG] Could not overlay joints for frame {bi}: {e}")
+    return masked_render
+
+
+def overlay_gt_smpl_joints_from_npz(
+    image: torch.Tensor,
+    frame_path: str | Path,
+    smpl_dir: Path,
+    c2w: torch.Tensor,
+    intr: torch.Tensor,
+    device: torch.device,
+    joint_radius: int = 3,
+    color: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Load GT SMPL joints (24) from npz and overlay onto the provided image.
+    image: [H, W, 3]
+    c2w: [4,4] camera-to-world
+    intr: [3,3] intrinsics
+    """
+    if color is None:
+        color = torch.tensor([0.0, 1.0, 0.0], device=device)
+    try:
+        stem = Path(frame_path).stem
+        npz_path = smpl_dir / f"{stem}.npz"
+        if not npz_path.exists():
+            return image
+        data = np.load(npz_path)
+        joints_np = data["joints_3d"]  # [P,24,3]
+        joints = torch.from_numpy(joints_np).to(device=device, dtype=torch.float32)
+        w2c = torch.inverse(c2w.to(device))
+        intr3 = intr.to(device)
+        gt_img = image.clone()
+
+        for person_idx in range(joints.shape[0]):
+            gt_img = overlay_smpl_body_joints_on_image(
+                gt_img,
+                joints[person_idx],
+                w2c,
+                intr3,
+                device,
+                joint_radius=joint_radius,
+                color=color,
+            )
+
+
+        return gt_img
+    except Exception as e:
+        print(f"[DEBUG] Could not overlay GT SMPL joints for {frame_path}: {e}")
+        return image
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -756,8 +943,10 @@ class MultiHumanFinetuner(Inferrer):
         for tgt_cam_id in target_camera_ids:
             tgt_gt_frames_dir_path = root_gt_dir_path / "images" / f"{tgt_cam_id}"
             tgt_gt_masks_dir_path = root_gt_dir_path / "seg" / "img_seg_mask" / f"{tgt_cam_id}" / "all"
+            gt_smpl_dir_path = root_gt_dir_path / "smpl"
             tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
             tgt_w2c = _extr_to_w2c_4x4(tgt_extr)
+            tgt_c2w_global = torch.inverse(tgt_w2c)
 
             # Express target camera in source-camera coordinates
             tgt_c2w_in_src = src_w2c @ torch.inverse(tgt_w2c) 
@@ -802,16 +991,40 @@ class MultiHumanFinetuner(Inferrer):
                     masks3 = masks
                     if masks3.shape[-1] == 1:
                         masks3 = masks3.repeat(1, 1, 1, 3)
-                    masked_render = comp_rgb # * masks3
+                    masked_render = comp_rgb  # optionally apply mask later if desired
                     masked_gt = frames * masks3
-                    overlay = 0.5 * masked_render + 0.5 * masked_gt
+
+                    masked_render = overlay_smplx_body_joints_on_render(
+                        masked_render,
+                        smplx_params,
+                        gt_render_c2ws,
+                        gt_render_intrs,
+                        getattr(self.model.renderer, "smplx_model", None),
+                        self.tuner_device,
+                    )
+
+                    updated_masked_gt = []
+                    for i in range(masked_gt.shape[0]):
+                        gt_overlay = overlay_gt_smpl_joints_from_npz(
+                            masked_gt[i],
+                            frame_paths[i],
+                            gt_smpl_dir_path,
+                            tgt_c2w_global,
+                            tgt_intr4[:3, :3],
+                            self.tuner_device,
+                            joint_radius=3,
+                        )
+                        updated_masked_gt.append(gt_overlay)
+                    masked_gt = torch.stack(updated_masked_gt, dim=0)
+
+                    overlay = 0.5 * (masked_render + masked_gt)
                     joined = torch.cat([masked_render, masked_gt, overlay], dim=2)  # side-by-side along width
+                    for i in range(joined.shape[0]):
+                        save_path = save_dir / Path(frame_paths[i]).name
+                        save_image(joined[i].permute(2, 0, 1), str(save_path))
+                        save_image(masked_gt[i].permute(2, 0, 1), str(save_dir / f"gt_joints_{Path(frame_paths[i]).name}"))
 
-                    for bi in range(frames.shape[0]):
-                        fname = Path(frame_paths[bi]).name
-                        save_image(joined[bi], str(save_dir / fname))
         quit()
-
 
     # ---------------- Visualization ----------------
     def _canonical_vis_for_track(self, track_idx: int, epoch: int):
@@ -888,6 +1101,7 @@ class MultiHumanFinetuner(Inferrer):
                 shutil.copy(video_path, view_dir / "last.mp4")
             except Exception as e:
                 print(f"[WARN] video export failed for view {deg}: {e}")
+
 
     # ---------------- Saving ----------------
     def _save_refined_models(self):
