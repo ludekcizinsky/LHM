@@ -337,8 +337,8 @@ def compute_S_M2W_from_joints(pred_smpl_joints, gt_smpl_joints, joint_indices=No
     joint_indices = np.asarray(joint_indices, dtype=int)
 
     # Select joints
-    pred_sel = pred_smpl_joints[:, :, joint_indices, :]  # (F, P, K, 3)
-    gt_sel   = gt_smpl_joints[:, :, joint_indices, :]    # (F, P, K, 3)
+    pred_sel = pred_smpl_joints[:, :, :, :]  # (F, P, K, 3)
+    gt_sel   = gt_smpl_joints[:, :, :, :]    # (F, P, K, 3)
 
     # Flatten over frames and people and joints -> (N, 3)
     pred_flat = pred_sel.reshape(-1, 3)
@@ -1226,44 +1226,54 @@ class MultiHumanFinetuner(Inferrer):
 
                     smplx_model = self.model.renderer.smplx_model
 
-                    # Load world-space joints for similarity estimation
-                    gt_smpl_joints_world = preload_gt_smpl_joints_world(
-                        frame_paths, gt_smpl_dir_path, self.cfg.num_persons, self.tuner_device
-                    )  # [F, P, 24, 3]
-                    pred_smpl_joints_world = smplx_to_smpl(
-                        preload_pred_smplx_joints_world(
-                            smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), self.tuner_device
+                    use_sim = bool(getattr(self.cfg.nvs_eval, "use_similarity_transform", True))
+                    if use_sim:
+                        # Load world-space joints for similarity estimation
+                        gt_smpl_joints_world = preload_gt_smpl_joints_world(
+                            frame_paths, gt_smpl_dir_path, self.cfg.num_persons, self.tuner_device
+                        )  # [F, P, 24, 3]
+                        pred_smpl_joints_world = smplx_to_smpl(
+                            preload_pred_smplx_joints_world(
+                                smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), self.tuner_device
+                            )
+                        )  # [F, P, 24, 3]
+
+                        # similarity transform (M → W)
+                        S_M2W_np, s, R_np, t_np, err = compute_S_M2W_from_joints(
+                            pred_smpl_joints_world,  # (F,P,24,3) in M/world frame
+                            gt_smpl_joints_world     # (F,P,24,3) in W-frame
                         )
-                    )  # [F, P, 24, 3]
 
-                    # similarity transform (M → W)
-                    S_M2W_np, s, R_np, t_np, err = compute_S_M2W_from_joints(
-                        pred_smpl_joints_world,  # (F,P,24,3) in M/world frame
-                        gt_smpl_joints_world     # (F,P,24,3) in W-frame
-                    )
-                    print(f"Similarity transform error: {err}")
+                        S_M2W = torch.from_numpy(S_M2W_np).to(device=self.tuner_device, dtype=torch.float32)
+                        S_W2M = torch.linalg.inv(S_M2W)
+                    else:
+                        S_M2W = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
+                        S_W2M = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
 
-                    S_M2W = torch.from_numpy(S_M2W_np).to(device=self.tuner_device, dtype=torch.float32)
-                    S_W2M = torch.linalg.inv(S_M2W)
-
-                    # express TGT camera in M-frame
+                    # express TGT camera in render/model frame
                     tgt_c2w_W   = torch.inverse(tgt_w2c)   # cam → W
-                    tgt_c2w_M   = S_W2M @ tgt_c2w_W        # cam → M
-                    tgt_c2w_M_template = tgt_c2w_M.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
+                    if use_sim:
+                        tgt_c2w_render = S_W2M @ tgt_c2w_W   # cam → M (aligned via similarity)
+                    else:
+                        # default: express target camera in source-camera coordinates
+                        tgt_c2w_render = src_w2c @ tgt_c2w_W
+                    tgt_c2w_render_template = tgt_c2w_render.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
 
-                    # Recompute camera-space joints using aligned camera pose
+                    # Recompute camera-space joints
+                    # - Pred joints: use render camera (tgt_c2w_render) to match rendered view
+                    # - GT joints: use original GT camera (tgt_c2w_W) to overlay on GT images
                     gt_smpl_joints = preload_gt_smpl_joints_camera_space(
                         frame_paths, gt_smpl_dir_path, tgt_c2w_W, self.cfg.num_persons, self.tuner_device
                     ) # [F, P, 24, 3]
                     pred_smpl_joints = smplx_to_smpl(
                         preload_pred_smplx_joints_camera_space(
-                            smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), tgt_c2w_M, self.tuner_device
+                            smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), tgt_c2w_render, self.tuner_device
                         )
                     )  # [F, P, 24, 3]
 
                     # Build camera tensors matching render_bg_colors leading dims [B?, F]
                     num_tracks, num_frames = render_bg_colors.shape[0], render_bg_colors.shape[1]
-                    gt_render_c2ws = tgt_c2w_M_template.expand(num_tracks, num_frames, 4, 4) # shape [B?, F, 4, 4]
+                    gt_render_c2ws = tgt_c2w_render_template.expand(num_tracks, num_frames, 4, 4) # shape [B?, F, 4, 4]
 
                     gt_render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4) # shape [B?, F, 4, 4]
                     render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32)
