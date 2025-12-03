@@ -238,16 +238,143 @@ def _ensure_nchw(t: torch.Tensor) -> torch.Tensor:
     return t.permute(0, 3, 1, 2).contiguous()
 
 
+def smplx_base_vertices_in_camera(
+    smplx_model,
+    smplx_params: dict,
+    pid: int,
+    frame_idx: int,
+    c2w: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """
+    Compute base (non-upsampled) SMPL-X vertices in camera coordinates for a given person and frame.
+    Returns: [V_base, 3] or None on failure.
+    """
+    try:
+        layer = getattr(smplx_model, "smplx_layer", None)
+        if layer is None and hasattr(smplx_model, "layer"):
+            layer = smplx_model.layer.get("neutral", None)
+        if layer is None:
+            raise AttributeError("SMPLX model has no base smplx_layer")
+        layer = layer.to(device)
+        params = {
+            "global_orient": smplx_params["root_pose"][pid : pid + 1, frame_idx],
+            "body_pose": smplx_params["body_pose"][pid : pid + 1, frame_idx],
+            "jaw_pose": smplx_params["jaw_pose"][pid : pid + 1, frame_idx],
+            "leye_pose": smplx_params["leye_pose"][pid : pid + 1, frame_idx],
+            "reye_pose": smplx_params["reye_pose"][pid : pid + 1, frame_idx],
+            "left_hand_pose": smplx_params["lhand_pose"][pid : pid + 1, frame_idx],
+            "right_hand_pose": smplx_params["rhand_pose"][pid : pid + 1, frame_idx],
+            "betas": smplx_params["betas"][pid : pid + 1],
+            "transl": smplx_params["trans"][pid : pid + 1, frame_idx],
+        }
+        if "expr" in smplx_params:
+            params["expression"] = smplx_params["expr"][pid : pid + 1, frame_idx]
+        output = layer(**{k: v.to(device) for k, v in params.items()})
+        verts_world = output.vertices  # [1, V, 3]
+        w2c = torch.inverse(c2w).to(device)
+        homo = torch.cat([verts_world, torch.ones_like(verts_world[..., :1])], dim=-1)  # [1,V,4]
+        cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[0, :, :3]  # [V,3]
+        return cam
+    except Exception as e:
+        print(f"[DEBUG] Could not compute base SMPL-X verts in camera: {e}")
+        return None
+
+
 SMPLX_BODY_TO_SMPL = list(range(22))
 LEFT_PALM_IDS = [25, 28, 34, 31, 37]
 RIGHT_PALM_IDS = [40, 43, 49, 46, 52]
 
+# Optional: paths to SMPLX→SMPL transfer and SMPL joint regressor
+SMPLX2SMPL_TRANSFER_PATH = Path("/scratch/izar/cizinsky/pretrained/smplx2smpl.pkl")
+SMPL_JOINT_REGRESSOR_PATH = Path("/home/cizinsky/smpl/v.1.1.0/basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl")
 
-def smplx_to_smpl(joints55: torch.Tensor) -> torch.Tensor:
+_SMPL_REGRESSOR_CACHE: torch.Tensor | None = None
+_SMPLX2SMPL_TRANSFER_CACHE: torch.Tensor | None = None
+_WARNED_TRANSFER_SHAPE: bool = False
+
+
+def _load_smpl_regressor() -> torch.Tensor | None:
+    global _SMPL_REGRESSOR_CACHE
+    if _SMPL_REGRESSOR_CACHE is not None:
+        return _SMPL_REGRESSOR_CACHE
+    try:
+        import pickle
+        with open(SMPL_JOINT_REGRESSOR_PATH, "rb") as f:
+            data = pickle.load(f, encoding="latin1")
+        J = data.get("J_regressor", None)
+        if J is None:
+            return None
+        if hasattr(J, "toarray"):
+            J = J.toarray()
+        J_torch = torch.from_numpy(J).float()  # [24, 6890]
+        _SMPL_REGRESSOR_CACHE = J_torch
+        return J_torch
+    except Exception as e:
+        print(f"[WARN] Could not load SMPL joint regressor: {e}")
+        return None
+
+
+def _load_smplx2smpl_transfer() -> torch.Tensor | None:
+    global _SMPLX2SMPL_TRANSFER_CACHE
+    if _SMPLX2SMPL_TRANSFER_CACHE is not None:
+        return _SMPLX2SMPL_TRANSFER_CACHE
+    try:
+        import pickle
+        with open(SMPLX2SMPL_TRANSFER_PATH, "rb") as f:
+            data = pickle.load(f, encoding="latin1")
+        mat = data.get("matrix", None)  # expected [6890, 10475]
+        if mat is None:
+            return None
+        mat_torch = torch.from_numpy(mat).float()
+        _SMPLX2SMPL_TRANSFER_CACHE = mat_torch
+        return mat_torch
+    except Exception as e:
+        print(f"[WARN] Could not load SMPLX→SMPL transfer: {e}")
+        return None
+
+
+def smplx_to_smpl(joints55: torch.Tensor | None, smplx_vertices: torch.Tensor | None = None) -> torch.Tensor:
     """
     Convert SMPL-X joints [...,55,3] to SMPL 24-joint layout by copying body joints
     and averaging finger bases for the hand markers.
+    If SMPL-X vertices and the SMPL joint regressor + transfer are available,
+    regress SMPL joints from SMPL vertices for higher fidelity.
     """
+    # Robust path: regress from vertices if possible
+    if smplx_vertices is not None:
+        reg = _load_smpl_regressor()
+        transfer = _load_smplx2smpl_transfer()
+        if reg is not None and transfer is not None:
+            try:
+                global _WARNED_TRANSFER_SHAPE
+                if smplx_vertices.shape[-2] != transfer.shape[1]:
+                    if not _WARNED_TRANSFER_SHAPE:
+                        print(
+                            f"[WARN] SMPLX verts ({smplx_vertices.shape[-2]}) != transfer cols ({transfer.shape[1]}), "
+                            "skipping regressed SMPL joints."
+                        )
+                        _WARNED_TRANSFER_SHAPE = True
+                    raise ValueError("transfer/verts shape mismatch")
+                # transfer: [6890, 10475], smplx_vertices: [..., 10475, 3]
+
+                smpl_vertices = torch.einsum(
+                    "nv,...vc->...nc",
+                    transfer.to(smplx_vertices.device, smplx_vertices.dtype),
+                    smplx_vertices,
+                )  # [..., 6890, 3]
+                smpl_joints = torch.einsum(
+                    "jn,...nc->...jc",
+                    reg.to(smpl_vertices.device, smpl_vertices.dtype),
+                    smpl_vertices,
+                )  # [..., 24, 3]
+                return smpl_joints
+            except Exception as e:
+                print(f"[WARN] Falling back to heuristic SMPLX→SMPL joints: {e}")
+
+    # Heuristic fallback (fast, no verts)
+    if joints55 is None:
+        raise ValueError("joints55 is required when SMPL-X vertices are not provided.")
     body = joints55[..., SMPLX_BODY_TO_SMPL, :]  # [...,22,3]
     l_hand = joints55[..., LEFT_PALM_IDS, :].mean(dim=-2, keepdim=True)
     r_hand = joints55[..., RIGHT_PALM_IDS, :].mean(dim=-2, keepdim=True)
@@ -437,109 +564,6 @@ def load_gt_smpl_joints_cam(
         print(f"[DEBUG] Could not load GT SMPL joints cam for {frame_path}: {e}")
         return None
 
-def overlay_smplx_body_joints(
-    masked_render: torch.Tensor,
-    smplx_params: dict,
-    render_c2ws: torch.Tensor,
-    render_intrs: torch.Tensor,
-    smplx_model,
-    device: torch.device,
-    joint_radius: int = 3,
-) -> torch.Tensor:
-    """
-    Draw body joints (root + 21) onto masked_render in-place and return it.
-    masked_render: [B, H, W, 3]
-    render_c2ws: [1, F, 4, 4]
-    render_intrs: [1, F, 4, 4]
-    smplx_params: dict containing per-person poses/trans, shape, and transform_mat_neutral_pose.
-    """
-    if smplx_model is None:
-        return masked_render
-
-    B = masked_render.shape[0]
-    body_joint_ids = list(range(22))
-
-    for bi in range(B):
-        try:
-            c2w_proj = render_c2ws[0, bi]
-            intr_proj = render_intrs[0, bi][:3, :3]
-            H, W = masked_render.shape[1], masked_render.shape[2]
-
-            for pid in range(smplx_params["betas"].shape[0]):
-                joints_cam = smplx_joints_in_camera(
-                    smplx_model, smplx_params, pid, bi, c2w_proj, device
-                )
-                if joints_cam is None:
-                    continue
-                cam_z = joints_cam[:, 2].clamp(min=1e-6)
-                uvx = (intr_proj[0, 0] * joints_cam[:, 0] + intr_proj[0, 2] * cam_z) / cam_z
-                uvy = (intr_proj[1, 1] * joints_cam[:, 1] + intr_proj[1, 2] * cam_z) / cam_z
-                u = uvx.round().long()
-                v = uvy.round().long()
-                for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
-                    if 0 <= ui < W and 0 <= vi < H:
-                        v0 = max(vi - joint_radius, 0)
-                        v1 = min(vi + joint_radius + 1, H)
-                        u0 = max(ui - joint_radius, 0)
-                        u1 = min(ui + joint_radius + 1, W)
-                        masked_render[bi, v0:v1, u0:u1, :] = torch.tensor([1.0, 0.0, 0.0], device=device)
-        except Exception as e:
-            print(f"[DEBUG] Could not overlay SMPLX joints for frame {bi}: {e}")
-    return masked_render
-
-
-def overlay_gt_smpl_joints(
-    images: torch.Tensor,
-    frame_paths: List[str | Path],
-    smpl_dir: Path,
-    c2ws: torch.Tensor,
-    intrs: torch.Tensor,
-    number_of_persons: int,
-    device: torch.device,
-    joint_radius: int = 3,
-) -> torch.Tensor:
-    """
-    Batch helper: overlay GT SMPL joints on a batch of images.
-
-    Args:
-        images: [F, H, W, 3]
-        frame_paths: List of frame file paths
-        smpl_dir: Path to directory containing SMPL npz files
-        c2ws: [1, 4, 4] 
-        intrs: [1, 4, 4] 
-
-    Returns:
-        torch.Tensor: Images with overlaid GT SMPL joints of shape [F, H, W, 3]
-    """
-    updated = []
-    F = images.shape[0]
-    color = torch.tensor([0.0, 1.0, 0.0], device=device)
-    for fi in range(F):
-        c2w = c2ws[0].to(device)
-        intr = intrs[0][:3, :3].to(device)
-        gt_img = images[fi].clone()
-        H, W = gt_img.shape[0], gt_img.shape[1]
-
-        for person_idx in range(number_of_persons):
-            cam_joints = load_gt_smpl_joints_cam(smpl_dir, frame_paths[fi], person_idx, c2w, device)
-
-            cam_z = cam_joints[:, 2].clamp(min=1e-6)
-            uvx = (intr[0, 0] * cam_joints[:, 0] + intr[0, 2] * cam_z) / cam_z
-            uvy = (intr[1, 1] * cam_joints[:, 1] + intr[1, 2] * cam_z) / cam_z
-            u = uvx.round().long()
-            v = uvy.round().long()
-            body_joint_ids = list(range(min(24, u.shape[0])))  # SMPL has 24 body joints
-            for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
-                if 0 <= ui < W and 0 <= vi < H:
-                    v0 = max(vi - joint_radius, 0)
-                    v1 = min(vi + joint_radius + 1, H)
-                    u0 = max(ui - joint_radius, 0)
-                    u1 = min(ui + joint_radius + 1, W)
-                    gt_img[v0:v1, u0:u1, :] = color
-
-        updated.append(gt_img)
-
-    return torch.stack(updated, dim=0)
 
 
 def overlay_smpl_joints(
@@ -652,37 +676,118 @@ def preload_gt_smpl_joints_world(
     return torch.stack(smpl_joints, dim=0)
 
 
-def preload_pred_smplx_joints_camera_space(smplx_model, smplx_params, num_persons, n_frames, c2w_proj, device):
+def preload_pred_smplx_joints_camera_space(
+    smplx_model,
+    smplx_params,
+    num_persons,
+    n_frames,
+    c2w_proj,
+    device,
+    use_regressed: bool = False,
+):
 
-    result = list()
+    smplx_result = []
+    smpl_result = []
     for fid in range(n_frames):
-        results_per_frame = list()
+        smplx_per_frame = []
+        smpl_per_frame = []
         for pid in range(num_persons):
             joints_cam = smplx_joints_in_camera(
                 smplx_model, smplx_params, pid, fid, c2w_proj, device
             ) # [55, 3]
-            results_per_frame.append(joints_cam)
-        result.append(torch.stack(results_per_frame, dim=0))
+            if use_regressed:
+                verts_cam = smplx_base_vertices_in_camera(
+                    smplx_model, smplx_params, pid, fid, c2w_proj, device
+                )
+                smpl_cam = smplx_to_smpl(
+                    joints_cam, smplx_vertices=verts_cam.unsqueeze(0) if verts_cam is not None else None
+                )
+                if smpl_cam.dim() > 2 and smpl_cam.shape[0] == 1:
+                    smpl_cam = smpl_cam.squeeze(0)
+                smpl_per_frame.append(smpl_cam)
+            smplx_per_frame.append(joints_cam)
+        smplx_result.append(torch.stack(smplx_per_frame, dim=0))
+        if use_regressed:
+            smpl_result.append(torch.stack(smpl_per_frame, dim=0))
 
-    return torch.stack(result, dim=0)
+    if use_regressed:
+        return torch.stack(smplx_result, dim=0), torch.stack(smpl_result, dim=0)
+    return torch.stack(smplx_result, dim=0)
 
 
-def preload_pred_smplx_joints_world(smplx_model, smplx_params, num_persons, n_frames, device):
+def preload_pred_smplx_joints_world(
+    smplx_model,
+    smplx_params,
+    num_persons,
+    n_frames,
+    device,
+    use_regressed: bool = False,
+):
     """
     Convenience loader to get posed SMPL-X joints in model/world frame (no camera applied).
-    Returns [F, P, 55, 3]
+    Returns [F, P, 55, 3] and, if use_regressed=True, also [F, P, 24, 3].
     """
-    result = []
+    smplx_result = []
+    smpl_result = []
     eye_c2w = torch.eye(4, device=device, dtype=torch.float32)
     for fid in range(n_frames):
-        per_person = []
+        smplx_per_person = []
+        smpl_per_person = []
         for pid in range(num_persons):
             joints_world = smplx_joints_in_camera(
                 smplx_model, smplx_params, pid, fid, eye_c2w, device
             )
-            per_person.append(joints_world)
-        result.append(torch.stack(per_person, dim=0))
-    return torch.stack(result, dim=0)
+            smplx_per_person.append(joints_world)
+            if use_regressed:
+                verts_world = smplx_base_vertices_in_camera(
+                    smplx_model, smplx_params, pid, fid, eye_c2w, device
+                )
+                smpl_world = smplx_to_smpl(
+                    joints_world, smplx_vertices=verts_world.unsqueeze(0) if verts_world is not None else None
+                )
+                if smpl_world.dim() > 2 and smpl_world.shape[0] == 1:
+                    smpl_world = smpl_world.squeeze(0)
+                smpl_per_person.append(smpl_world)
+        smplx_result.append(torch.stack(smplx_per_person, dim=0))
+        if use_regressed:
+            smpl_result.append(torch.stack(smpl_per_person, dim=0))
+
+    if use_regressed:
+        return torch.stack(smplx_result, dim=0), torch.stack(smpl_result, dim=0)
+    return torch.stack(smplx_result, dim=0)
+
+
+def compute_s_w2m(smplx_model, use_regressed_smpl, smplx_params, frame_paths, gt_smpl_dir_path, num_persons, device, use_sim):
+
+    if use_sim:
+        # Load world-space joints for similarity estimation
+        gt_smpl_joints_world = preload_gt_smpl_joints_world(
+            frame_paths, gt_smpl_dir_path, num_persons, device
+        )  # [F, P, 24, 3]
+        if use_regressed_smpl:
+            _, pred_smpl_joints_world = preload_pred_smplx_joints_world(
+                smplx_model, smplx_params, num_persons, len(frame_paths), device, use_regressed=True
+            )
+        else:
+            pred_smpl_joints_world = smplx_to_smpl(
+                preload_pred_smplx_joints_world(
+                    smplx_model, smplx_params, num_persons, len(frame_paths), device
+                )
+            )  # [F, P, 24, 3]
+
+        # similarity transform (M → W)
+        S_M2W_np, s, R_np, t_np, err = compute_S_M2W_from_joints(
+            pred_smpl_joints_world,  # (F,P,24,3) in M/world frame
+            gt_smpl_joints_world     # (F,P,24,3) in W-frame
+        )
+
+        S_M2W = torch.from_numpy(S_M2W_np).to(device=device, dtype=torch.float32)
+        S_W2M = torch.linalg.inv(S_M2W)
+    else:
+        S_M2W = torch.eye(4, device=device, dtype=torch.float32)
+        S_W2M = torch.eye(4, device=device, dtype=torch.float32)
+
+    return S_W2M
 
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1305,11 @@ class MultiHumanFinetuner(Inferrer):
         _, src_extr = load_camera_from_npz(camera_params_path, source_camera_id, device=self.tuner_device)
         src_w2c = _extr_to_w2c_4x4(src_extr)
 
+        mode = str(getattr(self.cfg.nvs_eval, "smplx_to_smpl_mode", "auto")).lower()
+        use_regressed_smpl = mode != "heuristic"
+        use_sim = bool(getattr(self.cfg.nvs_eval, "use_similarity_transform", True))
+        print(f"[DEBUG] smplx_to_smpl_mode={mode}, use_regressed_smpl={use_regressed_smpl}, use_similarity_transform={use_sim}")
+
         for tgt_cam_id in target_camera_ids:
             tgt_gt_frames_dir_path = root_gt_dir_path / "images" / f"{tgt_cam_id}"
             tgt_gt_masks_dir_path = root_gt_dir_path / "seg" / "img_seg_mask" / f"{tgt_cam_id}" / "all"
@@ -1219,36 +1329,17 @@ class MultiHumanFinetuner(Inferrer):
             save_dir = root_save_dir / f"{tgt_cam_id}"
             save_dir.mkdir(parents=True, exist_ok=True)
 
+
             with torch.no_grad():
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
                     frame_indices = frame_indices.to(self.tuner_device)
-                    smplx_params, est_render_c2ws, est_render_intrs, render_bg_colors = self._slice_motion(frame_indices)
+                    smplx_params, _, _, render_bg_colors = self._slice_motion(frame_indices)
 
                     smplx_model = self.model.renderer.smplx_model
 
-                    use_sim = bool(getattr(self.cfg.nvs_eval, "use_similarity_transform", True))
-                    if use_sim:
-                        # Load world-space joints for similarity estimation
-                        gt_smpl_joints_world = preload_gt_smpl_joints_world(
-                            frame_paths, gt_smpl_dir_path, self.cfg.num_persons, self.tuner_device
-                        )  # [F, P, 24, 3]
-                        pred_smpl_joints_world = smplx_to_smpl(
-                            preload_pred_smplx_joints_world(
-                                smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), self.tuner_device
-                            )
-                        )  # [F, P, 24, 3]
-
-                        # similarity transform (M → W)
-                        S_M2W_np, s, R_np, t_np, err = compute_S_M2W_from_joints(
-                            pred_smpl_joints_world,  # (F,P,24,3) in M/world frame
-                            gt_smpl_joints_world     # (F,P,24,3) in W-frame
-                        )
-
-                        S_M2W = torch.from_numpy(S_M2W_np).to(device=self.tuner_device, dtype=torch.float32)
-                        S_W2M = torch.linalg.inv(S_M2W)
-                    else:
-                        S_M2W = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
-                        S_W2M = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
+                    S_W2M = compute_s_w2m(
+                        smplx_model, use_regressed_smpl, smplx_params, frame_paths, gt_smpl_dir_path, self.cfg.num_persons, self.tuner_device, use_sim
+                    )
 
                     # express TGT camera in render/model frame
                     tgt_c2w_W   = torch.inverse(tgt_w2c)   # cam → W
@@ -1265,11 +1356,15 @@ class MultiHumanFinetuner(Inferrer):
                     gt_smpl_joints = preload_gt_smpl_joints_camera_space(
                         frame_paths, gt_smpl_dir_path, tgt_c2w_W, self.cfg.num_persons, self.tuner_device
                     ) # [F, P, 24, 3]
-                    pred_smpl_joints = smplx_to_smpl(
-                        preload_pred_smplx_joints_camera_space(
+                    if use_regressed_smpl:
+                        _, pred_smpl_joints = preload_pred_smplx_joints_camera_space(
+                            smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), tgt_c2w_render, self.tuner_device, use_regressed=True
+                        )
+                    else:
+                        smplx_joints = preload_pred_smplx_joints_camera_space(
                             smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), tgt_c2w_render, self.tuner_device
                         )
-                    )  # [F, P, 24, 3]
+                        pred_smpl_joints = smplx_to_smpl(smplx_joints)  # [F, P, 24, 3]
 
                     # Build camera tensors matching render_bg_colors leading dims [B?, F]
                     num_tracks, num_frames = render_bg_colors.shape[0], render_bg_colors.shape[1]
