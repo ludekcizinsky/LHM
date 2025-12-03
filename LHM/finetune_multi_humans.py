@@ -183,68 +183,6 @@ def depth_to_color(
 def _ensure_nchw(t: torch.Tensor) -> torch.Tensor:
     return t.permute(0, 3, 1, 2).contiguous()
 
-def overlay_smpl_body_joints_on_image(
-    image: torch.Tensor,
-    joints_world: torch.Tensor,
-    w2c: torch.Tensor,
-    intr: torch.Tensor,
-    device: torch.device,
-    joint_radius: int = 3,
-    color: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """
-    Overlay SMPL (24-body) joints on a GT image.
-    image: [H, W, 3] or [1, H, W, 3]
-    joints_world: [N, 3] or [1, N, 3] in world coords
-    w2c: [4, 4] or [1, 4, 4] world-to-camera
-    intr: [3, 3] or [1, 3, 3] intrinsics
-    """
-    if color is None:
-        color = torch.tensor([1.0, 0.0, 0.0], device=device)
-    single = image.dim() == 3
-    if single:
-        img = image.unsqueeze(0)  # [1,H,W,3]
-    else:
-        img = image
-    H, W = img.shape[1], img.shape[2]
-
-    if joints_world.dim() == 2:
-        joints_world = joints_world.unsqueeze(0)  # [1,N,3]
-    if w2c.dim() == 3:
-        w2c = w2c[0]
-    w2c = w2c.to(device)
-    if intr.dim() == 3:
-        intr_mat = intr[0]
-    else:
-        intr_mat = intr
-    if intr_mat.shape[0] == 4:
-        intr_mat = intr_mat[:3, :3]
-    intr_mat = intr_mat.to(device)
-
-    try:
-        homo = torch.cat([joints_world, torch.ones_like(joints_world[..., :1])], dim=-1)  # [1,N,4]
-        cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[..., :3]  # [1,N,3]
-        cam_z = cam[..., 2].clamp(min=1e-6)
-        fx = intr_mat[0, 0]
-        cx = intr_mat[0, 2]
-        fy = intr_mat[1, 1]
-        cy = intr_mat[1, 2]
-        uvx = (fx * cam[..., 0] + cx * cam_z) / cam_z
-        uvy = (fy * cam[..., 1] + cy * cam_z) / cam_z
-        u = uvx.round().long().squeeze(0)
-        v = uvy.round().long().squeeze(0)
-        body_joint_ids = list(range(min(24, u.shape[0])))  # SMPL has 24 body joints
-        for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
-            if 0 <= ui < W and 0 <= vi < H:
-                v0 = max(vi - joint_radius, 0)
-                v1 = min(vi + joint_radius + 1, H)
-                u0 = max(ui - joint_radius, 0)
-                u1 = min(ui + joint_radius + 1, W)
-                img[0, v0:v1, u0:u1, :] = color
-    except Exception as e:
-        print(f"[DEBUG] Could not overlay SMPL joints: {e}")
-    return img[0] if single else img
-
 
 def smplx_joints_in_camera(
     smplx_model,
@@ -357,7 +295,6 @@ def overlay_gt_smpl_joints_from_npz(
     intr: torch.Tensor,
     device: torch.device,
     joint_radius: int = 3,
-    color: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Load GT SMPL joints (24) from npz and overlay onto the provided image.
@@ -365,36 +302,50 @@ def overlay_gt_smpl_joints_from_npz(
     c2w: [4,4] camera-to-world
     intr: [3,3] intrinsics
     """
-    if color is None:
-        color = torch.tensor([0.0, 1.0, 0.0], device=device)
-    try:
-        stem = Path(frame_path).stem
-        npz_path = smpl_dir / f"{stem}.npz"
-        if not npz_path.exists():
-            return image
-        data = np.load(npz_path)
-        joints_np = data["joints_3d"]  # [P,24,3]
-        joints = torch.from_numpy(joints_np).to(device=device, dtype=torch.float32)
-        w2c = torch.inverse(c2w.to(device))
-        intr3 = intr.to(device)
-        gt_img = image.clone()
 
-        for person_idx in range(joints.shape[0]):
-            gt_img = overlay_smpl_body_joints_on_image(
-                gt_img,
-                joints[person_idx],
-                w2c,
-                intr3,
-                device,
-                joint_radius=joint_radius,
-                color=color,
-            )
+    color = torch.tensor([0.0, 1.0, 0.0], device=device)
 
+    stem = Path(frame_path).stem
+    npz_path = smpl_dir / f"{stem}.npz"
+    if not npz_path.exists():
+        raise FileNotFoundError(f"SMPL npz file not found: {npz_path}")
+    data = np.load(npz_path)
+    joints_np = data["joints_3d"]  # [P,24,3]
+    joints = torch.from_numpy(joints_np).to(device=device, dtype=torch.float32)
+    w2c = torch.inverse(c2w.to(device))
+    gt_img = image.clone().unsqueeze(0)
 
-        return gt_img
-    except Exception as e:
-        print(f"[DEBUG] Could not overlay GT SMPL joints for {frame_path}: {e}")
-        return image
+    for person_idx in range(joints.shape[0]):
+
+        H, W = gt_img.shape[1], gt_img.shape[2]
+        joints_world = joints[person_idx].unsqueeze(0) # [1,24,3]
+        w2c = w2c.to(device) # [4,4]
+        intr_mat = intr.to(device) # [3,3]
+
+        try:
+            homo = torch.cat([joints_world, torch.ones_like(joints_world[..., :1])], dim=-1)  # [1,N,4]
+            cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[..., :3]  # [1,N,3]
+            cam_z = cam[..., 2].clamp(min=1e-6)
+            fx = intr_mat[0, 0]
+            cx = intr_mat[0, 2]
+            fy = intr_mat[1, 1]
+            cy = intr_mat[1, 2]
+            uvx = (fx * cam[..., 0] + cx * cam_z) / cam_z
+            uvy = (fy * cam[..., 1] + cy * cam_z) / cam_z
+            u = uvx.round().long().squeeze(0)
+            v = uvy.round().long().squeeze(0)
+            body_joint_ids = list(range(min(24, u.shape[0])))  # SMPL has 24 body joints
+            for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
+                if 0 <= ui < W and 0 <= vi < H:
+                    v0 = max(vi - joint_radius, 0)
+                    v1 = min(vi + joint_radius + 1, H)
+                    u0 = max(ui - joint_radius, 0)
+                    u1 = min(ui + joint_radius + 1, W)
+                    gt_img[0, v0:v1, u0:u1, :] = color
+        except Exception as e:
+            print(f"[DEBUG] Could not overlay SMPL joints: {e}")
+
+    return gt_img.squeeze(0)
 
 
 def overlay_gt_smpl_joints_batch(
