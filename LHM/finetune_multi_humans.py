@@ -972,6 +972,35 @@ class MultiHumanFinetuner(Inferrer):
         for k, v in self.motion_seq["smplx_params"].items():
             print(f"[DEBUG] motion_seq smplx_params key:{k}, shape:{v.shape}")
 
+    def _load_gt_smplx_params(self, frame_paths: List[str], smplx_dir: Path):
+        """Load per-frame SMPL-X params in world coordinates (no camera transform)."""
+
+        npzs = [np.load(smplx_dir / f"{Path(fp).stem}.npz") for fp in frame_paths]
+
+        def stack_key(key):
+            arrs = [torch.from_numpy(n[key]).float() for n in npzs]
+            return torch.stack(arrs, dim=1).to(self.tuner_device)  # [P, F, ...]
+
+        betas = stack_key("betas")  # [P,F,10] (constant across frames)
+
+        smplx = {
+            "betas": betas[:, 0, :10],  # [P,10] keep first 10, assume constant over frames
+            "root_pose": stack_key("root_pose"),   # [P,F,3] world axis-angle
+            "body_pose": stack_key("body_pose"),
+            "jaw_pose": stack_key("jaw_pose"),
+            "leye_pose": stack_key("leye_pose"),
+            "reye_pose": stack_key("reye_pose"),
+            "lhand_pose": stack_key("lhand_pose"),
+            "rhand_pose": stack_key("rhand_pose"),
+            "trans": stack_key("trans"),           # [P,F,3] world translation
+            "expr": stack_key("expression"),
+            "transform_mat_neutral_pose": self.transform_mat_neutral_pose.to(self.tuner_device),
+        }
+#            print(f"[DEBUG] Loaded GT SMPL-X params:")
+        #for k, v in smplx.items():
+            #print(f"{k}: {v.shape}")
+        return smplx
+
     # ---------------- Training utilities ----------------
     def _trainable_tensors(self) -> List[torch.Tensor]:
         params = []
@@ -1300,72 +1329,6 @@ class MultiHumanFinetuner(Inferrer):
             w2c[:3, :4] = extr.to(self.tuner_device)
             return w2c
 
-        def _aa_to_rot(aa: torch.Tensor) -> torch.Tensor:
-            """Axis-angle (...,3) -> rotmat (...,3,3)."""
-            from smplx.lbs import batch_rodrigues
-
-            flat = aa.reshape(-1, 3)
-            rots = batch_rodrigues(flat)
-            return rots.view(*aa.shape[:-1], 3, 3)
-
-        def _rot_to_aa(rot: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor:
-            """Rotation matrix (...,3,3) -> axis-angle (...,3)."""
-            flat = rot.reshape(-1, 3, 3)
-            cos = 0.5 * (torch.einsum("bii->b", flat) - 1.0)
-            cos = torch.clamp(cos, -1 + epsilon, 1 - epsilon)
-            theta = torch.acos(cos)
-
-            m21 = flat[:, 2, 1] - flat[:, 1, 2]
-            m02 = flat[:, 0, 2] - flat[:, 2, 0]
-            m10 = flat[:, 1, 0] - flat[:, 0, 1]
-            denom = torch.sqrt(m21 * m21 + m02 * m02 + m10 * m10 + epsilon)
-
-            axis0 = torch.where(torch.abs(theta) < 0.00001, m21, m21 / denom)
-            axis1 = torch.where(torch.abs(theta) < 0.00001, m02, m02 / denom)
-            axis2 = torch.where(torch.abs(theta) < 0.00001, m10, m10 / denom)
-            aa = theta.unsqueeze(1) * torch.stack([axis0, axis1, axis2], dim=1)
-            return aa.view(*rot.shape[:-2], 3)
-
-        def _load_gt_smplx_params(frame_paths: List[str], smplx_dir: Path, src_w2c_mat: torch.Tensor):
-            """Load per-frame SMPL-X params (world coords) and convert to source-cam coords."""
-            src_R = src_w2c_mat[:3, :3]  # w2c rotation
-            src_t = src_w2c_mat[:3, 3]   # w2c translation
-
-            npzs = [np.load(smplx_dir / f"{Path(fp).stem}.npz") for fp in frame_paths]
-
-            def stack_key(key):
-                arrs = [torch.from_numpy(n[key]).float() for n in npzs]
-                return torch.stack(arrs, dim=1).to(self.tuner_device)  # [P, F, ...]
-
-            trans_w = stack_key("trans")  # [P,F,3]
-            root_pose_w = stack_key("root_pose")  # [P,F,3]
-            betas = stack_key("betas")  # [P,F,10] (constant across frames)
-
-            # Transform root pose + translation into source camera coordinates
-            root_rot_w = _aa_to_rot(root_pose_w)  # [P,F,3,3]
-            root_rot_c = torch.matmul(src_R, root_rot_w)  # broadcast matmul
-            root_pose_c = _rot_to_aa(root_rot_c)  # [P,F,3]
-
-            trans_c = torch.einsum("ij,bfj->bfi", src_R, trans_w) + src_t  # [P,F,3]
-
-            smplx = {
-                "betas": betas[:, 0, :10],  # [P,10] keep first 10, assume constant over frames
-                "root_pose": root_pose_c,
-                "body_pose": stack_key("body_pose"),
-                "jaw_pose": stack_key("jaw_pose"),
-                "leye_pose": stack_key("leye_pose"),
-                "reye_pose": stack_key("reye_pose"),
-                "lhand_pose": stack_key("lhand_pose"),
-                "rhand_pose": stack_key("rhand_pose"),
-                "trans": trans_c,
-                "expr": stack_key("expression"),
-                "transform_mat_neutral_pose": self.transform_mat_neutral_pose.to(self.tuner_device),
-            }
-#            print(f"[DEBUG] Loaded GT SMPL-X params:")
-            #for k, v in smplx.items():
-                #print(f"{k}: {v.shape}")
-            return smplx
-
         def _intr_to_4x4(intr: torch.Tensor) -> torch.Tensor:
             intr4 = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
             intr4[:3, :3] = intr.to(self.tuner_device)
@@ -1410,8 +1373,8 @@ class MultiHumanFinetuner(Inferrer):
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
                     frame_indices = frame_indices.to(self.tuner_device)
                     if use_gt_smplx:
-                        smplx_params = _load_gt_smplx_params(
-                            frame_paths, root_gt_dir_path / "smplx", src_w2c
+                        smplx_params = self._load_gt_smplx_params(
+                            frame_paths, root_gt_dir_path / "smplx"
                         )
                         render_bg_colors = torch.zeros(
                             (self.cfg.num_persons, len(frame_paths), 3),
@@ -1432,8 +1395,12 @@ class MultiHumanFinetuner(Inferrer):
                     if use_sim:
                         tgt_c2w_render = S_W2M @ tgt_c2w_W   # cam → M (aligned via similarity)
                     else:
-                        # default: express target camera in source-camera coordinates
-                        tgt_c2w_render = src_w2c @ tgt_c2w_W
+                        if use_gt_smplx:
+                            # When using GT SMPL-X (already in world frame), keep camera in world frame
+                            tgt_c2w_render = tgt_c2w_W
+                        else:
+                            # default: express target camera in source-camera coordinates
+                            tgt_c2w_render = src_w2c @ tgt_c2w_W
                     tgt_c2w_render_template = tgt_c2w_render.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
 
                     # Recompute camera-space joints
