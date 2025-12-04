@@ -35,13 +35,8 @@ loss_weights:
 tune_motion: true
 
 nvs_eval:
-  source_camera_id: 4
-  target_camera_ids: [28, 52, 64]
-  use_gt_smplx_params: true
+  target_camera_ids: [52, 64]
   root_gt_dir_path: /scratch/izar/cizinsky/ait_datasets/full/hi4d/pair00_1/fight00
-  pad_ratio: 0.0
-  use_similarity_transform: false
-  smplx_to_smpl_mode: heuristic  # regressed | heuristic
 
 
 hydra:

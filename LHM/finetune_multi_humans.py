@@ -106,6 +106,16 @@ class FrameMaskDataset(Dataset):
 # ---------------------------------------------------------------------------
 import math
 
+def extr_to_w2c_4x4(extr: torch.Tensor, device) -> torch.Tensor:
+    w2c = torch.eye(4, device=device, dtype=torch.float32)
+    w2c[:3, :4] = extr.to(device)
+    return w2c
+
+def intr_to_4x4(intr: torch.Tensor, device) -> torch.Tensor:
+    intr4 = torch.eye(4, device=device, dtype=torch.float32)
+    intr4[:3, :3] = intr.to(device)
+    return intr4
+
 def load_camera_from_npz(
     camera_npz_path: str | Path, camera_id: int, device: torch.device | None = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -680,42 +690,25 @@ def preload_gt_smpl_joints_world(
     return torch.stack(smpl_joints, dim=0)
 
 
-def preload_pred_smplx_joints_camera_space(
+def load_smplx_joints_camera_space(
     smplx_model,
     smplx_params,
     num_persons,
     n_frames,
     c2w_proj,
     device,
-    use_regressed: bool = False,
 ):
 
     smplx_result = []
-    smpl_result = []
     for fid in range(n_frames):
         smplx_per_frame = []
-        smpl_per_frame = []
         for pid in range(num_persons):
             joints_cam = smplx_joints_in_camera(
                 smplx_model, smplx_params, pid, fid, c2w_proj, device
             ) # [55, 3]
-            if use_regressed:
-                verts_cam = smplx_base_vertices_in_camera(
-                    smplx_model, smplx_params, pid, fid, c2w_proj, device
-                )
-                smpl_cam = smplx_to_smpl(
-                    joints_cam, smplx_vertices=verts_cam.unsqueeze(0) if verts_cam is not None else None
-                )
-                if smpl_cam.dim() > 2 and smpl_cam.shape[0] == 1:
-                    smpl_cam = smpl_cam.squeeze(0)
-                smpl_per_frame.append(smpl_cam)
             smplx_per_frame.append(joints_cam)
-        smplx_result.append(torch.stack(smplx_per_frame, dim=0))
-        if use_regressed:
-            smpl_result.append(torch.stack(smpl_per_frame, dim=0))
+        smplx_result.append(torch.stack(smplx_per_frame, dim=0)) 
 
-    if use_regressed:
-        return torch.stack(smplx_result, dim=0), torch.stack(smpl_result, dim=0)
     return torch.stack(smplx_result, dim=0)
 
 
@@ -761,34 +754,34 @@ def preload_pred_smplx_joints_world(
     return torch.stack(smplx_result, dim=0)
 
 
-def compute_s_w2m(smplx_model, use_regressed_smpl, smplx_params, frame_paths, gt_smpl_dir_path, num_persons, device, use_sim):
+def compute_s_w2m(
+    smplx_model,
+    smplx_params_pred,
+    frame_paths,
+    gt_smplx_params,
+    num_persons,
+    device,
+    use_sim,
+):
+    """
+    Compute similarity transform using SMPL-X joints (55) in world frame.
+    """
+    if use_sim and gt_smplx_params is not None:
+        gt_joints_world = preload_pred_smplx_joints_world(
+            smplx_model, gt_smplx_params, num_persons, len(frame_paths), device
+        )  # [F,P,55,3]
+        pred_joints_world = preload_pred_smplx_joints_world(
+            smplx_model, smplx_params_pred, num_persons, len(frame_paths), device
+        )  # [F,P,55,3]
 
-    if use_sim:
-        # Load world-space joints for similarity estimation
-        gt_smpl_joints_world = preload_gt_smpl_joints_world(
-            frame_paths, gt_smpl_dir_path, num_persons, device
-        )  # [F, P, 24, 3]
-        if use_regressed_smpl:
-            _, pred_smpl_joints_world = preload_pred_smplx_joints_world(
-                smplx_model, smplx_params, num_persons, len(frame_paths), device, use_regressed=True
-            )
-        else:
-            pred_smpl_joints_world = smplx_to_smpl(
-                preload_pred_smplx_joints_world(
-                    smplx_model, smplx_params, num_persons, len(frame_paths), device
-                )
-            )  # [F, P, 24, 3]
-
-        # similarity transform (M → W)
         S_M2W_np, s, R_np, t_np, err = compute_S_M2W_from_joints(
-            pred_smpl_joints_world,  # (F,P,24,3) in M/world frame
-            gt_smpl_joints_world     # (F,P,24,3) in W-frame
+            pred_joints_world,  # (F,P,55,3)
+            gt_joints_world,    # (F,P,55,3)
         )
 
         S_M2W = torch.from_numpy(S_M2W_np).to(device=device, dtype=torch.float32)
         S_W2M = torch.linalg.inv(S_M2W)
     else:
-        S_M2W = torch.eye(4, device=device, dtype=torch.float32)
         S_W2M = torch.eye(4, device=device, dtype=torch.float32)
 
     return S_W2M
@@ -1316,51 +1309,36 @@ class MultiHumanFinetuner(Inferrer):
 
     # ---------------- Evaluation -------------------
     def eval_loop(self, epoch):
+
         # Parse the evaluation setup
-        source_camera_id: int = self.cfg.nvs_eval.source_camera_id
         target_camera_ids: List[int] = self.cfg.nvs_eval.target_camera_ids
         root_gt_dir_path: Path = Path(self.cfg.nvs_eval.root_gt_dir_path)
         camera_params_path: Path = root_gt_dir_path / "cameras" / "rgb_cameras.npz"
         root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
         root_save_dir.mkdir(parents=True, exist_ok=True)
-
-        def _extr_to_w2c_4x4(extr: torch.Tensor) -> torch.Tensor:
-            w2c = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
-            w2c[:3, :4] = extr.to(self.tuner_device)
-            return w2c
-
-        def _intr_to_4x4(intr: torch.Tensor) -> torch.Tensor:
-            intr4 = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
-            intr4[:3, :3] = intr.to(self.tuner_device)
-            return intr4
-
-        # Source camera pose: w2c from params
-        _, src_extr = load_camera_from_npz(camera_params_path, source_camera_id, device=self.tuner_device)
-        src_w2c = _extr_to_w2c_4x4(src_extr)
-
-        mode = str(getattr(self.cfg.nvs_eval, "smplx_to_smpl_mode", "auto")).lower()
-        use_regressed_smpl = mode != "heuristic"
-        use_sim = bool(getattr(self.cfg.nvs_eval, "use_similarity_transform", True))
-        use_gt_smplx = bool(getattr(self.cfg.nvs_eval, "use_gt_smplx_params", False))
-        if use_gt_smplx:
-            # GT params are in world coords; we transform them to the source camera and skip similarity.
-            use_sim = False
-        print(
-            f"[DEBUG] smplx_to_smpl_mode={mode}, use_regressed_smpl={use_regressed_smpl}, use_similarity_transform={use_sim}, use_gt_smplx_params={use_gt_smplx}"
-        )
+        num_tracks, num_frames = self.cfg.num_persons, self.cfg.batch_size
+        render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32) # black
 
         for tgt_cam_id in target_camera_ids:
+
+            # Prepare paths
             tgt_gt_frames_dir_path = root_gt_dir_path / "images" / f"{tgt_cam_id}"
             tgt_gt_masks_dir_path = root_gt_dir_path / "seg" / "img_seg_mask" / f"{tgt_cam_id}" / "all"
-            gt_smpl_dir_path = root_gt_dir_path / "smpl"
+
+            # Load and prepare the gt camera parameters
+            # - c2w
             tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
-            tgt_w2c = _extr_to_w2c_4x4(tgt_extr)
+            tgt_w2c = extr_to_w2c_4x4(tgt_extr, self.tuner_device)
+            tgt_c2w = torch.inverse(tgt_w2c)
+            tgt_c2w_render_template = tgt_c2w.unsqueeze(0).unsqueeze(0)  
+            tgt_render_c2ws = tgt_c2w_render_template.expand(num_tracks, num_frames, 4, 4) 
 
-            # Use the target camera intrinsics as 4x4 matrix
-            tgt_intr4 = _intr_to_4x4(tgt_intr)
+            # - intrinsics
+            tgt_intr4 = intr_to_4x4(tgt_intr, self.tuner_device)
             tgt_intr_template = tgt_intr4.unsqueeze(0).unsqueeze(0)      # [1,1,4,4]
+            tgt_render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4) 
 
-            # Prepare dataset and dataloader
+            # Prepare dataset and dataloader for loading frames and masks
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
             loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=0, drop_last=False)
 
@@ -1368,99 +1346,33 @@ class MultiHumanFinetuner(Inferrer):
             save_dir = root_save_dir / f"{tgt_cam_id}"
             save_dir.mkdir(parents=True, exist_ok=True)
 
-
+            # Render in batches novel views from target camera
             with torch.no_grad():
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
+                    
+                    # Load the gt SMPL-X parameters
                     frame_indices = frame_indices.to(self.tuner_device)
-                    if use_gt_smplx:
-                        smplx_params = self._load_gt_smplx_params(
-                            frame_paths, root_gt_dir_path / "smplx"
-                        )
-                        render_bg_colors = torch.zeros(
-                            (self.cfg.num_persons, len(frame_paths), 3),
-                            device=self.tuner_device,
-                            dtype=torch.float32,
-                        )
-                    else:
-                        smplx_params, _, _, render_bg_colors = self._slice_motion(frame_indices)
-
-                    smplx_model = self.model.renderer.smplx_model
-
-                    S_W2M = compute_s_w2m(
-                        smplx_model, use_regressed_smpl, smplx_params, frame_paths, gt_smpl_dir_path, self.cfg.num_persons, self.tuner_device, use_sim
+                    smplx_params = self._load_gt_smplx_params(
+                        frame_paths, root_gt_dir_path / "smplx"
                     )
-
-                    # express TGT camera in render/model frame
-                    tgt_c2w_W   = torch.inverse(tgt_w2c)   # cam → W
-                    if use_sim:
-                        tgt_c2w_render = S_W2M @ tgt_c2w_W   # cam → M (aligned via similarity)
-                    else:
-                        if use_gt_smplx:
-                            # When using GT SMPL-X (already in world frame), keep camera in world frame
-                            tgt_c2w_render = tgt_c2w_W
-                        else:
-                            # default: express target camera in source-camera coordinates
-                            tgt_c2w_render = src_w2c @ tgt_c2w_W
-                    tgt_c2w_render_template = tgt_c2w_render.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
-
-                    # Recompute camera-space joints
-                    # - Pred joints: use render camera (tgt_c2w_render) to match rendered view
-                    # - GT joints: use original GT camera (tgt_c2w_W) to overlay on GT images
-                    gt_smpl_joints = preload_gt_smpl_joints_camera_space(
-                        frame_paths, gt_smpl_dir_path, tgt_c2w_W, self.cfg.num_persons, self.tuner_device
-                    ) # [F, P, 24, 3]
-                    if use_regressed_smpl:
-                        _, pred_smpl_joints = preload_pred_smplx_joints_camera_space(
-                            smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), tgt_c2w_render, self.tuner_device, use_regressed=True
-                        )
-                    else:
-                        smplx_joints = preload_pred_smplx_joints_camera_space(
-                            smplx_model, smplx_params, self.cfg.num_persons, len(frame_paths), tgt_c2w_render, self.tuner_device
-                        )
-                        pred_smpl_joints = smplx_to_smpl(smplx_joints)  # [F, P, 24, 3]
-
-                    # Build camera tensors matching render_bg_colors leading dims [B?, F]
-                    num_tracks, num_frames = render_bg_colors.shape[0], render_bg_colors.shape[1]
-                    gt_render_c2ws = tgt_c2w_render_template.expand(num_tracks, num_frames, 4, 4) # shape [B?, F, 4, 4]
-
-                    gt_render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4) # shape [B?, F, 4, 4]
-                    render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32)
 
                     # Render with the model
                     res = self.model.animation_infer_custom(
                         self.gs_model_list,
                         self.query_points,
                         smplx_params,
-                        render_c2ws=gt_render_c2ws,
-                        render_intrs=gt_render_intrs,
+                        render_c2ws=tgt_render_c2ws,
+                        render_intrs=tgt_render_intrs,
                         render_bg_colors=render_bg_colors,
                     )
-
-                    # Apply masks
                     comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
+
+                    # Apply masks to the rendered images and gt 
                     masks3 = masks
                     if masks3.shape[-1] == 1:
                         masks3 = masks3.repeat(1, 1, 1, 3)
-                    masked_render = comp_rgb  # optionally apply mask later if desired
+                    masked_render = comp_rgb * masks3
                     masked_gt = frames * masks3
-
-                    masked_render = overlay_smpl_joints(
-                        masked_render,
-                        pred_smpl_joints,
-                        tgt_intr4,
-                        joint_radius=3,
-                        color=torch.tensor([1.0, 0.0, 0.0]),
-                        device=self.tuner_device,
-                    )
-
-                    masked_gt = overlay_smpl_joints(
-                        masked_gt,
-                        gt_smpl_joints,
-                        tgt_intr4,
-                        joint_radius=3,
-                        color=torch.tensor([0.0, 1.0, 0.0]),
-                        device=self.tuner_device,
-                    )
 
                     # Combine masked render and masked GT with overlay
                     overlay = 0.5 * (masked_render + masked_gt)
@@ -1468,7 +1380,6 @@ class MultiHumanFinetuner(Inferrer):
                     for i in range(joined.shape[0]):
                         save_path = save_dir / Path(frame_paths[i]).name
                         save_image(joined[i].permute(2, 0, 1), str(save_path))
-                        save_image(masked_gt[i].permute(2, 0, 1), str(save_dir / f"gt_joints_{Path(frame_paths[i]).name}"))
 
         quit()
 
