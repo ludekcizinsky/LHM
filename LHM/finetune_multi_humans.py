@@ -261,12 +261,38 @@ def smplx_base_vertices_in_camera(
     Returns: [V_base, 3] or None on failure.
     """
     try:
+        def _pad_or_truncate(t: torch.Tensor, target_dim: int | None, label: str) -> torch.Tensor:
+            if target_dim is None:
+                return t
+            cur = t.shape[-1]
+            if cur == target_dim:
+                return t
+            if cur > target_dim:
+                print(f"[DEBUG] Truncating {label} from {cur} to {target_dim}")
+                return t[..., :target_dim]
+            pad = torch.zeros(*t.shape[:-1], target_dim - cur, device=t.device, dtype=t.dtype)
+            return torch.cat([t, pad], dim=-1)
+
         layer = getattr(smplx_model, "smplx_layer", None)
         if layer is None and hasattr(smplx_model, "layer"):
             layer = smplx_model.layer.get("neutral", None)
         if layer is None:
             raise AttributeError("SMPLX model has no base smplx_layer")
         layer = layer.to(device)
+
+        expected_beta_dim = getattr(layer, "num_betas", None)
+        if expected_beta_dim is None and hasattr(layer, "shapedirs"):
+            try:
+                expected_beta_dim = int(layer.shapedirs.shape[-1])
+            except Exception:
+                expected_beta_dim = None
+        expected_expr_dim = getattr(layer, "num_expression_coeffs", None)
+        if expected_expr_dim is None and hasattr(layer, "expr_dirs"):
+            try:
+                expected_expr_dim = int(layer.expr_dirs.shape[-1])
+            except Exception:
+                expected_expr_dim = None
+
         params = {
             "global_orient": smplx_params["root_pose"][pid : pid + 1, frame_idx],
             "body_pose": smplx_params["body_pose"][pid : pid + 1, frame_idx],
@@ -275,11 +301,12 @@ def smplx_base_vertices_in_camera(
             "reye_pose": smplx_params["reye_pose"][pid : pid + 1, frame_idx],
             "left_hand_pose": smplx_params["lhand_pose"][pid : pid + 1, frame_idx],
             "right_hand_pose": smplx_params["rhand_pose"][pid : pid + 1, frame_idx],
-            "betas": smplx_params["betas"][pid : pid + 1],
+            "betas": _pad_or_truncate(smplx_params["betas"][pid : pid + 1], expected_beta_dim, "betas"),
             "transl": smplx_params["trans"][pid : pid + 1, frame_idx],
         }
         if "expr" in smplx_params:
-            params["expression"] = smplx_params["expr"][pid : pid + 1, frame_idx]
+            expr = smplx_params["expr"][pid : pid + 1, frame_idx]
+            params["expression"] = _pad_or_truncate(expr, expected_expr_dim, "expr")
         output = layer(**{k: v.to(device) for k, v in params.items()})
         verts_world = output.vertices  # [1, V, 3]
         w2c = torch.inverse(c2w).to(device)
@@ -302,6 +329,7 @@ SMPL_JOINT_REGRESSOR_PATH = Path("/home/cizinsky/body_models/smpl/SMPL_NEUTRAL.p
 _SMPL_REGRESSOR_CACHE: torch.Tensor | None = None
 _SMPLX2SMPL_TRANSFER_CACHE: torch.Tensor | None = None
 _WARNED_TRANSFER_SHAPE: bool = False
+_SMPL_FACE_CACHE: np.ndarray | None = None
 
 
 def _load_smpl_regressor() -> torch.Tensor | None:
@@ -341,6 +369,25 @@ def _load_smplx2smpl_transfer() -> torch.Tensor | None:
         return mat_torch
     except Exception as e:
         print(f"[WARN] Could not load SMPLX→SMPL transfer: {e}")
+        return None
+
+
+def _load_smpl_faces() -> np.ndarray | None:
+    global _SMPL_FACE_CACHE
+    if _SMPL_FACE_CACHE is not None:
+        return _SMPL_FACE_CACHE
+    try:
+        import pickle
+        with open(SMPL_JOINT_REGRESSOR_PATH, "rb") as f:
+            data = pickle.load(f, encoding="latin1")
+        faces = data.get("f", None)
+        if faces is None:
+            return None
+        faces = np.asarray(faces, dtype=np.int64)
+        _SMPL_FACE_CACHE = faces
+        return faces
+    except Exception as e:
+        print(f"[WARN] Could not load SMPL faces: {e}")
         return None
 
 
@@ -620,6 +667,225 @@ def overlay_smpl_joints(
     return torch.stack(updated, dim=0)
 
 
+def overlay_smplx_mesh_pyrender(
+    images: torch.Tensor,
+    smplx_params: dict,
+    smplx_model,
+    intr: torch.Tensor,
+    c2w: torch.Tensor,
+    device: torch.device,
+    mesh_color: Tuple[float, float, float] = (0.0, 1.0, 0.0),
+    mesh_alpha: float = 0.7,
+) -> torch.Tensor:
+    """
+    Render SMPL-X meshes with trimesh+pyrender and alpha-blend them over images.
+
+    images: [F, H, W, 3] float in [0,1]
+    smplx_params: dict with shapes [P, F, ...]
+    intr: [3,3] or [4,4] intrinsics
+    c2w: [4,4] camera-to-world
+    mesh_color: RGB in [0,1]; mesh_alpha: opacity for the mesh layer
+    """
+    try:
+        import pyrender
+        import trimesh
+    except Exception as e:
+        print(f"[WARN] pyrender/trimesh unavailable for mesh overlay: {e}")
+        return images
+
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+    layer = getattr(smplx_model, "smplx_layer", None)
+    if layer is None and hasattr(smplx_model, "layer"):
+        layer = smplx_model.layer.get("neutral", None)
+    faces = getattr(layer, "faces", None) if layer is not None else None
+    if faces is None:
+        print("[WARN] SMPL-X faces not found, skipping mesh overlay.")
+        return images
+    faces_np = np.asarray(faces, dtype=np.int64)
+
+    intr_cpu = intr.detach().cpu()
+    if intr_cpu.shape[-2:] == (4, 4):
+        intr_cpu = intr_cpu[:3, :3]
+    fx, fy, cx, cy = (
+        float(intr_cpu[0, 0]),
+        float(intr_cpu[1, 1]),
+        float(intr_cpu[0, 2]),
+        float(intr_cpu[1, 2]),
+    )
+
+    num_frames = images.shape[0]
+    num_people = smplx_params["betas"].shape[0]
+    H, W = images.shape[1], images.shape[2]
+
+    try:
+        renderer = pyrender.OffscreenRenderer(viewport_width=W, viewport_height=H)
+    except Exception as e:
+        print(f"[WARN] Could not initialise pyrender renderer: {e}")
+        return images
+
+    out_frames: List[torch.Tensor] = []
+    try:
+        for fi in range(num_frames):
+            base_img = (images[fi].detach().cpu().numpy() * 255).astype(np.uint8)
+            depth_map = np.ones((H, W)) * np.inf
+            overlay_img = base_img.astype(np.float32)
+
+            for pid in range(num_people):
+                cam_verts = smplx_base_vertices_in_camera(
+                    smplx_model, smplx_params, pid, fi, c2w, device
+                )
+                if cam_verts is None:
+                    continue
+                verts_np = cam_verts.detach().cpu().numpy()
+
+                material = pyrender.MetallicRoughnessMaterial(
+                    metallicFactor=0.2,
+                    alphaMode="BLEND",
+                    baseColorFactor=[
+                        float(mesh_color[0]),
+                        float(mesh_color[1]),
+                        float(mesh_color[2]),
+                        float(mesh_alpha),
+                    ],
+                )
+                mesh = trimesh.Trimesh(verts_np, faces_np, process=False)
+                rot = trimesh.transformations.rotation_matrix(np.radians(180), [1, 0, 0])
+                mesh.apply_transform(rot)
+                mesh = pyrender.Mesh.from_trimesh(mesh, material=material, smooth=False)
+
+                scene = pyrender.Scene(
+                    bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=(0.5, 0.5, 0.5)
+                )
+                scene.add(mesh, "mesh")
+                camera = pyrender.IntrinsicsCamera(fx=fx, fy=fy, cx=cx, cy=cy, zfar=1e4)
+                scene.add(camera, pose=np.eye(4))
+                light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.5)
+                scene.add(light, pose=np.eye(4))
+
+                color, rend_depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
+                valid_mask = (rend_depth < depth_map) & (rend_depth > 0)
+                depth_map[valid_mask] = rend_depth[valid_mask]
+                valid_mask = valid_mask[..., None]
+                overlay_img = valid_mask * color[..., :3] + (1.0 - valid_mask) * overlay_img
+
+            overlay_tensor = (
+                torch.from_numpy(overlay_img).to(device=images.device, dtype=images.dtype) / 255.0
+            )
+            out_frames.append(overlay_tensor)
+    finally:
+        renderer.delete()
+
+    return torch.stack(out_frames, dim=0)
+
+
+def overlay_smpl_mesh_pyrender(
+    images: torch.Tensor,
+    smpl_verts_world: torch.Tensor,
+    intr: torch.Tensor,
+    c2w: torch.Tensor,
+    device: torch.device,
+    mesh_color: Tuple[float, float, float] = (0.0, 0.5, 1.0),
+    mesh_alpha: float = 0.7,
+) -> torch.Tensor:
+    """
+    Render SMPL meshes (world-space verts) with trimesh+pyrender and alpha-blend them over images.
+
+    images: [F, H, W, 3] float in [0,1]
+    smpl_verts_world: [F, P, V, 3] world-space vertices
+    intr: [3,3] or [4,4] intrinsics
+    c2w: [4,4] camera-to-world
+    """
+    faces = _load_smpl_faces()
+    if faces is None:
+        print("[WARN] SMPL faces not available, skipping SMPL overlay.")
+        return images
+
+    try:
+        import pyrender
+        import trimesh
+    except Exception as e:
+        print(f"[WARN] pyrender/trimesh unavailable for SMPL overlay: {e}")
+        return images
+
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+    intr_cpu = intr.detach().cpu()
+    if intr_cpu.shape[-2:] == (4, 4):
+        intr_cpu = intr_cpu[:3, :3]
+    fx, fy, cx, cy = (
+        float(intr_cpu[0, 0]),
+        float(intr_cpu[1, 1]),
+        float(intr_cpu[0, 2]),
+        float(intr_cpu[1, 2]),
+    )
+
+    num_frames = images.shape[0]
+    num_people = smpl_verts_world.shape[1]
+    H, W = images.shape[1], images.shape[2]
+    w2c = torch.inverse(c2w.to(device))  # [4,4]
+
+    try:
+        renderer = pyrender.OffscreenRenderer(viewport_width=W, viewport_height=H)
+    except Exception as e:
+        print(f"[WARN] Could not initialise pyrender renderer for SMPL overlay: {e}")
+        return images
+
+    out_frames: List[torch.Tensor] = []
+    try:
+        for fi in range(num_frames):
+            base_img = (images[fi].detach().cpu().numpy() * 255).astype(np.uint8)
+            depth_map = np.ones((H, W)) * np.inf
+            overlay_img = base_img.astype(np.float32)
+
+            for pid in range(num_people):
+                verts_w = smpl_verts_world[fi, pid].to(device=device)
+                if verts_w.numel() == 0:
+                    continue
+                homo = torch.cat([verts_w, torch.ones_like(verts_w[:, :1])], dim=-1)  # [V,4]
+                cam = (w2c @ homo.t()).t()[:, :3]
+                verts_np = cam.detach().cpu().numpy()
+
+                material = pyrender.MetallicRoughnessMaterial(
+                    metallicFactor=0.2,
+                    alphaMode="BLEND",
+                    baseColorFactor=[
+                        float(mesh_color[0]),
+                        float(mesh_color[1]),
+                        float(mesh_color[2]),
+                        float(mesh_alpha),
+                    ],
+                )
+                mesh = trimesh.Trimesh(verts_np, faces, process=False)
+                rot = trimesh.transformations.rotation_matrix(np.radians(180), [1, 0, 0])
+                mesh.apply_transform(rot)
+                mesh = pyrender.Mesh.from_trimesh(mesh, material=material, smooth=False)
+
+                scene = pyrender.Scene(
+                    bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=(0.5, 0.5, 0.5)
+                )
+                scene.add(mesh, "mesh")
+                camera = pyrender.IntrinsicsCamera(fx=fx, fy=fy, cx=cx, cy=cy, zfar=1e4)
+                scene.add(camera, pose=np.eye(4))
+                light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.5)
+                scene.add(light, pose=np.eye(4))
+
+                color, rend_depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
+                valid_mask = (rend_depth < depth_map) & (rend_depth > 0)
+                depth_map[valid_mask] = rend_depth[valid_mask]
+                valid_mask = valid_mask[..., None]
+                overlay_img = valid_mask * color[..., :3] + (1.0 - valid_mask) * overlay_img
+
+            overlay_tensor = (
+                torch.from_numpy(overlay_img).to(device=images.device, dtype=images.dtype) / 255.0
+            )
+            out_frames.append(overlay_tensor)
+    finally:
+        renderer.delete()
+
+    return torch.stack(out_frames, dim=0)
+
+
 def preload_gt_smpl_joints_camera_space(
     frame_paths: List[str | Path],
     smpl_dir: Path,
@@ -665,6 +931,44 @@ def load_gt_smpl_joints_world(
     except Exception as e:
         print(f"[DEBUG] Could not load GT SMPL joints world for {frame_path}: {e}")
         return None
+
+
+def load_gt_smpl_verts_world_batch(
+    frame_paths: List[str | Path],
+    smpl_dir: Path,
+    num_persons: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """
+    Load GT SMPL verts (world space) for each frame. Returns [F, P, V, 3] or None if unavailable.
+    """
+    verts_list = []
+    for fp in frame_paths:
+        try:
+            stem = Path(fp).stem
+            npz_path = smpl_dir / f"{stem}.npz"
+            if not npz_path.exists():
+                return None
+            data = np.load(npz_path)
+            verts_np = data.get("verts", None)
+            if verts_np is None:
+                return None
+            verts_t = torch.from_numpy(verts_np).float().to(device)  # [P,6890,3]
+            if verts_t.shape[0] < num_persons:
+                pad = torch.zeros(
+                    (num_persons - verts_t.shape[0], verts_t.shape[1], 3),
+                    device=device,
+                    dtype=verts_t.dtype,
+                )
+                verts_t = torch.cat([verts_t, pad], dim=0)
+            else:
+                verts_t = verts_t[:num_persons]
+            verts_list.append(verts_t)
+        except Exception as e:
+            print(f"[DEBUG] Could not load GT SMPL verts for {fp}: {e}")
+            return None
+
+    return torch.stack(verts_list, dim=0) if verts_list else None
 
 
 def preload_gt_smpl_joints_world(
@@ -1317,7 +1621,6 @@ class MultiHumanFinetuner(Inferrer):
         root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
         root_save_dir.mkdir(parents=True, exist_ok=True)
         num_tracks, num_frames = self.cfg.num_persons, self.cfg.batch_size
-        # Templates (expanded per-batch inside the loop to match frame count)
         render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32) # black
 
         for tgt_cam_id in target_camera_ids:
@@ -1350,12 +1653,48 @@ class MultiHumanFinetuner(Inferrer):
             # Render in batches novel views from target camera
             with torch.no_grad():
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
+
+                    # Get gt image size
+                    gt_h, gt_w = frames.shape[1], frames.shape[2]
                     
                     # Load the gt SMPL-X parameters
                     frame_indices = frame_indices.to(self.tuner_device)
                     smplx_params = self._load_gt_smplx_params(
                         frame_paths, root_gt_dir_path / "smplx"
                     )
+                    smpl_gt_verts = load_gt_smpl_verts_world_batch(
+                        frame_paths, root_gt_dir_path / "smpl", self.cfg.num_persons, self.tuner_device
+                    )
+                    smplx_model = getattr(self.model.renderer, "smplx_model", None)
+                    gt_mesh_overlay = None
+                    smpl_mesh_overlay = None
+                    if smplx_model is not None:
+                        try:
+                            gt_mesh_overlay = overlay_smplx_mesh_pyrender(
+                                frames,
+                                smplx_params,
+                                smplx_model,
+                                tgt_intr4,
+                                tgt_c2w,
+                                self.tuner_device,
+                                mesh_color=(0.0, 1.0, 0.0),
+                                mesh_alpha=0.7,
+                            )
+                        except Exception as e:
+                            print(f"[WARN] SMPL-X mesh overlay failed: {e}")
+                    if smpl_gt_verts is not None:
+                        try:
+                            smpl_mesh_overlay = overlay_smpl_mesh_pyrender(
+                                frames,
+                                smpl_gt_verts,
+                                tgt_intr4,
+                                tgt_c2w,
+                                self.tuner_device,
+                                mesh_color=(0.0, 0.5, 1.0),
+                                mesh_alpha=0.7,
+                            )
+                        except Exception as e:
+                            print(f"[WARN] SMPL overlay failed: {e}")
 
                     # Render with the model
                     res = self.model.animation_infer_custom(
@@ -1365,6 +1704,7 @@ class MultiHumanFinetuner(Inferrer):
                         render_c2ws=tgt_render_c2ws,
                         render_intrs=tgt_render_intrs,
                         render_bg_colors=render_bg_colors,
+                        render_hw=(gt_h, gt_w),
                     )
                     comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
 
@@ -1377,7 +1717,12 @@ class MultiHumanFinetuner(Inferrer):
 
                     # Combine masked render and masked GT with overlay
                     overlay = 0.5 * (masked_render + masked_gt)
-                    joined = torch.cat([masked_render, masked_gt, overlay], dim=2)  # side-by-side along width
+                    columns = [masked_render, masked_gt, overlay]
+                    if gt_mesh_overlay is not None:
+                        columns.append(gt_mesh_overlay)
+                    if smpl_mesh_overlay is not None:
+                        columns.append(smpl_mesh_overlay)
+                    joined = torch.cat(columns, dim=2)  # side-by-side along width
                     for i in range(joined.shape[0]):
                         save_path = save_dir / Path(frame_paths[i]).name
                         save_image(joined[i].permute(2, 0, 1), str(save_path))
