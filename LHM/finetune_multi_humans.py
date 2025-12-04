@@ -1318,9 +1318,7 @@ class MultiHumanFinetuner(Inferrer):
         root_save_dir.mkdir(parents=True, exist_ok=True)
         num_tracks, num_frames = self.cfg.num_persons, self.cfg.batch_size
         # Templates (expanded per-batch inside the loop to match frame count)
-        render_bg_colors_template = torch.zeros(
-            (num_tracks, 1, 3), device=self.tuner_device, dtype=torch.float32
-        )  # black
+        render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32) # black
 
         for tgt_cam_id in target_camera_ids:
 
@@ -1333,11 +1331,13 @@ class MultiHumanFinetuner(Inferrer):
             tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
             tgt_w2c = extr_to_w2c_4x4(tgt_extr, self.tuner_device)
             tgt_c2w = torch.inverse(tgt_w2c)
-            tgt_c2w_render_template = tgt_c2w.unsqueeze(0).unsqueeze(0)  # [1,1,4,4]
+            tgt_c2w_render_template = tgt_c2w.unsqueeze(0).unsqueeze(0)  
+            tgt_render_c2ws = tgt_c2w_render_template.expand(num_tracks, num_frames, 4, 4) 
 
             # - intrinsics
             tgt_intr4 = intr_to_4x4(tgt_intr, self.tuner_device)
             tgt_intr_template = tgt_intr4.unsqueeze(0).unsqueeze(0)      # [1,1,4,4]
+            tgt_render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4) 
 
             # Prepare dataset and dataloader for loading frames and masks
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
@@ -1356,10 +1356,6 @@ class MultiHumanFinetuner(Inferrer):
                     smplx_params = self._load_gt_smplx_params(
                         frame_paths, root_gt_dir_path / "smplx"
                     )
-                    cur_F = len(frame_paths)
-                    render_bg_colors = render_bg_colors_template.expand(num_tracks, cur_F, 3)
-                    tgt_render_c2ws = tgt_c2w_render_template.expand(num_tracks, cur_F, 4, 4)
-                    tgt_render_intrs = tgt_intr_template.expand(num_tracks, cur_F, 4, 4)
 
                     # Render with the model
                     res = self.model.animation_infer_custom(
