@@ -833,15 +833,14 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
                 out[k] = v
         return out
 
-    def animation_infer_custom(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors):
+    def animation_infer_custom(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_hw):
         '''Inference code avoid repeat forward.
         '''
-
-        render_h, render_w = 1280, 940
 
         # render target views
         render_res_list = []
         num_views = render_c2ws.shape[1]
+        render_h, render_w = render_hw
 
         for view_idx in range(num_views):
             smplx_single_view = self.renderer.get_single_view_smpl_data(smplx_params, view_idx)
