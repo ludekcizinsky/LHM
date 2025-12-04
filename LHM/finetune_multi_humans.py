@@ -287,7 +287,7 @@ RIGHT_PALM_IDS = [40, 43, 49, 46, 52]
 
 # Optional: paths to SMPLX→SMPL transfer and SMPL joint regressor
 SMPLX2SMPL_TRANSFER_PATH = Path("/scratch/izar/cizinsky/pretrained/smplx2smpl.pkl")
-SMPL_JOINT_REGRESSOR_PATH = Path("/home/cizinsky/smpl/v.1.1.0/basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl")
+SMPL_JOINT_REGRESSOR_PATH = Path("/home/cizinsky/body_models/smpl/SMPL_NEUTRAL.pkl")
 
 _SMPL_REGRESSOR_CACHE: torch.Tensor | None = None
 _SMPLX2SMPL_TRANSFER_CACHE: torch.Tensor | None = None
@@ -517,6 +517,10 @@ def smplx_joints_in_camera(
     for opt_key in ("face_offset", "joint_offset", "locator_offset"):
         if opt_key in smplx_params:
             smpl_slice[opt_key] = smplx_params[opt_key][pid : pid + 1]
+
+    # Drop any time dimension from betas (should be [1, num_betas])
+    if smpl_slice["betas"].dim() > 2:
+        smpl_slice["betas"] = smpl_slice["betas"][:, 0]
 
     joint_zero = smplx_model.get_zero_pose_human(
         shape_param=smpl_slice["betas"],
@@ -1296,6 +1300,72 @@ class MultiHumanFinetuner(Inferrer):
             w2c[:3, :4] = extr.to(self.tuner_device)
             return w2c
 
+        def _aa_to_rot(aa: torch.Tensor) -> torch.Tensor:
+            """Axis-angle (...,3) -> rotmat (...,3,3)."""
+            from smplx.lbs import batch_rodrigues
+
+            flat = aa.reshape(-1, 3)
+            rots = batch_rodrigues(flat)
+            return rots.view(*aa.shape[:-1], 3, 3)
+
+        def _rot_to_aa(rot: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor:
+            """Rotation matrix (...,3,3) -> axis-angle (...,3)."""
+            flat = rot.reshape(-1, 3, 3)
+            cos = 0.5 * (torch.einsum("bii->b", flat) - 1.0)
+            cos = torch.clamp(cos, -1 + epsilon, 1 - epsilon)
+            theta = torch.acos(cos)
+
+            m21 = flat[:, 2, 1] - flat[:, 1, 2]
+            m02 = flat[:, 0, 2] - flat[:, 2, 0]
+            m10 = flat[:, 1, 0] - flat[:, 0, 1]
+            denom = torch.sqrt(m21 * m21 + m02 * m02 + m10 * m10 + epsilon)
+
+            axis0 = torch.where(torch.abs(theta) < 0.00001, m21, m21 / denom)
+            axis1 = torch.where(torch.abs(theta) < 0.00001, m02, m02 / denom)
+            axis2 = torch.where(torch.abs(theta) < 0.00001, m10, m10 / denom)
+            aa = theta.unsqueeze(1) * torch.stack([axis0, axis1, axis2], dim=1)
+            return aa.view(*rot.shape[:-2], 3)
+
+        def _load_gt_smplx_params(frame_paths: List[str], smplx_dir: Path, src_w2c_mat: torch.Tensor):
+            """Load per-frame SMPL-X params (world coords) and convert to source-cam coords."""
+            src_R = src_w2c_mat[:3, :3]  # w2c rotation
+            src_t = src_w2c_mat[:3, 3]   # w2c translation
+
+            npzs = [np.load(smplx_dir / f"{Path(fp).stem}.npz") for fp in frame_paths]
+
+            def stack_key(key):
+                arrs = [torch.from_numpy(n[key]).float() for n in npzs]
+                return torch.stack(arrs, dim=1).to(self.tuner_device)  # [P, F, ...]
+
+            trans_w = stack_key("trans")  # [P,F,3]
+            root_pose_w = stack_key("root_pose")  # [P,F,3]
+            betas = stack_key("betas")  # [P,F,10] (constant across frames)
+
+            # Transform root pose + translation into source camera coordinates
+            root_rot_w = _aa_to_rot(root_pose_w)  # [P,F,3,3]
+            root_rot_c = torch.matmul(src_R, root_rot_w)  # broadcast matmul
+            root_pose_c = _rot_to_aa(root_rot_c)  # [P,F,3]
+
+            trans_c = torch.einsum("ij,bfj->bfi", src_R, trans_w) + src_t  # [P,F,3]
+
+            smplx = {
+                "betas": betas[:, 0, :10],  # [P,10] keep first 10, assume constant over frames
+                "root_pose": root_pose_c,
+                "body_pose": stack_key("body_pose"),
+                "jaw_pose": stack_key("jaw_pose"),
+                "leye_pose": stack_key("leye_pose"),
+                "reye_pose": stack_key("reye_pose"),
+                "lhand_pose": stack_key("lhand_pose"),
+                "rhand_pose": stack_key("rhand_pose"),
+                "trans": trans_c,
+                "expr": stack_key("expression"),
+                "transform_mat_neutral_pose": self.transform_mat_neutral_pose.to(self.tuner_device),
+            }
+#            print(f"[DEBUG] Loaded GT SMPL-X params:")
+            #for k, v in smplx.items():
+                #print(f"{k}: {v.shape}")
+            return smplx
+
         def _intr_to_4x4(intr: torch.Tensor) -> torch.Tensor:
             intr4 = torch.eye(4, device=self.tuner_device, dtype=torch.float32)
             intr4[:3, :3] = intr.to(self.tuner_device)
@@ -1308,7 +1378,13 @@ class MultiHumanFinetuner(Inferrer):
         mode = str(getattr(self.cfg.nvs_eval, "smplx_to_smpl_mode", "auto")).lower()
         use_regressed_smpl = mode != "heuristic"
         use_sim = bool(getattr(self.cfg.nvs_eval, "use_similarity_transform", True))
-        print(f"[DEBUG] smplx_to_smpl_mode={mode}, use_regressed_smpl={use_regressed_smpl}, use_similarity_transform={use_sim}")
+        use_gt_smplx = bool(getattr(self.cfg.nvs_eval, "use_gt_smplx_params", False))
+        if use_gt_smplx:
+            # GT params are in world coords; we transform them to the source camera and skip similarity.
+            use_sim = False
+        print(
+            f"[DEBUG] smplx_to_smpl_mode={mode}, use_regressed_smpl={use_regressed_smpl}, use_similarity_transform={use_sim}, use_gt_smplx_params={use_gt_smplx}"
+        )
 
         for tgt_cam_id in target_camera_ids:
             tgt_gt_frames_dir_path = root_gt_dir_path / "images" / f"{tgt_cam_id}"
@@ -1333,7 +1409,17 @@ class MultiHumanFinetuner(Inferrer):
             with torch.no_grad():
                 for frame_indices, frames, masks, frame_paths in tqdm(loader, desc=f"NVS cam {tgt_cam_id}", leave=False):
                     frame_indices = frame_indices.to(self.tuner_device)
-                    smplx_params, _, _, render_bg_colors = self._slice_motion(frame_indices)
+                    if use_gt_smplx:
+                        smplx_params = _load_gt_smplx_params(
+                            frame_paths, root_gt_dir_path / "smplx", src_w2c
+                        )
+                        render_bg_colors = torch.zeros(
+                            (self.cfg.num_persons, len(frame_paths), 3),
+                            device=self.tuner_device,
+                            dtype=torch.float32,
+                        )
+                    else:
+                        smplx_params, _, _, render_bg_colors = self._slice_motion(frame_indices)
 
                     smplx_model = self.model.renderer.smplx_model
 
