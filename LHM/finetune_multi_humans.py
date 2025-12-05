@@ -1298,6 +1298,71 @@ class MultiHumanFinetuner(Inferrer):
             #print(f"{k}: {v.shape}")
         return smplx
 
+    def _mask_centroids(self, masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (cx, cy, valid) for a batch of masks shaped [B, H, W]."""
+        binary = (masks > 0.5).float()
+        area = binary.flatten(1).sum(1)
+        valid = area > 10.0  # ignore tiny masks
+        if not valid.any():
+            zeros = torch.zeros_like(area)
+            return zeros, zeros, valid
+
+        _, h, w = binary.shape
+        xs = torch.arange(w, device=masks.device).view(1, 1, w)
+        ys = torch.arange(h, device=masks.device).view(1, h, 1)
+        cx = (binary * xs).sum((1, 2)) / (area + 1e-6)
+        cy = (binary * ys).sum((1, 2)) / (area + 1e-6)
+        return cx, cy, valid
+
+    def _estimate_world_translation_offset(
+        self,
+        render_mask: torch.Tensor,
+        gt_mask: torch.Tensor,
+        depth_map: torch.Tensor | None,
+        intr: torch.Tensor,
+        c2w: torch.Tensor,
+        w2c: torch.Tensor,
+        smplx_trans: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """
+        Estimate per-frame world-space translation that aligns rendered and GT masks.
+        Returns tensor shaped [B, 3] or None if no valid masks.
+        """
+        # strip the channel dim -> [B, H, W]
+        render_mask_b = render_mask[..., 0]
+        gt_mask_b = gt_mask[..., 0]
+
+        render_cx, render_cy, render_valid = self._mask_centroids(render_mask_b)
+        gt_cx, gt_cy, gt_valid = self._mask_centroids(gt_mask_b)
+        valid = render_valid & gt_valid
+        if not valid.any():
+            return None
+
+        dx = gt_cx - render_cx
+        dy = gt_cy - render_cy
+
+        # Depth from rendered depth map if available, otherwise from SMPL-X translations.
+#        z = None
+        #if depth_map is not None:
+            #depth_bhw = depth_map[..., 0]
+            #depth_sum = (depth_bhw * (render_mask_b > 0.5).float()).sum((1, 2))
+            #mask_sum = (render_mask_b > 0.5).float().sum((1, 2)).clamp_min(1e-6)
+            #z = depth_sum / mask_sum
+
+        # if z is None:
+        cam_coords = torch.einsum("ij,pbj->pbi", w2c[:3, :3], smplx_trans) + w2c[:3, 3]
+        z = cam_coords[..., 2].mean(dim=0)
+
+        z = z.clamp_min(1e-3)
+        fx, fy = intr[0, 0], intr[1, 1]
+        delta_cam = torch.stack(
+            [dx * z / fx, dy * z / fy, torch.zeros_like(z)],
+            dim=-1,
+        )
+        delta_cam = torch.where(valid[:, None], delta_cam, torch.zeros_like(delta_cam))
+        delta_world = torch.einsum("ij,bj->bi", c2w[:3, :3], delta_cam)
+        return delta_world
+
     # ---------------- Training utilities ----------------
     def _trainable_tensors(self) -> List[torch.Tensor]:
         params = []
@@ -1621,7 +1686,9 @@ class MultiHumanFinetuner(Inferrer):
         root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
         root_save_dir.mkdir(parents=True, exist_ok=True)
         num_tracks, num_frames = self.cfg.num_persons, self.cfg.batch_size
-        render_bg_colors = torch.zeros((num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32) # black
+        render_bg_colors_template = torch.zeros(
+            (num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32
+        )  # black
 
         for tgt_cam_id in target_camera_ids:
 
@@ -1634,13 +1701,7 @@ class MultiHumanFinetuner(Inferrer):
             tgt_intr, tgt_extr = load_camera_from_npz(camera_params_path, tgt_cam_id, device=self.tuner_device)
             tgt_w2c = extr_to_w2c_4x4(tgt_extr, self.tuner_device)
             tgt_c2w = torch.inverse(tgt_w2c)
-            tgt_c2w_render_template = tgt_c2w.unsqueeze(0).unsqueeze(0)  
-            tgt_render_c2ws = tgt_c2w_render_template.expand(num_tracks, num_frames, 4, 4) 
-
-            # - intrinsics
             tgt_intr4 = intr_to_4x4(tgt_intr, self.tuner_device)
-            tgt_intr_template = tgt_intr4.unsqueeze(0).unsqueeze(0)      # [1,1,4,4]
-            tgt_render_intrs = tgt_intr_template.expand(num_tracks, num_frames, 4, 4) 
 
             # Prepare dataset and dataloader for loading frames and masks
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
@@ -1656,56 +1717,56 @@ class MultiHumanFinetuner(Inferrer):
 
                     # Get gt image size
                     gt_h, gt_w = frames.shape[1], frames.shape[2]
+                    batch_b = frames.shape[0]
+
+                    # Prepare per-batch camera/intr/background tensors (num_frames can differ in last batch)
+                    render_c2ws = (
+                        tgt_c2w.unsqueeze(0).unsqueeze(0).expand(num_tracks, batch_b, 4, 4).clone()
+                    )
+                    render_intrs = tgt_intr4.unsqueeze(0).unsqueeze(0).expand(num_tracks, batch_b, 4, 4)
+                    render_bg_colors = render_bg_colors_template[:, :batch_b]
                     
                     # Load the gt SMPL-X parameters
                     frame_indices = frame_indices.to(self.tuner_device)
                     smplx_params = self._load_gt_smplx_params(
                         frame_paths, root_gt_dir_path / "smplx"
                     )
-                    smpl_gt_verts = load_gt_smpl_verts_world_batch(
-                        frame_paths, root_gt_dir_path / "smpl", self.cfg.num_persons, self.tuner_device
-                    )
-                    smplx_model = getattr(self.model.renderer, "smplx_model", None)
-                    gt_mesh_overlay = None
-                    smpl_mesh_overlay = None
-                    if smplx_model is not None:
-                        try:
-                            gt_mesh_overlay = overlay_smplx_mesh_pyrender(
-                                frames,
-                                smplx_params,
-                                smplx_model,
-                                tgt_intr4,
-                                tgt_c2w,
-                                self.tuner_device,
-                                mesh_color=(0.0, 1.0, 0.0),
-                                mesh_alpha=0.7,
-                            )
-                        except Exception as e:
-                            print(f"[WARN] SMPL-X mesh overlay failed: {e}")
-                    if smpl_gt_verts is not None:
-                        try:
-                            smpl_mesh_overlay = overlay_smpl_mesh_pyrender(
-                                frames,
-                                smpl_gt_verts,
-                                tgt_intr4,
-                                tgt_c2w,
-                                self.tuner_device,
-                                mesh_color=(0.0, 0.5, 1.0),
-                                mesh_alpha=0.7,
-                            )
-                        except Exception as e:
-                            print(f"[WARN] SMPL overlay failed: {e}")
 
                     # Render with the model
                     res = self.model.animation_infer_custom(
                         self.gs_model_list,
                         self.query_points,
                         smplx_params,
-                        render_c2ws=tgt_render_c2ws,
-                        render_intrs=tgt_render_intrs,
+                        render_c2ws=render_c2ws,
+                        render_intrs=render_intrs,
                         render_bg_colors=render_bg_colors,
                         render_hw=(gt_h, gt_w),
                     )
+
+                    delta_world = self._estimate_world_translation_offset(
+                        render_mask=res["comp_mask"],
+                        gt_mask=masks,
+                        depth_map=res.get("comp_depth"),
+                        intr=tgt_intr,
+                        c2w=tgt_c2w,
+                        w2c=tgt_w2c,
+                        smplx_trans=smplx_params["trans"],
+                    )
+                    if delta_world is not None:
+                        # Move camera opposite to desired subject shift (extrinsic is world->camera).
+                        damp = 0.2  # conservative to avoid overshoot
+                        render_c2ws = render_c2ws.clone()
+                        render_c2ws[:, :, :3, 3] += damp * delta_world.unsqueeze(0)
+                        res = self.model.animation_infer_custom(
+                            self.gs_model_list,
+                            self.query_points,
+                            smplx_params,
+                            render_c2ws=render_c2ws,
+                            render_intrs=render_intrs,
+                            render_bg_colors=render_bg_colors,
+                            render_hw=(gt_h, gt_w),
+                        )
+
                     comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
 
                     # Apply masks to the rendered images and gt 
@@ -1718,10 +1779,6 @@ class MultiHumanFinetuner(Inferrer):
                     # Combine masked render and masked GT with overlay
                     overlay = 0.5 * (masked_render + masked_gt)
                     columns = [masked_render, masked_gt, overlay]
-                    if gt_mesh_overlay is not None:
-                        columns.append(gt_mesh_overlay)
-                    if smpl_mesh_overlay is not None:
-                        columns.append(smpl_mesh_overlay)
                     joined = torch.cat(columns, dim=2)  # side-by-side along width
                     for i in range(joined.shape[0]):
                         save_path = save_dir / Path(frame_paths[i]).name
