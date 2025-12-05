@@ -14,7 +14,7 @@ cd /home/cizinsky/LHM
 conda deactivate && conda activate lhm
 
 # --- Shared settings
-seq_name="hi4d_pair00_fight"
+seq_name="hi4d_pair15_fight"
 num_persons=2
 
 # --- V1

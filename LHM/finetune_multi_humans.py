@@ -1202,6 +1202,7 @@ class MultiHumanFinetuner(Inferrer):
 
                 render_intrs = motion_seq["render_intrs"][:, fi : fi + 1].to(self.tuner_device)
                 render_bg_colors = motion_seq["render_bg_colors"][:, fi : fi + 1].to(self.tuner_device)
+                render_hw = self.cfg.render_hw
 
                 with torch.no_grad():
                     res = self.model.animation_infer_custom(
@@ -1211,6 +1212,7 @@ class MultiHumanFinetuner(Inferrer):
                         render_c2ws=render_c2ws,
                         render_intrs=render_intrs,
                         render_bg_colors=render_bg_colors,
+                        render_hw=render_hw,
                     )
                     img = res["comp_rgb"][0].detach().cpu().clamp(0, 1).numpy()
 

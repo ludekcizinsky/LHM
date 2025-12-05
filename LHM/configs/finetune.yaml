@@ -17,6 +17,8 @@ train_params:
   - opacity
   - shs
 
+render_hw: [1280, 940]
+
 wandb:
   enable: true
   project: "hybrid-lhm"
@@ -36,8 +38,8 @@ tune_motion: true
 
 nvs_eval:
   source_camera_id: 4
-  target_camera_ids: [28, 52]
-  root_gt_dir_path: /scratch/izar/cizinsky/ait_datasets/full/hi4d/pair00_1/fight00
+  target_camera_ids: [4, 16, 28, 40, 52, 64, 76, 88]
+  root_gt_dir_path: /scratch/izar/cizinsky/ait_datasets/full/hi4d/pair15_1/pair15/fight15
   downscale_factor: 2
 
 

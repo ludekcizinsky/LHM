@@ -2,7 +2,7 @@
 set -e # exit on error
 # This script runs the full LHM pipeline: data preparation and inference.
 # Example usage:
-#   bash preprocess.sh taichi /home/cizinsky/in_the_wild/bilibili/taichi.mp4
+#   bash preprocess.sh taichi 
 
 # activate conda environment
 source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
@@ -13,10 +13,10 @@ cd /home/cizinsky/LHM
 
 # configurable settings
 seq_name=$1
-input_video=$2
 
 # for now default settings
 default_ref_frame_idx=0
+input_video='/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair15_1/pair15/fight15/images/4/fight15_cam4_30fps.mp4'
 
 # derived paths
 preprocess_dir=/scratch/izar/cizinsky/thesis/preprocessing/$seq_name
@@ -28,7 +28,13 @@ mkdir -p $frame_folder
 initial_gs_model_dir=$output_dir/initial_scene_recon
 mkdir -p $initial_gs_model_dir
 
-# echo "--- [1/?] Running preprocess.sh to generate motion sequences"
+# echo "--- [1/?] Extracting frames from input video at 30 fps"
+# ffmpeg -framerate 30 -start_number 1 \
+  # -i '/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair15_1/pair15/fight15/images/4/%06d.jpg' \
+  # -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
+  # $input_video
+
+# echo "--- [2/?] Running preprocess.sh to generate motion sequences"
 # conda deactivate && conda activate lhm
 # python engine/pose_estimation/video2motion.py --video_path $input_video --output_path $output_dir/motion --visualize
 
@@ -39,8 +45,8 @@ mkdir -p $initial_gs_model_dir
 # python engine/new_segment_api/run.py --frames $frame_folder --text "a person" --output-dir $output_dir --prompt-frame 75
 
 # echo "[3/?] Running Depth Anything 3 to generate depth maps"
-# conda deactivate && conda activate da3
-# python engine/depth_est_api/run.py --output_dir $output_dir
+conda deactivate && conda activate da3
+python engine/depth_est_api/run.py --output_dir $output_dir
 
 # TODO: manual inspection needed at this point and making sure that mask track ids match motion track ids.
 # TODO: another todo is to pick a frame index for each person track to be used as reference frame during inference.
