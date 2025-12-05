@@ -1,27 +1,17 @@
 """
 Finetune canonical Gaussian params for multiple humans using original frames as supervision.
-
-Trains offset_xyz, rotation, scaling, opacity, and SH/RGB while keeping SMPL-X motion fixed.
-Supervision:
-  - L_rgb: MSE between rendered RGB (masked) and GT frame * union mask (weight 1.0)
-  - L_sil: MSE between rendered mask and GT union mask (weight 0.5)
-  - L_ssim: SSIM (weight configurable)
-
-Expects:
-  output_dir/initial_scene_recon/<track_id>/* (loaded canonical state)
-  output_dir/frames/<0000.png...> and output_dir/masks/union/<0000.png...> for supervision.
-Saves finetuned state to output_dir/refined_scene_recon/<track_id>/...
 """
 
 
 import os
 import sys
 import shutil
+import math
 import subprocess
 import imageio.v2 as imageio
 from dataclasses import fields
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import copy
 from tqdm import tqdm
 
@@ -33,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+import kornia
 from torch.utils.data import DataLoader, Dataset
 
 from fused_ssim import fused_ssim
@@ -46,6 +37,122 @@ from LHM.models import ModelHumanLRMSapdinoBodyHeadSD3_5
 from LHM.outputs.output import GaussianAppOutput
 from LHM.runners.infer.base_inferrer import Inferrer
 from LHM.utils.hf_hub import wrap_model_hub
+
+# ---------------------------------------------------------------------------
+# Evaluation metrics
+# ---------------------------------------------------------------------------
+
+# Cached LPIPS metric instance; built lazily on first use.
+_LPIPS_METRIC: Optional[torch.nn.Module] = None
+
+
+def _get_lpips_net(device: torch.device) -> torch.nn.Module:
+    global _LPIPS_METRIC
+    if _LPIPS_METRIC is None:
+        # Spatial LPIPS gives a per-pixel distance map (pyiqa handles input normalisation to [-1,1])
+        _LPIPS_METRIC = pyiqa.create_metric(
+            "lpips", device=device, net="vgg", spatial=True, as_loss=False
+        ).eval()
+    return _LPIPS_METRIC.to(device)
+
+
+def _ensure_nchw(t: torch.Tensor) -> torch.Tensor:
+    """Convert tensors from NHWC (renderer output) to NCHW for library calls."""
+    return t.permute(0, 3, 1, 2).contiguous()
+
+
+def _mask_sums(mask: torch.Tensor) -> torch.Tensor:
+    """Sum mask activations per sample (expects shape [B,1,H,W])."""
+    return mask.sum(dim=(2, 3))
+
+
+def ssim(images: torch.Tensor, masks: torch.Tensor, renders: torch.Tensor) -> torch.Tensor:
+    """Masked SSIM per sample.
+    
+    Args:
+        images: [B,H,W,C] ground truth images in [0,1] 
+        masks: [B,H,W] binary masks in [0,1]
+        renders: [B,H,W,C] rendered images in [0,1]
+    Returns: 
+        ssim_vals: [B] masked SSIM values 
+    """
+    target = _ensure_nchw(images.float())
+    preds = _ensure_nchw(renders.float())
+    mask = masks.unsqueeze(1).float()
+
+    # Kornia returns per-channel SSIM; average across channels before masking
+    ssim_map = kornia.metrics.ssim(preds, target, window_size=11, max_val=1.0)
+    ssim_map = ssim_map.mean(1, keepdim=True)
+
+    # Reduce over the masked region for each batch element
+    numerator = (ssim_map * mask).sum(dim=(2, 3))
+    mask_sum = _mask_sums(mask)
+    safe_mask_sum = mask_sum.clamp_min(1e-6)
+    result = numerator / safe_mask_sum
+    result = torch.where(mask_sum < 1e-5, torch.zeros_like(result), result)
+    return result.squeeze(1)
+
+
+def psnr(images: torch.Tensor, masks: torch.Tensor, renders: torch.Tensor, max_val: float = 1.0) -> torch.Tensor:
+    """Masked PSNR per sample.
+
+    Args:
+        images: [B,H,W,C] ground truth images in [0,1] 
+        masks: [B,H,W] binary masks in [0,1]
+        renders: [B,H,W,C] rendered images in [0,1]
+
+    Returns:
+        psnr_vals: [B] masked PSNR values 
+    """
+    target = images.float()
+    preds = renders.float()
+    mask = masks.unsqueeze(-1).float()
+
+    diff2 = (preds - target) ** 2
+    masked_diff2 = diff2 * mask
+    # Compute masked MSE then convert to PSNR
+    numerator = masked_diff2.sum(dim=(1, 2, 3))
+    denom = mask.sum(dim=(1, 2, 3))
+    safe_denom = denom.clamp_min(1e-6)
+    mse = numerator / safe_denom
+    mse = mse.clamp_min(1e-12)
+    psnr_vals = 10.0 * torch.log10((max_val ** 2) / mse)
+    psnr_vals = torch.where(denom < 1e-5, torch.zeros_like(psnr_vals), psnr_vals)
+    return psnr_vals
+
+
+def lpips(images: torch.Tensor, masks: torch.Tensor, renders: torch.Tensor) -> torch.Tensor:
+    """Masked spatial LPIPS per sample using pyiqa.
+
+
+    Args:
+        images: [B,H,W,C] ground truth images in [0,1] 
+        masks: [B,H,W] binary masks in [0,1]
+        renders: [B,H,W,C] rendered images in [0,1]
+    Returns:
+        lpips_vals: [B] masked LPIPS values 
+    """
+    target = _ensure_nchw(images.float()).clamp(0.0, 1.0)
+    preds = _ensure_nchw(renders.float()).clamp(0.0, 1.0)
+    mask = masks.unsqueeze(1).float()
+
+    net = _get_lpips_net(preds.device)
+    with torch.no_grad():
+        dmap = net(preds, target)
+
+    # Match mask resolution to the LPIPS map and average within the mask
+    if dmap.shape[-2:] != mask.shape[-2:]:
+        mask_resized = F.interpolate(mask, size=dmap.shape[-2:], mode="nearest")
+    else:
+        mask_resized = mask
+
+    numerator = (dmap * mask_resized).sum(dim=(1, 2, 3))
+    denom = mask_resized.sum(dim=(1, 2, 3))
+    safe_denom = denom.clamp_min(1e-6)
+    lpips_vals = numerator / safe_denom
+    lpips_vals = torch.where(denom < 1e-5, torch.zeros_like(lpips_vals), lpips_vals)
+    return lpips_vals
+
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -104,7 +211,7 @@ class FrameMaskDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
-import math
+
 
 def extr_to_w2c_4x4(extr: torch.Tensor, device) -> torch.Tensor:
     w2c = torch.eye(4, device=device, dtype=torch.float32)
@@ -244,856 +351,6 @@ def depth_to_color(
     return (cm.magma(norm)[..., :3] * 255).astype(np.uint8)
 
 
-def _ensure_nchw(t: torch.Tensor) -> torch.Tensor:
-    return t.permute(0, 3, 1, 2).contiguous()
-
-
-def smplx_base_vertices_in_camera(
-    smplx_model,
-    smplx_params: dict,
-    pid: int,
-    frame_idx: int,
-    c2w: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """
-    Compute base (non-upsampled) SMPL-X vertices in camera coordinates for a given person and frame.
-    Returns: [V_base, 3] or None on failure.
-    """
-    try:
-        def _pad_or_truncate(t: torch.Tensor, target_dim: int | None, label: str) -> torch.Tensor:
-            if target_dim is None:
-                return t
-            cur = t.shape[-1]
-            if cur == target_dim:
-                return t
-            if cur > target_dim:
-                print(f"[DEBUG] Truncating {label} from {cur} to {target_dim}")
-                return t[..., :target_dim]
-            pad = torch.zeros(*t.shape[:-1], target_dim - cur, device=t.device, dtype=t.dtype)
-            return torch.cat([t, pad], dim=-1)
-
-        layer = getattr(smplx_model, "smplx_layer", None)
-        if layer is None and hasattr(smplx_model, "layer"):
-            layer = smplx_model.layer.get("neutral", None)
-        if layer is None:
-            raise AttributeError("SMPLX model has no base smplx_layer")
-        layer = layer.to(device)
-
-        expected_beta_dim = getattr(layer, "num_betas", None)
-        if expected_beta_dim is None and hasattr(layer, "shapedirs"):
-            try:
-                expected_beta_dim = int(layer.shapedirs.shape[-1])
-            except Exception:
-                expected_beta_dim = None
-        expected_expr_dim = getattr(layer, "num_expression_coeffs", None)
-        if expected_expr_dim is None and hasattr(layer, "expr_dirs"):
-            try:
-                expected_expr_dim = int(layer.expr_dirs.shape[-1])
-            except Exception:
-                expected_expr_dim = None
-
-        params = {
-            "global_orient": smplx_params["root_pose"][pid : pid + 1, frame_idx],
-            "body_pose": smplx_params["body_pose"][pid : pid + 1, frame_idx],
-            "jaw_pose": smplx_params["jaw_pose"][pid : pid + 1, frame_idx],
-            "leye_pose": smplx_params["leye_pose"][pid : pid + 1, frame_idx],
-            "reye_pose": smplx_params["reye_pose"][pid : pid + 1, frame_idx],
-            "left_hand_pose": smplx_params["lhand_pose"][pid : pid + 1, frame_idx],
-            "right_hand_pose": smplx_params["rhand_pose"][pid : pid + 1, frame_idx],
-            "betas": _pad_or_truncate(smplx_params["betas"][pid : pid + 1], expected_beta_dim, "betas"),
-            "transl": smplx_params["trans"][pid : pid + 1, frame_idx],
-        }
-        if "expr" in smplx_params:
-            expr = smplx_params["expr"][pid : pid + 1, frame_idx]
-            params["expression"] = _pad_or_truncate(expr, expected_expr_dim, "expr")
-        output = layer(**{k: v.to(device) for k, v in params.items()})
-        verts_world = output.vertices  # [1, V, 3]
-        w2c = torch.inverse(c2w).to(device)
-        homo = torch.cat([verts_world, torch.ones_like(verts_world[..., :1])], dim=-1)  # [1,V,4]
-        cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[0, :, :3]  # [V,3]
-        return cam
-    except Exception as e:
-        print(f"[DEBUG] Could not compute base SMPL-X verts in camera: {e}")
-        return None
-
-
-SMPLX_BODY_TO_SMPL = list(range(22))
-LEFT_PALM_IDS = [25, 28, 34, 31, 37]
-RIGHT_PALM_IDS = [40, 43, 49, 46, 52]
-
-# Optional: paths to SMPLX→SMPL transfer and SMPL joint regressor
-SMPLX2SMPL_TRANSFER_PATH = Path("/scratch/izar/cizinsky/pretrained/smplx2smpl.pkl")
-SMPL_JOINT_REGRESSOR_PATH = Path("/home/cizinsky/body_models/smpl/SMPL_NEUTRAL.pkl")
-
-_SMPL_REGRESSOR_CACHE: torch.Tensor | None = None
-_SMPLX2SMPL_TRANSFER_CACHE: torch.Tensor | None = None
-_WARNED_TRANSFER_SHAPE: bool = False
-_SMPL_FACE_CACHE: np.ndarray | None = None
-
-
-def _load_smpl_regressor() -> torch.Tensor | None:
-    global _SMPL_REGRESSOR_CACHE
-    if _SMPL_REGRESSOR_CACHE is not None:
-        return _SMPL_REGRESSOR_CACHE
-    try:
-        import pickle
-        with open(SMPL_JOINT_REGRESSOR_PATH, "rb") as f:
-            data = pickle.load(f, encoding="latin1")
-        J = data.get("J_regressor", None)
-        if J is None:
-            return None
-        if hasattr(J, "toarray"):
-            J = J.toarray()
-        J_torch = torch.from_numpy(J).float()  # [24, 6890]
-        _SMPL_REGRESSOR_CACHE = J_torch
-        return J_torch
-    except Exception as e:
-        print(f"[WARN] Could not load SMPL joint regressor: {e}")
-        return None
-
-
-def _load_smplx2smpl_transfer() -> torch.Tensor | None:
-    global _SMPLX2SMPL_TRANSFER_CACHE
-    if _SMPLX2SMPL_TRANSFER_CACHE is not None:
-        return _SMPLX2SMPL_TRANSFER_CACHE
-    try:
-        import pickle
-        with open(SMPLX2SMPL_TRANSFER_PATH, "rb") as f:
-            data = pickle.load(f, encoding="latin1")
-        mat = data.get("matrix", None)  # expected [6890, 10475]
-        if mat is None:
-            return None
-        mat_torch = torch.from_numpy(mat).float()
-        _SMPLX2SMPL_TRANSFER_CACHE = mat_torch
-        return mat_torch
-    except Exception as e:
-        print(f"[WARN] Could not load SMPLX→SMPL transfer: {e}")
-        return None
-
-
-def _load_smpl_faces() -> np.ndarray | None:
-    global _SMPL_FACE_CACHE
-    if _SMPL_FACE_CACHE is not None:
-        return _SMPL_FACE_CACHE
-    try:
-        import pickle
-        with open(SMPL_JOINT_REGRESSOR_PATH, "rb") as f:
-            data = pickle.load(f, encoding="latin1")
-        faces = data.get("f", None)
-        if faces is None:
-            return None
-        faces = np.asarray(faces, dtype=np.int64)
-        _SMPL_FACE_CACHE = faces
-        return faces
-    except Exception as e:
-        print(f"[WARN] Could not load SMPL faces: {e}")
-        return None
-
-
-def smplx_to_smpl(joints55: torch.Tensor | None, smplx_vertices: torch.Tensor | None = None) -> torch.Tensor:
-    """
-    Convert SMPL-X joints [...,55,3] to SMPL 24-joint layout by copying body joints
-    and averaging finger bases for the hand markers.
-    If SMPL-X vertices and the SMPL joint regressor + transfer are available,
-    regress SMPL joints from SMPL vertices for higher fidelity.
-    """
-    # Robust path: regress from vertices if possible
-    if smplx_vertices is not None:
-        reg = _load_smpl_regressor()
-        transfer = _load_smplx2smpl_transfer()
-        if reg is not None and transfer is not None:
-            try:
-                global _WARNED_TRANSFER_SHAPE
-                if smplx_vertices.shape[-2] != transfer.shape[1]:
-                    if not _WARNED_TRANSFER_SHAPE:
-                        print(
-                            f"[WARN] SMPLX verts ({smplx_vertices.shape[-2]}) != transfer cols ({transfer.shape[1]}), "
-                            "skipping regressed SMPL joints."
-                        )
-                        _WARNED_TRANSFER_SHAPE = True
-                    raise ValueError("transfer/verts shape mismatch")
-                # transfer: [6890, 10475], smplx_vertices: [..., 10475, 3]
-
-                smpl_vertices = torch.einsum(
-                    "nv,...vc->...nc",
-                    transfer.to(smplx_vertices.device, smplx_vertices.dtype),
-                    smplx_vertices,
-                )  # [..., 6890, 3]
-                smpl_joints = torch.einsum(
-                    "jn,...nc->...jc",
-                    reg.to(smpl_vertices.device, smpl_vertices.dtype),
-                    smpl_vertices,
-                )  # [..., 24, 3]
-                return smpl_joints
-            except Exception as e:
-                print(f"[WARN] Falling back to heuristic SMPLX→SMPL joints: {e}")
-
-    # Heuristic fallback (fast, no verts)
-    if joints55 is None:
-        raise ValueError("joints55 is required when SMPL-X vertices are not provided.")
-    body = joints55[..., SMPLX_BODY_TO_SMPL, :]  # [...,22,3]
-    l_hand = joints55[..., LEFT_PALM_IDS, :].mean(dim=-2, keepdim=True)
-    r_hand = joints55[..., RIGHT_PALM_IDS, :].mean(dim=-2, keepdim=True)
-    return torch.cat([body, l_hand, r_hand], dim=-2)  # [...,24,3]
-
-def similarity_transform_3D(src, dst):
-    """
-    Compute the rotation R and translation t that aligns src to dst
-    such that dst ≈ src @ R.T + t
-
-    src, dst: (N, 3) arrays of corresponding 3D points
-    returns: s, R (3x3), t (3,), avg_reproj_error
-    """
-    src = np.asarray(src)
-    dst = np.asarray(dst)
-    assert src.shape == dst.shape
-    assert src.shape[1] == 3
-
-    # 1. Compute centroids
-    centroid_src = src.mean(axis=0)
-    centroid_dst = dst.mean(axis=0)
-
-    # 2. Center the points
-    src_centered = src - centroid_src
-    dst_centered = dst - centroid_dst
-
-    # 3. Compute covariance matrix
-    H = src_centered.T @ dst_centered  # (3x3)
-
-    # 4. SVD
-    U, S, Vt = np.linalg.svd(H)
-
-    # 5. Compute rotation
-    R = Vt.T @ U.T
-
-    # Reflection correction (ensure det(R) = +1)
-    if np.linalg.det(R) < 0:
-        Vt[2, :] *= -1
-        R = Vt.T @ U.T
-
-    # 6. Compute scale
-    var_src = np.sum(np.sum(src_centered**2, axis=1))
-    s = np.sum(S) / var_src
-
-    # 7. Compute translation
-    t = centroid_dst - s*(centroid_src @ R.T)  
-
-    # 8. compute reprojection error per point
-    avg_reproj_error = 0.0
-    for i in range(src.shape[0]):
-        src_pt = src[i]
-        dst_pt = dst[i]
-        src_transformed = s * (R @ src_pt) + t
-        error = np.linalg.norm(dst_pt - src_transformed)
-        avg_reproj_error += error
-    
-    avg_reproj_error *= 1.0 / src.shape[0] 
-    return s, R, t.squeeze(), avg_reproj_error
-
-def compute_S_M2W_from_joints(pred_smpl_joints, gt_smpl_joints, joint_indices=None):
-    """
-    pred_smpl_joints: (F, P, J, 3) - Multi-HMR joints in M-frame
-    gt_smpl_joints:   (F, P, J, 3) - GT joints in W-frame
-    joint_indices: list/array of joint indices to use (in SMPL joint space).
-                   If None, use a default core-body set.
-    
-    Returns:
-        S_M2W: (4, 4) similarity transform matrix mapping M-frame -> W-frame
-        s:     scalar scale
-        R:     (3,3) rotation
-        t:     (3,) translation
-        avg_reproj_error: float
-    """
-    pred_smpl_joints = np.asarray(pred_smpl_joints.cpu())
-    gt_smpl_joints   = np.asarray(gt_smpl_joints.cpu())
-    assert pred_smpl_joints.shape == gt_smpl_joints.shape
-    assert pred_smpl_joints.shape[-1] == 3
-
-    F, P, J, _ = pred_smpl_joints.shape
-
-    # Default: core body joints (example indices; adjust to your SMPL convention)
-    # Here: 0 pelvis, 1 l_hip, 2 r_hip, 3 spine, 4 l_knee, 5 r_knee,
-    #       6 spine1, 9 l_shoulder, 12 r_shoulder, 16 l_elbow, 17 r_elbow
-    if joint_indices is None:
-        joint_indices = [0, 1, 2, 3, 4, 5, 6, 9, 12, 16, 17]
-
-    joint_indices = np.asarray(joint_indices, dtype=int)
-
-    # Select joints
-    pred_sel = pred_smpl_joints[:, :, :, :]  # (F, P, K, 3)
-    gt_sel   = gt_smpl_joints[:, :, :, :]    # (F, P, K, 3)
-
-    # Flatten over frames and people and joints -> (N, 3)
-    pred_flat = pred_sel.reshape(-1, 3)
-    gt_flat   = gt_sel.reshape(-1, 3)
-
-    # Optionally: remove NaNs / infs
-    valid_mask = np.isfinite(pred_flat).all(axis=1) & np.isfinite(gt_flat).all(axis=1)
-    pred_flat = pred_flat[valid_mask]
-    gt_flat   = gt_flat[valid_mask]
-
-    # Compute similarity transform: pred (src, M-frame) -> gt (dst, W-frame)
-    s, R, t, avg_err = similarity_transform_3D(pred_flat, gt_flat)
-
-    # Build 4x4 S_M2W
-    S_M2W = np.eye(4, dtype=np.float64)
-    S_M2W[:3, :3] = s * R
-    S_M2W[:3, 3]  = t
-
-    return S_M2W, s, R, t, avg_err
-
-
-def smplx_joints_in_camera(
-    smplx_model,
-    smplx_params: dict,
-    pid: int,
-    frame_idx: int,
-    c2w: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """
-    Compute SMPL-X joints (55) in camera coordinates for a given person and frame.
-    Returns: [N, 3] or None on failure.
-    """
-
-    smpl_slice = {
-        "betas": smplx_params["betas"][pid : pid + 1],
-        "root_pose": smplx_params["root_pose"][pid : pid + 1, frame_idx],
-        "body_pose": smplx_params["body_pose"][pid : pid + 1, frame_idx],
-        "jaw_pose": smplx_params["jaw_pose"][pid : pid + 1, frame_idx],
-        "leye_pose": smplx_params["leye_pose"][pid : pid + 1, frame_idx],
-        "reye_pose": smplx_params["reye_pose"][pid : pid + 1, frame_idx],
-        "lhand_pose": smplx_params["lhand_pose"][pid : pid + 1, frame_idx],
-        "rhand_pose": smplx_params["rhand_pose"][pid : pid + 1, frame_idx],
-        "trans": smplx_params["trans"][pid : pid + 1, frame_idx],
-        "transform_mat_neutral_pose": smplx_params["transform_mat_neutral_pose"][pid : pid + 1],
-    }
-    if "expr" in smplx_params:
-        smpl_slice["expr"] = smplx_params["expr"][pid : pid + 1, frame_idx]
-    for opt_key in ("face_offset", "joint_offset", "locator_offset"):
-        if opt_key in smplx_params:
-            smpl_slice[opt_key] = smplx_params[opt_key][pid : pid + 1]
-
-    # Drop any time dimension from betas (should be [1, num_betas])
-    if smpl_slice["betas"].dim() > 2:
-        smpl_slice["betas"] = smpl_slice["betas"][:, 0]
-
-    joint_zero = smplx_model.get_zero_pose_human(
-        shape_param=smpl_slice["betas"],
-        device=device,
-        face_offset=smpl_slice.get("face_offset", None),
-        joint_offset=smpl_slice.get("joint_offset", None),
-        return_mesh=False,
-    )
-    _, posed_joints = smplx_model.get_transform_mat_joint(
-        smpl_slice["transform_mat_neutral_pose"], joint_zero, smpl_slice
-    )
-    joints_world = posed_joints + smpl_slice["trans"]  # [1,55,3]
-    w2c = torch.inverse(c2w).to(device)
-    homo = torch.cat([joints_world, torch.ones_like(joints_world[..., :1])], dim=-1)  # [1,55,4]
-    cam = (w2c @ homo.transpose(1, 2)).transpose(1, 2)[0, :, :3]  # [55,3]
-    return cam
-
-
-def load_gt_smpl_joints_cam(
-    smpl_dir: Path,
-    frame_path: str | Path,
-    person_idx: int,
-    c2w: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """
-    Load GT SMPL joints (24) for a given frame/person and return camera-space joints [24,3].
-    c2w: [4,4] camera-to-world (will be inverted internally).
-    """
-    try:
-        stem = Path(frame_path).stem
-        npz_path = smpl_dir / f"{stem}.npz"
-        if not npz_path.exists():
-            return None
-        data = np.load(npz_path)
-        joints_np = data["joints_3d"]  # [P,24,3]
-        if person_idx >= joints_np.shape[0]:
-            return None
-        joints = torch.from_numpy(joints_np[person_idx]).to(device=device, dtype=torch.float32)  # [24,3]
-        w2c = torch.inverse(c2w.to(device))
-        homo = torch.cat([joints, torch.ones_like(joints[:, :1])], dim=-1)  # [24,4]
-        cam = (w2c @ homo.transpose(0, 1)).transpose(0, 1)[..., :3]  # [24,3]
-        return cam
-    except Exception as e:
-        print(f"[DEBUG] Could not load GT SMPL joints cam for {frame_path}: {e}")
-        return None
-
-
-
-def overlay_smpl_joints(
-        images: torch.Tensor,
-        joints: torch.Tensor,
-        intrs: torch.Tensor,
-        joint_radius: int = 3,
-        color: torch.Tensor = torch.tensor([0.0, 1.0, 0.0]),
-        device: torch.device = torch.device("cpu"),
-):
-
-    updated = []
-    F, P = joints.shape[0], joints.shape[1]
-    color = color.to(device)
-    intr = intrs[:3, :3].to(device)
-
-    for fi in range(F):
-        gt_img = images[fi].clone()
-        H, W = gt_img.shape[0], gt_img.shape[1]
-
-        for person_idx in range(P):
-            cam_joints = joints[fi, person_idx]
-
-            cam_z = cam_joints[:, 2].clamp(min=1e-6)
-            uvx = (intr[0, 0] * cam_joints[:, 0] + intr[0, 2] * cam_z) / cam_z
-            uvy = (intr[1, 1] * cam_joints[:, 1] + intr[1, 2] * cam_z) / cam_z
-            u = uvx.round().long()
-            v = uvy.round().long()
-            body_joint_ids = list(range(min(24, u.shape[0])))  # SMPL has 24 body joints
-            for ui, vi in zip(u[body_joint_ids].tolist(), v[body_joint_ids].tolist()):
-                if 0 <= ui < W and 0 <= vi < H:
-                    v0 = max(vi - joint_radius, 0)
-                    v1 = min(vi + joint_radius + 1, H)
-                    u0 = max(ui - joint_radius, 0)
-                    u1 = min(ui + joint_radius + 1, W)
-                    gt_img[v0:v1, u0:u1, :] = color
-
-        updated.append(gt_img)
-
-    return torch.stack(updated, dim=0)
-
-
-def overlay_smplx_mesh_pyrender(
-    images: torch.Tensor,
-    smplx_params: dict,
-    smplx_model,
-    intr: torch.Tensor,
-    c2w: torch.Tensor,
-    device: torch.device,
-    mesh_color: Tuple[float, float, float] = (0.0, 1.0, 0.0),
-    mesh_alpha: float = 0.7,
-) -> torch.Tensor:
-    """
-    Render SMPL-X meshes with trimesh+pyrender and alpha-blend them over images.
-
-    images: [F, H, W, 3] float in [0,1]
-    smplx_params: dict with shapes [P, F, ...]
-    intr: [3,3] or [4,4] intrinsics
-    c2w: [4,4] camera-to-world
-    mesh_color: RGB in [0,1]; mesh_alpha: opacity for the mesh layer
-    """
-    try:
-        import pyrender
-        import trimesh
-    except Exception as e:
-        print(f"[WARN] pyrender/trimesh unavailable for mesh overlay: {e}")
-        return images
-
-    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-
-    layer = getattr(smplx_model, "smplx_layer", None)
-    if layer is None and hasattr(smplx_model, "layer"):
-        layer = smplx_model.layer.get("neutral", None)
-    faces = getattr(layer, "faces", None) if layer is not None else None
-    if faces is None:
-        print("[WARN] SMPL-X faces not found, skipping mesh overlay.")
-        return images
-    faces_np = np.asarray(faces, dtype=np.int64)
-
-    intr_cpu = intr.detach().cpu()
-    if intr_cpu.shape[-2:] == (4, 4):
-        intr_cpu = intr_cpu[:3, :3]
-    fx, fy, cx, cy = (
-        float(intr_cpu[0, 0]),
-        float(intr_cpu[1, 1]),
-        float(intr_cpu[0, 2]),
-        float(intr_cpu[1, 2]),
-    )
-
-    num_frames = images.shape[0]
-    num_people = smplx_params["betas"].shape[0]
-    H, W = images.shape[1], images.shape[2]
-
-    try:
-        renderer = pyrender.OffscreenRenderer(viewport_width=W, viewport_height=H)
-    except Exception as e:
-        print(f"[WARN] Could not initialise pyrender renderer: {e}")
-        return images
-
-    out_frames: List[torch.Tensor] = []
-    try:
-        for fi in range(num_frames):
-            base_img = (images[fi].detach().cpu().numpy() * 255).astype(np.uint8)
-            depth_map = np.ones((H, W)) * np.inf
-            overlay_img = base_img.astype(np.float32)
-
-            for pid in range(num_people):
-                cam_verts = smplx_base_vertices_in_camera(
-                    smplx_model, smplx_params, pid, fi, c2w, device
-                )
-                if cam_verts is None:
-                    continue
-                verts_np = cam_verts.detach().cpu().numpy()
-
-                material = pyrender.MetallicRoughnessMaterial(
-                    metallicFactor=0.2,
-                    alphaMode="BLEND",
-                    baseColorFactor=[
-                        float(mesh_color[0]),
-                        float(mesh_color[1]),
-                        float(mesh_color[2]),
-                        float(mesh_alpha),
-                    ],
-                )
-                mesh = trimesh.Trimesh(verts_np, faces_np, process=False)
-                rot = trimesh.transformations.rotation_matrix(np.radians(180), [1, 0, 0])
-                mesh.apply_transform(rot)
-                mesh = pyrender.Mesh.from_trimesh(mesh, material=material, smooth=False)
-
-                scene = pyrender.Scene(
-                    bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=(0.5, 0.5, 0.5)
-                )
-                scene.add(mesh, "mesh")
-                camera = pyrender.IntrinsicsCamera(fx=fx, fy=fy, cx=cx, cy=cy, zfar=1e4)
-                scene.add(camera, pose=np.eye(4))
-                light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.5)
-                scene.add(light, pose=np.eye(4))
-
-                color, rend_depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
-                valid_mask = (rend_depth < depth_map) & (rend_depth > 0)
-                depth_map[valid_mask] = rend_depth[valid_mask]
-                valid_mask = valid_mask[..., None]
-                overlay_img = valid_mask * color[..., :3] + (1.0 - valid_mask) * overlay_img
-
-            overlay_tensor = (
-                torch.from_numpy(overlay_img).to(device=images.device, dtype=images.dtype) / 255.0
-            )
-            out_frames.append(overlay_tensor)
-    finally:
-        renderer.delete()
-
-    return torch.stack(out_frames, dim=0)
-
-
-def overlay_smpl_mesh_pyrender(
-    images: torch.Tensor,
-    smpl_verts_world: torch.Tensor,
-    intr: torch.Tensor,
-    c2w: torch.Tensor,
-    device: torch.device,
-    mesh_color: Tuple[float, float, float] = (0.0, 0.5, 1.0),
-    mesh_alpha: float = 0.7,
-) -> torch.Tensor:
-    """
-    Render SMPL meshes (world-space verts) with trimesh+pyrender and alpha-blend them over images.
-
-    images: [F, H, W, 3] float in [0,1]
-    smpl_verts_world: [F, P, V, 3] world-space vertices
-    intr: [3,3] or [4,4] intrinsics
-    c2w: [4,4] camera-to-world
-    """
-    faces = _load_smpl_faces()
-    if faces is None:
-        print("[WARN] SMPL faces not available, skipping SMPL overlay.")
-        return images
-
-    try:
-        import pyrender
-        import trimesh
-    except Exception as e:
-        print(f"[WARN] pyrender/trimesh unavailable for SMPL overlay: {e}")
-        return images
-
-    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-
-    intr_cpu = intr.detach().cpu()
-    if intr_cpu.shape[-2:] == (4, 4):
-        intr_cpu = intr_cpu[:3, :3]
-    fx, fy, cx, cy = (
-        float(intr_cpu[0, 0]),
-        float(intr_cpu[1, 1]),
-        float(intr_cpu[0, 2]),
-        float(intr_cpu[1, 2]),
-    )
-
-    num_frames = images.shape[0]
-    num_people = smpl_verts_world.shape[1]
-    H, W = images.shape[1], images.shape[2]
-    w2c = torch.inverse(c2w.to(device))  # [4,4]
-
-    try:
-        renderer = pyrender.OffscreenRenderer(viewport_width=W, viewport_height=H)
-    except Exception as e:
-        print(f"[WARN] Could not initialise pyrender renderer for SMPL overlay: {e}")
-        return images
-
-    out_frames: List[torch.Tensor] = []
-    try:
-        for fi in range(num_frames):
-            base_img = (images[fi].detach().cpu().numpy() * 255).astype(np.uint8)
-            depth_map = np.ones((H, W)) * np.inf
-            overlay_img = base_img.astype(np.float32)
-
-            for pid in range(num_people):
-                verts_w = smpl_verts_world[fi, pid].to(device=device)
-                if verts_w.numel() == 0:
-                    continue
-                homo = torch.cat([verts_w, torch.ones_like(verts_w[:, :1])], dim=-1)  # [V,4]
-                cam = (w2c @ homo.t()).t()[:, :3]
-                verts_np = cam.detach().cpu().numpy()
-
-                material = pyrender.MetallicRoughnessMaterial(
-                    metallicFactor=0.2,
-                    alphaMode="BLEND",
-                    baseColorFactor=[
-                        float(mesh_color[0]),
-                        float(mesh_color[1]),
-                        float(mesh_color[2]),
-                        float(mesh_alpha),
-                    ],
-                )
-                mesh = trimesh.Trimesh(verts_np, faces, process=False)
-                rot = trimesh.transformations.rotation_matrix(np.radians(180), [1, 0, 0])
-                mesh.apply_transform(rot)
-                mesh = pyrender.Mesh.from_trimesh(mesh, material=material, smooth=False)
-
-                scene = pyrender.Scene(
-                    bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=(0.5, 0.5, 0.5)
-                )
-                scene.add(mesh, "mesh")
-                camera = pyrender.IntrinsicsCamera(fx=fx, fy=fy, cx=cx, cy=cy, zfar=1e4)
-                scene.add(camera, pose=np.eye(4))
-                light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.5)
-                scene.add(light, pose=np.eye(4))
-
-                color, rend_depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
-                valid_mask = (rend_depth < depth_map) & (rend_depth > 0)
-                depth_map[valid_mask] = rend_depth[valid_mask]
-                valid_mask = valid_mask[..., None]
-                overlay_img = valid_mask * color[..., :3] + (1.0 - valid_mask) * overlay_img
-
-            overlay_tensor = (
-                torch.from_numpy(overlay_img).to(device=images.device, dtype=images.dtype) / 255.0
-            )
-            out_frames.append(overlay_tensor)
-    finally:
-        renderer.delete()
-
-    return torch.stack(out_frames, dim=0)
-
-
-def preload_gt_smpl_joints_camera_space(
-    frame_paths: List[str | Path],
-    smpl_dir: Path,
-    c2w: torch.Tensor,
-    num_persons: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Load GT SMPL joints from npz and transform to camera space for the first `preload_frames` frames.
-    Returns a tensor [F, P, 24, 3] 
-    """
-    smpl_joints = []
-    for fp in frame_paths:
-        per_person = []
-        for pid in range(num_persons):
-            cam_j = load_gt_smpl_joints_cam(smpl_dir, fp, pid, c2w, device)
-            per_person.append(cam_j)
-        smpl_joints.append(torch.stack(per_person, dim=0))
-
-    return torch.stack(smpl_joints, dim=0)
-
-
-def load_gt_smpl_joints_world(
-    smpl_dir: Path,
-    frame_path: str | Path,
-    person_idx: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """
-    Load GT SMPL joints (24) for a given frame/person in world space.
-    """
-    try:
-        stem = Path(frame_path).stem
-        npz_path = smpl_dir / f"{stem}.npz"
-        if not npz_path.exists():
-            return None
-        data = np.load(npz_path)
-        joints_np = data["joints_3d"]  # [P,24,3]
-        if person_idx >= joints_np.shape[0]:
-            return None
-        joints = torch.from_numpy(joints_np[person_idx]).to(device=device, dtype=torch.float32)  # [24,3]
-        return joints
-    except Exception as e:
-        print(f"[DEBUG] Could not load GT SMPL joints world for {frame_path}: {e}")
-        return None
-
-
-def load_gt_smpl_verts_world_batch(
-    frame_paths: List[str | Path],
-    smpl_dir: Path,
-    num_persons: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """
-    Load GT SMPL verts (world space) for each frame. Returns [F, P, V, 3] or None if unavailable.
-    """
-    verts_list = []
-    for fp in frame_paths:
-        try:
-            stem = Path(fp).stem
-            npz_path = smpl_dir / f"{stem}.npz"
-            if not npz_path.exists():
-                return None
-            data = np.load(npz_path)
-            verts_np = data.get("verts", None)
-            if verts_np is None:
-                return None
-            verts_t = torch.from_numpy(verts_np).float().to(device)  # [P,6890,3]
-            if verts_t.shape[0] < num_persons:
-                pad = torch.zeros(
-                    (num_persons - verts_t.shape[0], verts_t.shape[1], 3),
-                    device=device,
-                    dtype=verts_t.dtype,
-                )
-                verts_t = torch.cat([verts_t, pad], dim=0)
-            else:
-                verts_t = verts_t[:num_persons]
-            verts_list.append(verts_t)
-        except Exception as e:
-            print(f"[DEBUG] Could not load GT SMPL verts for {fp}: {e}")
-            return None
-
-    return torch.stack(verts_list, dim=0) if verts_list else None
-
-
-def preload_gt_smpl_joints_world(
-    frame_paths: List[str | Path],
-    smpl_dir: Path,
-    num_persons: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Load GT SMPL joints from npz in world space for the provided frames.
-    Returns a tensor [F, P, 24, 3]
-    """
-    smpl_joints = []
-    for fp in frame_paths:
-        per_person = []
-        for pid in range(num_persons):
-            joints_w = load_gt_smpl_joints_world(smpl_dir, fp, pid, device)
-            if joints_w is None:
-                joints_w = torch.zeros(24, 3, device=device)
-            per_person.append(joints_w)
-        smpl_joints.append(torch.stack(per_person, dim=0))
-
-    return torch.stack(smpl_joints, dim=0)
-
-
-def load_smplx_joints_camera_space(
-    smplx_model,
-    smplx_params,
-    num_persons,
-    n_frames,
-    c2w_proj,
-    device,
-):
-
-    smplx_result = []
-    for fid in range(n_frames):
-        smplx_per_frame = []
-        for pid in range(num_persons):
-            joints_cam = smplx_joints_in_camera(
-                smplx_model, smplx_params, pid, fid, c2w_proj, device
-            ) # [55, 3]
-            smplx_per_frame.append(joints_cam)
-        smplx_result.append(torch.stack(smplx_per_frame, dim=0)) 
-
-    return torch.stack(smplx_result, dim=0)
-
-
-def preload_pred_smplx_joints_world(
-    smplx_model,
-    smplx_params,
-    num_persons,
-    n_frames,
-    device,
-    use_regressed: bool = False,
-):
-    """
-    Convenience loader to get posed SMPL-X joints in model/world frame (no camera applied).
-    Returns [F, P, 55, 3] and, if use_regressed=True, also [F, P, 24, 3].
-    """
-    smplx_result = []
-    smpl_result = []
-    eye_c2w = torch.eye(4, device=device, dtype=torch.float32)
-    for fid in range(n_frames):
-        smplx_per_person = []
-        smpl_per_person = []
-        for pid in range(num_persons):
-            joints_world = smplx_joints_in_camera(
-                smplx_model, smplx_params, pid, fid, eye_c2w, device
-            )
-            smplx_per_person.append(joints_world)
-            if use_regressed:
-                verts_world = smplx_base_vertices_in_camera(
-                    smplx_model, smplx_params, pid, fid, eye_c2w, device
-                )
-                smpl_world = smplx_to_smpl(
-                    joints_world, smplx_vertices=verts_world.unsqueeze(0) if verts_world is not None else None
-                )
-                if smpl_world.dim() > 2 and smpl_world.shape[0] == 1:
-                    smpl_world = smpl_world.squeeze(0)
-                smpl_per_person.append(smpl_world)
-        smplx_result.append(torch.stack(smplx_per_person, dim=0))
-        if use_regressed:
-            smpl_result.append(torch.stack(smpl_per_person, dim=0))
-
-    if use_regressed:
-        return torch.stack(smplx_result, dim=0), torch.stack(smpl_result, dim=0)
-    return torch.stack(smplx_result, dim=0)
-
-
-def compute_s_w2m(
-    smplx_model,
-    smplx_params_pred,
-    frame_paths,
-    gt_smplx_params,
-    num_persons,
-    device,
-    use_sim,
-):
-    """
-    Compute similarity transform using SMPL-X joints (55) in world frame.
-    """
-    if use_sim and gt_smplx_params is not None:
-        gt_joints_world = preload_pred_smplx_joints_world(
-            smplx_model, gt_smplx_params, num_persons, len(frame_paths), device
-        )  # [F,P,55,3]
-        pred_joints_world = preload_pred_smplx_joints_world(
-            smplx_model, smplx_params_pred, num_persons, len(frame_paths), device
-        )  # [F,P,55,3]
-
-        S_M2W_np, s, R_np, t_np, err = compute_S_M2W_from_joints(
-            pred_joints_world,  # (F,P,55,3)
-            gt_joints_world,    # (F,P,55,3)
-        )
-
-        S_M2W = torch.from_numpy(S_M2W_np).to(device=device, dtype=torch.float32)
-        S_W2M = torch.linalg.inv(S_M2W)
-    else:
-        S_W2M = torch.eye(4, device=device, dtype=torch.float32)
-
-    return S_W2M
-
-
-# ---------------------------------------------------------------------------
-# Utility to make Gaussian params trainable
-# ---------------------------------------------------------------------------
 def enable_gaussian_grads(
     gauss: GaussianAppOutput,
     train_fields: Tuple[str, ...],
@@ -1135,10 +392,6 @@ class MultiHumanFinetuner(Inferrer):
         self.masks_dir = self.output_dir / "masks" / "union"
         self.depth_dir = self.output_dir / "depth_maps" / "raw"
 
-#        # clean this dir
-        #save_root = self.output_dir / "refined_scene_recon" / self.cfg.exp_name
-        #if save_root.exists():
-            #shutil.rmtree(save_root)
 
     # ---------------- Model / data loading ----------------
     def _build_model(self):
@@ -1685,7 +938,7 @@ class MultiHumanFinetuner(Inferrer):
         root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
         root_save_dir.mkdir(parents=True, exist_ok=True)
         num_tracks, num_frames = self.cfg.num_persons, self.cfg.batch_size
-        render_bg_colors_template = torch.zeros(
+        render_bg_colors_template = torch.ones(
             (num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32
         )  # black
         alpha_candidates = torch.tensor(
@@ -1817,16 +1070,23 @@ class MultiHumanFinetuner(Inferrer):
                     masks3 = masks
                     if masks3.shape[-1] == 1:
                         masks3 = masks3.repeat(1, 1, 1, 3)
-                    masked_render = comp_rgb # * masks3
-                    masked_gt = frames # * masks3
+                    render = comp_rgb 
+                    masked_gt = frames * masks3
+                    print(f"[DEBUG] Shape of render: {render.shape}, min / max render: {render.min().item()} / {render.max().item()}")
+                    print(f"[DEBUG] Shape of masked_gt: {masked_gt.shape}, min / max masked_gt: {masked_gt.min().item()} / {masked_gt.max().item()}")
+                    print(f"[DEBUG] Shape of masks3: {masks3.shape}, min / max masks3: {masks3.min().item()} / {masks3.max().item()}")
 
                     # Combine masked render and masked GT with overlay
-                    overlay = 0.5 * (masked_render + masked_gt)
-                    columns = [masked_render, masked_gt, overlay]
+                    overlay = render * 0.5 + masked_gt * 0.5
+                    columns = [render, masked_gt, overlay]
                     joined = torch.cat(columns, dim=2)  # side-by-side along width
                     for i in range(joined.shape[0]):
                         save_path = save_dir / Path(frame_paths[i]).name
                         save_image(joined[i].permute(2, 0, 1), str(save_path))
+                    
+                    # Compute metrics
+                    # lpips_vals = ...
+
 
         quit()
 
