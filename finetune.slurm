@@ -14,8 +14,7 @@ cd /home/cizinsky/LHM
 conda deactivate && conda activate lhm
 
 # --- Shared settings
-seq_name="hi4d_pair15_fight"
-num_persons=2
+
 
 # --- V1
 # exp_name="default"
@@ -49,6 +48,14 @@ num_persons=2
 # bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.4
 
 # --- V2
+seq_name="hi4d_pair00_fight"
+num_persons=2
 exp_name="dev"
-root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair15_1/pair15/fight15
-python LHM/finetune_multi_humans.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path
+root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair00_1/fight00
+python LHM/eval_multi_lhm.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path
+
+# seq_name="hi4d_pair15_fight"
+# num_persons=2
+# exp_name="dev"
+# root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair15_1/pair15/fight15
+# python LHM/finetune_multi_humans.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path
