@@ -1073,6 +1073,10 @@ class MultiHumanFinetuner(Inferrer):
                             mode="nearest",
                         ).permute(0, 2, 3, 1)
                         masks3 = masks.repeat(1, 1, 1, 3)
+                        frames = frames * masks3
+                        
+                        masks = torch.ones_like(masks)
+                        masks3 = masks.repeat(1, 1, 1, 3)
                     
                     # Save what goes into metrics computation for debugging
                     metrics_debug_dir = save_dir / "metrics_debug_inputs"
