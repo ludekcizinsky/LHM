@@ -751,11 +751,6 @@ class ModelHumanLRMSapdinoBodyHeadSD3_5(ModelHumanLRM):
         self,
         image,
         head_image,
-        source_c2ws,
-        source_intrs,
-        render_c2ws,
-        render_intrs,
-        render_bg_colors,
         smplx_params,
     ):
         assert len(smplx_params["betas"].shape) == 2

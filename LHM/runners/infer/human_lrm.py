@@ -738,9 +738,6 @@ class HumanLRMInferrer(Inferrer):
             need_mask=motion_img_need_mask,
             vis_motion=vis_motion,
         )
-#         motion_seq = prepare_motion_seqs_human3r(
-            # Path(motion_seqs_dir)
-        # )
         self.motion_dict[motion_name] = motion_seq
 
         # Save motion seq
@@ -763,11 +760,6 @@ class HumanLRMInferrer(Inferrer):
         gs_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
             image.unsqueeze(0).to(device, dtype),
             src_head_rgb.unsqueeze(0).to(device, dtype),
-            None,
-            None,
-            render_c2ws=motion_seq["render_c2ws"].to(device),
-            render_intrs=motion_seq["render_intrs"].to(device),
-            render_bg_colors=motion_seq["render_bg_colors"].to(device),
             smplx_params={
                 k: v.to(device) for k, v in smplx_params.items()
             },
