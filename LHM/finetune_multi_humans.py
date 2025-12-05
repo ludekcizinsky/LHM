@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 import copy
 from tqdm import tqdm
+import pandas as pd
 
 from omegaconf import DictConfig
 from hydra.core.global_hydra import GlobalHydra
@@ -192,10 +193,13 @@ class FrameMaskDataset(Dataset):
         arr = torch.from_numpy(np.array(img)).float() / 255.0
         return arr.to(self.device)
 
-    def _load_mask(self, path: Path) -> torch.Tensor:
-        mask = Image.open(path).convert("L")
-        arr = torch.from_numpy(np.array(mask)).float() / 255.0
-        return arr.unsqueeze(-1).to(self.device)
+    def _load_mask(self, path: Path, eps: float = 0.05) -> torch.Tensor:
+        arr = torch.from_numpy(np.array(Image.open(path))).float()  # HxWxC
+        if arr.shape[-1] == 4:
+            arr = arr[..., :3] # drop alpha
+        # Foreground is any pixel whose max channel exceeds eps*255
+        mask = (arr.max(dim=-1).values > eps * 255).float()  # HxW
+        return mask.to(self.device).unsqueeze(-1)  # HxWx1
 
     def __getitem__(self, idx: int):
         frame = self._load_img(self.frame_paths[idx])
@@ -211,7 +215,6 @@ class FrameMaskDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
-
 
 def extr_to_w2c_4x4(extr: torch.Tensor, device) -> torch.Tensor:
     w2c = torch.eye(4, device=device, dtype=torch.float32)
@@ -941,11 +944,11 @@ class MultiHumanFinetuner(Inferrer):
         render_bg_colors_template = torch.zeros(
             (num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32
         )  # black
-#        alpha_candidates = torch.tensor(
-            #[-0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0], device=self.tuner_device
-        #)
         alpha_candidates = torch.arange(-0.9, 1.1, 0.1, device=self.tuner_device)
         max_shift_m = 0.2
+
+        # Collector for metrics
+        metrics_all_cams_per_frame = list()
 
         for tgt_cam_id in target_camera_ids:
 
@@ -1003,7 +1006,7 @@ class MultiHumanFinetuner(Inferrer):
 
                     # Estimate translation offset between rendered and GT masks
                     delta_world = self._estimate_world_translation_offset(
-                        render_mask=res["comp_rgb"] > 0.5,
+                        render_mask=res["comp_rgb"] > 0.05,
                         gt_mask=masks,
                         intr=tgt_intr,
                         c2w=tgt_c2w,
@@ -1027,34 +1030,119 @@ class MultiHumanFinetuner(Inferrer):
                             render_bg_colors=render_bg_colors,
                             render_hw=(gt_h, gt_w),
                         )
-                        iou = self._mask_iou(cand_res["comp_rgb"] > 0.5, masks).mean()
+                        iou = self._mask_iou(cand_res["comp_rgb"] > 0.05, masks).mean()
                         if iou > best_iou:
-                            print(f"[DEBUG] Better IoU {iou:.4f} found at alpha {alpha:.2f}")
                             best_iou = iou
                             best_res = cand_res
                     res = best_res
 
                     # Save rendered images
-                    comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
+                    renders = res["comp_rgb"]  # [B, H, W, 3]
 
-                    # Apply masks to the rendered images and gt 
-                    masks3 = masks
-                    if masks3.shape[-1] == 1:
-                        masks3 = masks3.repeat(1, 1, 1, 3)
-                    render = comp_rgb 
+                    # Apply masks to the gt 
+                    masks3 = masks.repeat(1, 1, 1, 3)
                     masked_gt = frames * masks3
 
                     # Combine masked render and masked GT with overlay
-                    overlay = render * 0.5 + masked_gt * 0.5
-                    columns = [render, masked_gt, overlay]
+                    render_vs_gt_dir = save_dir / "render_vs_gt"
+                    render_vs_gt_dir.mkdir(parents=True, exist_ok=True)
+                    columns = [renders, masked_gt]
                     joined = torch.cat(columns, dim=2)  # side-by-side along width
                     for i in range(joined.shape[0]):
-                        save_path = save_dir / Path(frame_paths[i]).name
+                        save_path = render_vs_gt_dir / Path(frame_paths[i]).name
+                        save_image(joined[i].permute(2, 0, 1), str(save_path))
+
+                    # Before evaluation, apply downsampling if needed
+                    if self.cfg.nvs_eval.downscale_factor > 1:
+                        ds_factor = self.cfg.nvs_eval.downscale_factor
+                        renders = F.interpolate(
+                            renders.permute(0, 3, 1, 2),
+                            size=(gt_h // ds_factor, gt_w // ds_factor),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).permute(0, 2, 3, 1)
+                        frames = F.interpolate(
+                            frames.permute(0, 3, 1, 2),
+                            size=(gt_h // ds_factor, gt_w // ds_factor),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).permute(0, 2, 3, 1)
+                        masks = F.interpolate(
+                            masks.permute(0, 3, 1, 2),
+                            size=(gt_h // ds_factor, gt_w // ds_factor),
+                            mode="nearest",
+                        ).permute(0, 2, 3, 1)
+                        masks3 = masks.repeat(1, 1, 1, 3)
+                    
+                    # Save what goes into metrics computation for debugging
+                    metrics_debug_dir = save_dir / "metrics_debug_inputs"
+                    metrics_debug_dir.mkdir(parents=True, exist_ok=True)
+                    masked_renders = renders * masks3
+                    masked_gt = frames * masks3
+                    overlayed = 0.5 * masked_renders + 0.5 * masked_gt
+                    columns = [masked_renders, masked_gt, overlayed]
+                    joined = torch.cat(columns, dim=2)  # side-by-side along width
+                    for i in range(joined.shape[0]):
+                        save_path = metrics_debug_dir / Path(frame_paths[i]).name
                         save_image(joined[i].permute(2, 0, 1), str(save_path))
                     
                     # Compute metrics
-                    # lpips_vals = ...
+                    psnr_vals = psnr(
+                        images=frames,
+                        masks=masks.squeeze(-1),
+                        renders=renders,
+                    )
+                    ssim_vals = ssim(
+                        images=frames,
+                        masks=masks.squeeze(-1),
+                        renders=renders,
+                    )
+                    lpips_vals = lpips(
+                        images=frames,
+                        masks=masks.squeeze(-1),
+                        renders=renders,
+                    )
+                    for fid, psnr_val, ssim_val, lpips_val in zip(frame_indices, psnr_vals, ssim_vals, lpips_vals):
+                        metrics_all_cams_per_frame.append(
+                            (tgt_cam_id, fid.item(), psnr_val.item(), ssim_val.item(), lpips_val.item())
+                        )
+            
+            # Create a video from render vs gt images using call to ffmpeg
+            render_vs_gt_dir = root_save_dir / f"{tgt_cam_id}" / "render_vs_gt"
+            video_path = root_save_dir / f"{tgt_cam_id}" / f"cam_{tgt_cam_id}_nvs_epoch_{epoch:04d}.mp4"
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-framerate", "20",
+                "-i", str(render_vs_gt_dir / "%06d.jpg"),
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                str(video_path),
+            ]
+            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+ 
+        # Save metrics to CSV
+        # - save per-frame metrics
+        df = pd.DataFrame(metrics_all_cams_per_frame, columns=["camera_id", "frame_id", "psnr", "ssim", "lpips"])
+        csv_path = root_save_dir / "metrics_all_cams_per_frame.csv"
+        df.to_csv(csv_path, index=False)
 
+        # - save average metrics per camera
+        df_avg_cam = df.groupby("camera_id").agg({"psnr": "mean", "ssim": "mean", "lpips": "mean"}).reset_index()
+        csv_path_avg_cam = root_save_dir / "metrics_avg_per_camera.csv"
+        df_avg_cam.to_csv(csv_path_avg_cam, index=False)
+
+        # - save overall average metrics excluding self.cfg.nvs_eval.source_camera_id
+        df_excluding_source = df[df["camera_id"] != self.cfg.nvs_eval.source_camera_id]
+        overall_avg = {
+            "psnr": df_excluding_source["psnr"].mean(),
+            "ssim": df_excluding_source["ssim"].mean(),
+            "lpips": df_excluding_source["lpips"].mean(),
+        }
+        overall_avg_path = root_save_dir / "novel_view_results.txt"
+        with open(overall_avg_path, "w") as f:
+            for k, v in overall_avg.items():
+                f.write(f"{k}: {v:.4f}\n")
 
         quit()
 
