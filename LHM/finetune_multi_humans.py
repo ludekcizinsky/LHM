@@ -938,15 +938,13 @@ class MultiHumanFinetuner(Inferrer):
         root_save_dir: Path = self.output_dir / "evaluation" / self.cfg.exp_name / f"epoch_{epoch:04d}"
         root_save_dir.mkdir(parents=True, exist_ok=True)
         num_tracks, num_frames = self.cfg.num_persons, self.cfg.batch_size
-        render_bg_colors_template = torch.ones(
+        render_bg_colors_template = torch.zeros(
             (num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32
         )  # black
-        alpha_candidates = torch.tensor(
-            [-0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0], device=self.tuner_device
-        )
-        cam_alpha: dict[int, float] = {}
-        cam_alpha_stats: dict[int, dict[str, torch.Tensor | int]] = {}
-        calibrate_frames = 3
+#        alpha_candidates = torch.tensor(
+            #[-0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0], device=self.tuner_device
+        #)
+        alpha_candidates = torch.arange(-0.9, 1.1, 0.1, device=self.tuner_device)
         max_shift_m = 0.2
 
         for tgt_cam_id in target_camera_ids:
@@ -961,10 +959,7 @@ class MultiHumanFinetuner(Inferrer):
             tgt_w2c = extr_to_w2c_4x4(tgt_extr, self.tuner_device)
             tgt_c2w = torch.inverse(tgt_w2c)
             tgt_intr4 = intr_to_4x4(tgt_intr, self.tuner_device)
-            cam_alpha_stats.setdefault(
-                tgt_cam_id,
-                {"sum_iou": torch.zeros_like(alpha_candidates), "count": 0},
-            )
+
 
             # Prepare dataset and dataloader for loading frames and masks
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
@@ -1006,64 +1001,40 @@ class MultiHumanFinetuner(Inferrer):
                         render_hw=(gt_h, gt_w),
                     )
 
+                    # Estimate translation offset between rendered and GT masks
                     delta_world = self._estimate_world_translation_offset(
-                        render_mask=res["comp_mask"],
+                        render_mask=res["comp_rgb"] > 0.5,
                         gt_mask=masks,
                         intr=tgt_intr,
                         c2w=tgt_c2w,
                         w2c=tgt_w2c,
                         smplx_trans=smplx_params["trans"],
                     )
-                    if delta_world is not None:
-                        delta_world = delta_world.clamp(-max_shift_m, max_shift_m)
-                        stats = cam_alpha_stats[tgt_cam_id]
-                        cached_alpha = cam_alpha.get(tgt_cam_id, None)
+                    delta_world = delta_world.clamp(-max_shift_m, max_shift_m)
 
-                        if cached_alpha is None and stats["count"] < calibrate_frames:
-                            best_res = res
-                            best_iou = -1.0
-                            for idx, alpha in enumerate(alpha_candidates):
-                                if alpha.abs() < 1e-6:
-                                    cand_res = res
-                                else:
-                                    cand_c2ws = render_c2ws.clone()
-                                    cand_c2ws[:, :, :3, 3] -= alpha * delta_world.unsqueeze(0)
-                                    cand_res = self.model.animation_infer_custom(
-                                        self.gs_model_list,
-                                        self.query_points,
-                                        smplx_params,
-                                        render_c2ws=cand_c2ws,
-                                        render_intrs=render_intrs,
-                                        render_bg_colors=render_bg_colors,
-                                        render_hw=(gt_h, gt_w),
-                                    )
-                                iou = self._mask_iou(cand_res["comp_mask"], masks).mean()
-                                stats["sum_iou"][idx] += iou
-                                if iou > best_iou:
-                                    best_iou = iou
-                                    best_res = cand_res
-                            stats["count"] += 1
-                            res = best_res
-                            if stats["count"] >= calibrate_frames:
-                                best_idx = int(torch.argmax(stats["sum_iou"]).item())
-                                cam_alpha[tgt_cam_id] = float(alpha_candidates[best_idx].item())
-                        else:
-                            if cached_alpha is None:
-                                best_idx = int(torch.argmax(stats["sum_iou"]).item())
-                                cached_alpha = float(alpha_candidates[best_idx].item())
-                                cam_alpha[tgt_cam_id] = cached_alpha
-                            adj_c2ws = render_c2ws.clone()
-                            adj_c2ws[:, :, :3, 3] -= cached_alpha * delta_world.unsqueeze(0)
-                            res = self.model.animation_infer_custom(
-                                self.gs_model_list,
-                                self.query_points,
-                                smplx_params,
-                                render_c2ws=adj_c2ws,
-                                render_intrs=render_intrs,
-                                render_bg_colors=render_bg_colors,
-                                render_hw=(gt_h, gt_w),
-                            )
+                    # Find the best alpha for the translation offset
+                    best_res = res
+                    best_iou = -1.0
+                    for idx, alpha in enumerate(alpha_candidates):
+                        cand_c2ws = render_c2ws.clone()
+                        cand_c2ws[:, :, :3, 3] -= alpha * delta_world.unsqueeze(0)
+                        cand_res = self.model.animation_infer_custom(
+                            self.gs_model_list,
+                            self.query_points,
+                            smplx_params,
+                            render_c2ws=cand_c2ws,
+                            render_intrs=render_intrs,
+                            render_bg_colors=render_bg_colors,
+                            render_hw=(gt_h, gt_w),
+                        )
+                        iou = self._mask_iou(cand_res["comp_rgb"] > 0.5, masks).mean()
+                        if iou > best_iou:
+                            print(f"[DEBUG] Better IoU {iou:.4f} found at alpha {alpha:.2f}")
+                            best_iou = iou
+                            best_res = cand_res
+                    res = best_res
 
+                    # Save rendered images
                     comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
 
                     # Apply masks to the rendered images and gt 
@@ -1072,9 +1043,6 @@ class MultiHumanFinetuner(Inferrer):
                         masks3 = masks3.repeat(1, 1, 1, 3)
                     render = comp_rgb 
                     masked_gt = frames * masks3
-                    print(f"[DEBUG] Shape of render: {render.shape}, min / max render: {render.min().item()} / {render.max().item()}")
-                    print(f"[DEBUG] Shape of masked_gt: {masked_gt.shape}, min / max masked_gt: {masked_gt.min().item()} / {masked_gt.max().item()}")
-                    print(f"[DEBUG] Shape of masks3: {masks3.shape}, min / max masks3: {masks3.min().item()} / {masks3.max().item()}")
 
                     # Combine masked render and masked GT with overlay
                     overlay = render * 0.5 + masked_gt * 0.5
