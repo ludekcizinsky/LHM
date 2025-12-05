@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=lhm
+#SBATCH --job-name=eval_lhm
 #SBATCH --output=/scratch/izar/cizinsky/thesis/slurm/%x.%j.out
 #SBATCH --error=/scratch/izar/cizinsky/thesis/slurm/%x.%j.err
 #SBATCH --time=01:00:00
@@ -50,4 +50,5 @@ num_persons=2
 
 # --- V2
 exp_name="dev"
-python LHM/finetune_multi_humans.py scene_name=$seq_name num_persons=$num_persons
+root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair15_1/pair15/fight15
+python LHM/finetune_multi_humans.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path
