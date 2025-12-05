@@ -1314,11 +1314,18 @@ class MultiHumanFinetuner(Inferrer):
         cy = (binary * ys).sum((1, 2)) / (area + 1e-6)
         return cx, cy, valid
 
+    def _mask_iou(self, pred_mask: torch.Tensor, gt_mask: torch.Tensor) -> torch.Tensor:
+        """Compute IoU between predicted and GT masks; expects shape [B, H, W, 1]."""
+        p = (pred_mask[..., 0] > 0.5).float()
+        g = (gt_mask[..., 0] > 0.5).float()
+        inter = (p * g).sum((1, 2))
+        union = (p + g - p * g).sum((1, 2)).clamp_min(1e-6)
+        return inter / union
+
     def _estimate_world_translation_offset(
         self,
         render_mask: torch.Tensor,
         gt_mask: torch.Tensor,
-        depth_map: torch.Tensor | None,
         intr: torch.Tensor,
         c2w: torch.Tensor,
         w2c: torch.Tensor,
@@ -1341,15 +1348,7 @@ class MultiHumanFinetuner(Inferrer):
         dx = gt_cx - render_cx
         dy = gt_cy - render_cy
 
-        # Depth from rendered depth map if available, otherwise from SMPL-X translations.
-#        z = None
-        #if depth_map is not None:
-            #depth_bhw = depth_map[..., 0]
-            #depth_sum = (depth_bhw * (render_mask_b > 0.5).float()).sum((1, 2))
-            #mask_sum = (render_mask_b > 0.5).float().sum((1, 2)).clamp_min(1e-6)
-            #z = depth_sum / mask_sum
-
-        # if z is None:
+        # Depth from SMPL-X translations (projected to camera space)
         cam_coords = torch.einsum("ij,pbj->pbi", w2c[:3, :3], smplx_trans) + w2c[:3, 3]
         z = cam_coords[..., 2].mean(dim=0)
 
@@ -1689,6 +1688,13 @@ class MultiHumanFinetuner(Inferrer):
         render_bg_colors_template = torch.zeros(
             (num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32
         )  # black
+        alpha_candidates = torch.tensor(
+            [-0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0], device=self.tuner_device
+        )
+        cam_alpha: dict[int, float] = {}
+        cam_alpha_stats: dict[int, dict[str, torch.Tensor | int]] = {}
+        calibrate_frames = 3
+        max_shift_m = 0.2
 
         for tgt_cam_id in target_camera_ids:
 
@@ -1702,6 +1708,10 @@ class MultiHumanFinetuner(Inferrer):
             tgt_w2c = extr_to_w2c_4x4(tgt_extr, self.tuner_device)
             tgt_c2w = torch.inverse(tgt_w2c)
             tgt_intr4 = intr_to_4x4(tgt_intr, self.tuner_device)
+            cam_alpha_stats.setdefault(
+                tgt_cam_id,
+                {"sum_iou": torch.zeros_like(alpha_candidates), "count": 0},
+            )
 
             # Prepare dataset and dataloader for loading frames and masks
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
@@ -1746,26 +1756,60 @@ class MultiHumanFinetuner(Inferrer):
                     delta_world = self._estimate_world_translation_offset(
                         render_mask=res["comp_mask"],
                         gt_mask=masks,
-                        depth_map=res.get("comp_depth"),
                         intr=tgt_intr,
                         c2w=tgt_c2w,
                         w2c=tgt_w2c,
                         smplx_trans=smplx_params["trans"],
                     )
                     if delta_world is not None:
-                        # Move camera opposite to desired subject shift (extrinsic is world->camera).
-                        damp = 0.2  # conservative to avoid overshoot
-                        render_c2ws = render_c2ws.clone()
-                        render_c2ws[:, :, :3, 3] += damp * delta_world.unsqueeze(0)
-                        res = self.model.animation_infer_custom(
-                            self.gs_model_list,
-                            self.query_points,
-                            smplx_params,
-                            render_c2ws=render_c2ws,
-                            render_intrs=render_intrs,
-                            render_bg_colors=render_bg_colors,
-                            render_hw=(gt_h, gt_w),
-                        )
+                        delta_world = delta_world.clamp(-max_shift_m, max_shift_m)
+                        stats = cam_alpha_stats[tgt_cam_id]
+                        cached_alpha = cam_alpha.get(tgt_cam_id, None)
+
+                        if cached_alpha is None and stats["count"] < calibrate_frames:
+                            best_res = res
+                            best_iou = -1.0
+                            for idx, alpha in enumerate(alpha_candidates):
+                                if alpha.abs() < 1e-6:
+                                    cand_res = res
+                                else:
+                                    cand_c2ws = render_c2ws.clone()
+                                    cand_c2ws[:, :, :3, 3] -= alpha * delta_world.unsqueeze(0)
+                                    cand_res = self.model.animation_infer_custom(
+                                        self.gs_model_list,
+                                        self.query_points,
+                                        smplx_params,
+                                        render_c2ws=cand_c2ws,
+                                        render_intrs=render_intrs,
+                                        render_bg_colors=render_bg_colors,
+                                        render_hw=(gt_h, gt_w),
+                                    )
+                                iou = self._mask_iou(cand_res["comp_mask"], masks).mean()
+                                stats["sum_iou"][idx] += iou
+                                if iou > best_iou:
+                                    best_iou = iou
+                                    best_res = cand_res
+                            stats["count"] += 1
+                            res = best_res
+                            if stats["count"] >= calibrate_frames:
+                                best_idx = int(torch.argmax(stats["sum_iou"]).item())
+                                cam_alpha[tgt_cam_id] = float(alpha_candidates[best_idx].item())
+                        else:
+                            if cached_alpha is None:
+                                best_idx = int(torch.argmax(stats["sum_iou"]).item())
+                                cached_alpha = float(alpha_candidates[best_idx].item())
+                                cam_alpha[tgt_cam_id] = cached_alpha
+                            adj_c2ws = render_c2ws.clone()
+                            adj_c2ws[:, :, :3, 3] -= cached_alpha * delta_world.unsqueeze(0)
+                            res = self.model.animation_infer_custom(
+                                self.gs_model_list,
+                                self.query_points,
+                                smplx_params,
+                                render_c2ws=adj_c2ws,
+                                render_intrs=render_intrs,
+                                render_bg_colors=render_bg_colors,
+                                render_hw=(gt_h, gt_w),
+                            )
 
                     comp_rgb = res["comp_rgb"]  # [B, H, W, 3]
 
