@@ -718,45 +718,49 @@ class HumanLRMInferrer(Inferrer):
         Image.fromarray(vis_head_img).save(save_head_img_path)
         print(f"[DEBUG] saved head image to {save_head_img_path}")
 
-        # read motion seq
-        motion_name = os.path.dirname(
-            motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
-        )
-        motion_name = os.path.basename(motion_name)
-
-        print(f"[DEBUG] preparing motion sequence for {motion_name}")
-        motion_seq = prepare_motion_seqs(
-            motion_seqs_dir,
-            motion_img_dir,
-            save_root=dump_tmp_dir,
-            fps=motion_video_read_fps,
-            bg_color=1.0,
-            aspect_standard=aspect_standard,
-            enlarge_ratio=[1.0, 1, 0],
-            render_image_res=render_size,
-            multiply=16,
-            need_mask=motion_img_need_mask,
-            vis_motion=vis_motion,
-        )
-        self.motion_dict[motion_name] = motion_seq
-
-        # Save motion seq
-        motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
-        torch.save(motion_seq, motion_seq_save_path)
-        print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
-
         # Infer canonical gs model and query points
         device = "cuda"
         dtype = torch.float32
         shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
 
-        self.model.to(dtype)
-        smplx_params = motion_seq['smplx_params']
-        for k in smplx_params:
-            print(f"[DEBUG] smplx x params key: {k}, shape: {smplx_params[k].shape}")
+#        # read motion seq
+        #motion_name = os.path.dirname(
+            #motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
+        #)
+        #motion_name = os.path.basename(motion_name)
 
+        #print(f"[DEBUG] preparing motion sequence for {motion_name}")
+        #motion_seq = prepare_motion_seqs(
+            #motion_seqs_dir,
+            #motion_img_dir,
+            #save_root=dump_tmp_dir,
+            #fps=motion_video_read_fps,
+            #bg_color=1.0,
+            #aspect_standard=aspect_standard,
+            #enlarge_ratio=[1.0, 1, 0],
+            #render_image_res=render_size,
+            #multiply=16,
+            #need_mask=motion_img_need_mask,
+            #vis_motion=vis_motion,
+        #)
+        #self.motion_dict[motion_name] = motion_seq
+
+        ## Save motion seq
+        #motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
+        #torch.save(motion_seq, motion_seq_save_path)
+        #print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
+
+
+
+#        smplx_params = motion_seq['smplx_params']
+        #for k in smplx_params:
+            #print(f"[DEBUG] smplx x params key: {k}, shape: {smplx_params[k].shape}")
+
+        smplx_params =  dict()
         smplx_params['betas'] = shape_param.to(device)
         print(f"[DEBUG] used shape param shape: {shape_param.shape}")
+
+        self.model.to(dtype)
         gs_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
             image.unsqueeze(0).to(device, dtype),
             src_head_rgb.unsqueeze(0).to(device, dtype),

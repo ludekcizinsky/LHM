@@ -11,10 +11,9 @@
 
 # Change to the directory where the script is located
 cd /home/cizinsky/LHM
+source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 conda deactivate && conda activate lhm
-
-# --- Shared settings
-
+module load gcc ffmpeg
 
 # --- V1
 # exp_name="default"
@@ -48,14 +47,37 @@ conda deactivate && conda activate lhm
 # bash run_full.sh $seq_name $path_to_video $exp_name $lr $wd 0.4
 
 # --- V2
-seq_name="hi4d_pair00_fight"
-num_persons=2
-exp_name="dev"
-root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair00_1/fight00
-python LHM/eval_multi_lhm.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path
+# seq_name="hi4d_pair00_fight"
+# num_persons=2
+# exp_name="dev"
+# root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair00_1/fight00
+# python LHM/eval_multi_lhm.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path
 
+# --- LHM eval on hi4d
 # seq_name="hi4d_pair15_fight"
 # num_persons=2
 # exp_name="dev"
+# source_cam_id=4
 # root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair15_1/pair15/fight15
-# python LHM/finetune_multi_humans.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path
+# python LHM/eval_multi_lhm.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id
+
+# seq_name="hi4d_pair16_jump"
+# num_persons=2
+# exp_name="dev"
+# source_cam_id=4
+# root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair16/pair16/jump16
+# python LHM/eval_multi_lhm.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id
+
+# seq_name="hi4d_pair17_dance"
+# num_persons=2
+# exp_name="dev"
+# source_cam_id=28
+# root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair17_1/pair17/dance17
+# python LHM/eval_multi_lhm.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id
+
+seq_name="hi4d_pair19_piggyback"
+num_persons=2
+exp_name="dev"
+source_cam_id=4
+root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair19_2/piggyback19
+python LHM/eval_multi_lhm.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id

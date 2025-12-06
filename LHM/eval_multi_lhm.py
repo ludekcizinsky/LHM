@@ -618,9 +618,14 @@ class MultiHumanFinetuner(Inferrer):
             # Create a video from render vs gt images using call to ffmpeg
             render_vs_gt_dir = root_save_dir / f"{tgt_cam_id}" / "render_vs_gt"
             video_path = root_save_dir / f"{tgt_cam_id}" / f"cam_{tgt_cam_id}_nvs_epoch_{epoch:04d}.mp4"
+            jpg_frames = sorted(p for p in render_vs_gt_dir.glob("*.jpg") if p.stem.isdigit())
+            if not jpg_frames:
+                raise FileNotFoundError(f"No render_vs_gt frames found in {render_vs_gt_dir}")
+            start_number = int(jpg_frames[0].stem)
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",
+                "-start_number", str(start_number),
                 "-framerate", "20",
                 "-i", str(render_vs_gt_dir / "%06d.jpg"),
                 "-c:v", "libx264",
