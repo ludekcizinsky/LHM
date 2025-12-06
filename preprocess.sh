@@ -41,13 +41,13 @@ mkdir -p $initial_gs_model_dir
 
 # TODO: it can happen that sam3 actually fails to detect any humans in the scene, so here I would also need to check if everything went fine.
 # TODO: it can happen that sam3 will fail to detect certain human for a subset of the frames, so be aware of that
-echo "--- [2/?] Running SAM3 to generate masks and masked images"
-conda deactivate && conda activate sam3
-python engine/new_segment_api/run.py --frames $frame_folder --text "a person" --output-dir $output_dir --prompt-frame 40
+# echo "--- [2/?] Running SAM3 to generate masks and masked images"
+# conda deactivate && conda activate sam3
+# python engine/new_segment_api/run.py --frames $frame_folder --text "a person" --output-dir $output_dir --prompt-frame 0
 
 # echo "[3/?] Running Depth Anything 3 to generate depth maps"
-# conda deactivate && conda activate da3
-# python engine/depth_est_api/run.py --output_dir $output_dir
+conda deactivate && conda activate da3
+python engine/depth_est_api/run.py --output_dir $output_dir
 
 # TODO: manual inspection needed at this point and making sure that mask track ids match motion track ids.
 # TODO: another todo is to pick a frame index for each person track to be used as reference frame during inference.

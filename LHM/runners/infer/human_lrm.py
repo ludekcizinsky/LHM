@@ -724,12 +724,6 @@ class HumanLRMInferrer(Inferrer):
         shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
 
         # read motion seq
-        motion_name = os.path.dirname(
-            motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
-        )
-        motion_name = os.path.basename(motion_name)
-
-        print(f"[DEBUG] preparing motion sequence for {motion_name}")
         motion_seq = prepare_motion_seqs(
             motion_seqs_dir,
             motion_img_dir,
@@ -743,23 +737,20 @@ class HumanLRMInferrer(Inferrer):
             need_mask=motion_img_need_mask,
             vis_motion=vis_motion,
         )
-        self.motion_dict[motion_name] = motion_seq
 
         # Save motion seq
         motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
         torch.save(motion_seq, motion_seq_save_path)
         print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
 
-
-
+        # prepare smplx params 
         smplx_params = motion_seq['smplx_params']
+        smplx_params['betas'] = shape_param.to(device)
         for k in smplx_params:
             print(f"[DEBUG] smplx x params key: {k}, shape: {smplx_params[k].shape}")
 
-        smplx_params =  dict()
-        smplx_params['betas'] = shape_param.to(device)
-        print(f"[DEBUG] used shape param shape: {shape_param.shape}")
 
+        # Get canonical gs model and query points
         self.model.to(dtype)
         gs_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
             image.unsqueeze(0).to(device, dtype),
