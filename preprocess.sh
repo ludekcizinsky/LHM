@@ -16,7 +16,8 @@ seq_name=$1
 
 # for now default settings
 default_ref_frame_idx=0
-input_video='/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair19_2/piggyback19/images/4/piggyback19_cam4_30fps.mp4'
+frame_path=/scratch/izar/cizinsky/people_snapshot_public/male-3-casual/frames
+video_path=$frame_path/video.mp4
 
 # derived paths
 preprocess_dir=/scratch/izar/cizinsky/thesis/preprocessing/$seq_name
@@ -30,19 +31,19 @@ mkdir -p $initial_gs_model_dir
 
 # echo "--- [1/?] Extracting frames from input video at 30 fps"
 # ffmpeg -framerate 30 -start_number 1 \
-  # -i '/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair19_2/piggyback19/images/4/%06d.jpg' \
+  # -i $frame_path/frame_%05d.png \
   # -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
-  # $input_video
+  # $video_path
 
 # echo "--- [2/?] Running preprocess.sh to generate motion sequences"
 # conda deactivate && conda activate lhm
-# python engine/pose_estimation/video2motion.py --video_path $input_video --output_path $output_dir/motion --visualize
+# python engine/pose_estimation/video2motion.py --video_path $video_path --output_path $output_dir/motion --visualize
 
 # TODO: it can happen that sam3 actually fails to detect any humans in the scene, so here I would also need to check if everything went fine.
 # TODO: it can happen that sam3 will fail to detect certain human for a subset of the frames, so be aware of that
-# echo "--- [2/?] Running SAM3 to generate masks and masked images"
-# conda deactivate && conda activate sam3
-# python engine/new_segment_api/run.py --frames $frame_folder --text "a person" --output-dir $output_dir --prompt-frame 75
+echo "--- [2/?] Running SAM3 to generate masks and masked images"
+conda deactivate && conda activate sam3
+python engine/new_segment_api/run.py --frames $frame_folder --text "a person" --output-dir $output_dir --prompt-frame 40
 
 # echo "[3/?] Running Depth Anything 3 to generate depth maps"
 # conda deactivate && conda activate da3
@@ -53,5 +54,5 @@ mkdir -p $initial_gs_model_dir
 # TODO: I need to ensure I am running over all humans detected in the scene.
 # echo "--- [4/?] Running inference.sh to obtain canonical 3dgs models for each human"
 # conda deactivate && conda activate lhm
-bash inference.sh $seq_name 0 $default_ref_frame_idx LHM-1B
-bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B
+# bash inference.sh $seq_name 0 $default_ref_frame_idx LHM-1B
+# bash inference.sh $seq_name 1 $default_ref_frame_idx LHM-1B

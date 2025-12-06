@@ -723,38 +723,38 @@ class HumanLRMInferrer(Inferrer):
         dtype = torch.float32
         shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
 
-#        # read motion seq
-        #motion_name = os.path.dirname(
-            #motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
-        #)
-        #motion_name = os.path.basename(motion_name)
+        # read motion seq
+        motion_name = os.path.dirname(
+            motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
+        )
+        motion_name = os.path.basename(motion_name)
 
-        #print(f"[DEBUG] preparing motion sequence for {motion_name}")
-        #motion_seq = prepare_motion_seqs(
-            #motion_seqs_dir,
-            #motion_img_dir,
-            #save_root=dump_tmp_dir,
-            #fps=motion_video_read_fps,
-            #bg_color=1.0,
-            #aspect_standard=aspect_standard,
-            #enlarge_ratio=[1.0, 1, 0],
-            #render_image_res=render_size,
-            #multiply=16,
-            #need_mask=motion_img_need_mask,
-            #vis_motion=vis_motion,
-        #)
-        #self.motion_dict[motion_name] = motion_seq
+        print(f"[DEBUG] preparing motion sequence for {motion_name}")
+        motion_seq = prepare_motion_seqs(
+            motion_seqs_dir,
+            motion_img_dir,
+            save_root=dump_tmp_dir,
+            fps=motion_video_read_fps,
+            bg_color=1.0,
+            aspect_standard=aspect_standard,
+            enlarge_ratio=[1.0, 1, 0],
+            render_image_res=render_size,
+            multiply=16,
+            need_mask=motion_img_need_mask,
+            vis_motion=vis_motion,
+        )
+        self.motion_dict[motion_name] = motion_seq
 
-        ## Save motion seq
-        #motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
-        #torch.save(motion_seq, motion_seq_save_path)
-        #print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
+        # Save motion seq
+        motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
+        torch.save(motion_seq, motion_seq_save_path)
+        print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
 
 
 
-#        smplx_params = motion_seq['smplx_params']
-        #for k in smplx_params:
-            #print(f"[DEBUG] smplx x params key: {k}, shape: {smplx_params[k].shape}")
+        smplx_params = motion_seq['smplx_params']
+        for k in smplx_params:
+            print(f"[DEBUG] smplx x params key: {k}, shape: {smplx_params[k].shape}")
 
         smplx_params =  dict()
         smplx_params['betas'] = shape_param.to(device)
