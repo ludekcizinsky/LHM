@@ -114,7 +114,7 @@ def load_human3r_cameras(cameras_npz_path):
     t_c2w = -torch.einsum("bij,bj->bi", R_c2w, t_w2c)
 
     N = R_c2w.shape[0]
-    c2ws = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(N, 1, 1)
+    c2ws = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(N, 1, 1) # since smplx is exported in camera coordinates already
     # c2ws[:, :3, :3] = R_c2w
     # c2ws[:, :3, 3] = t_c2w
 

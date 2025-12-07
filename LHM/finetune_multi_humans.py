@@ -39,6 +39,8 @@ from LHM.outputs.output import GaussianAppOutput
 from LHM.runners.infer.base_inferrer import Inferrer
 from LHM.utils.hf_hub import wrap_model_hub
 
+from LHM.debug import overlay_smplx_mesh_pyrender 
+
 # ---------------------------------------------------------------------------
 # Evaluation metrics
 # ---------------------------------------------------------------------------
@@ -194,12 +196,16 @@ class FrameMaskDataset(Dataset):
         return arr.to(self.device)
 
     def _load_mask(self, path: Path, eps: float = 0.05) -> torch.Tensor:
-        arr = torch.from_numpy(np.array(Image.open(path))).float()  # HxWxC
+        arr = torch.from_numpy(np.array(Image.open(path))).float()  # HxWxC or HxW
+        if arr.dim() == 2:
+            arr = arr.unsqueeze(-1) / 255.0  # HxWx1
+            return arr.to(self.device) # already binary mask
+
         if arr.shape[-1] == 4:
             arr = arr[..., :3] # drop alpha
         # Foreground is any pixel whose max channel exceeds eps*255
         mask = (arr.max(dim=-1).values > eps * 255).float()  # HxW
-        return mask.to(self.device).unsqueeze(-1)  # HxWx1
+        return mask.to(self.device).unsqueeze(-1)  # HxWx1, range [0,1]
 
     def __getitem__(self, idx: int):
         frame = self._load_img(self.frame_paths[idx])
@@ -689,7 +695,8 @@ class MultiHumanFinetuner(Inferrer):
             render_c2ws=render_c2ws,
             render_intrs=render_intrs,
             render_bg_colors=render_bg_colors,
-        )
+            render_hw=self.trn_render_hw,
+        ), smplx_params, render_c2ws, render_intrs
 
     def _canonical_regularization(self):
         """Return combined canonical regularization and its components."""
@@ -784,6 +791,8 @@ class MultiHumanFinetuner(Inferrer):
         dataset = FrameMaskDataset(
             self.frames_dir, self.masks_dir, self.tuner_device, sample_every=self.cfg.sample_every
         )
+        first_frame = dataset[0][1]
+        self.trn_render_hw = first_frame.shape[:2]
         loader = DataLoader(
             dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, drop_last=False
         )
@@ -792,11 +801,11 @@ class MultiHumanFinetuner(Inferrer):
         optimizer = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
         # Pre-optimization visualization (epoch 0).
-        if self.cfg.vis_every_epoch > 0:
-            for tidx in range(len(self.track_meta)):
-                self._canonical_vis_for_track(tidx, 0)
-        if getattr(self.cfg, "eval_every_epoch", 0) > 0:
-            self.eval_loop(0)
+#        if self.cfg.vis_every_epoch > 0:
+            #for tidx in range(len(self.track_meta)):
+                #self._canonical_vis_for_track(tidx, 0)
+        #if getattr(self.cfg, "eval_every_epoch", 0) > 0:
+            #self.eval_loop(0)
 
         for epoch in range(self.cfg.epochs):
             running_loss = 0.0
@@ -806,7 +815,7 @@ class MultiHumanFinetuner(Inferrer):
                 optimizer.zero_grad(set_to_none=True)
 
                 frame_indices = frame_indices.to(self.tuner_device)
-                res = self._render_batch(frame_indices)
+                res, smplx_params, render_c2ws, render_intrs = self._render_batch(frame_indices)
                 comp_rgb = res["comp_rgb"]  # [B, H, W, 3], 0-1
                 comp_mask = res["comp_mask"][..., :1]  # [B, H, W, 1]
                 pred_depth = res.get("comp_depth", None)  # [B, H, W, 1] if available
@@ -867,7 +876,8 @@ class MultiHumanFinetuner(Inferrer):
                     debug_save_dir.mkdir(parents=True, exist_ok=True)
 
                     # - create a joined image from pred_masked and gt_masked for debugging
-                    joined_image = torch.cat([comp_rgb, gt_masked], dim=3)  # Concatenate along width
+                    overlay = comp_rgb*0.5 + gt_masked*0.5
+                    joined_image = torch.cat([comp_rgb, gt_masked, overlay], dim=3)  # Concatenate along width
                     debug_image_path = debug_save_dir / f"rgb_loss_input.png"
                     save_image(joined_image.permute(0, 3, 1, 2), str(debug_image_path))
 
@@ -880,6 +890,19 @@ class MultiHumanFinetuner(Inferrer):
                     ssim_input_image = torch.cat([comp_rgb, gt_masked], dim=3)  # Concatenate along width
                     debug_ssim_path = debug_save_dir / f"ssim_loss_input.png"
                     save_image(ssim_input_image.permute(0, 3, 1, 2), str(debug_ssim_path))
+
+                    # - create smpl overlay over original rgb
+                    smplx_model = self.model.renderer.smplx_model
+                    smplx_overlayed_frames = overlay_smplx_mesh_pyrender(frames, smplx_params, smplx_model, render_intrs[0, 0], self.tuner_device)
+                    print(f"Shape of smplx overlayed frames: {smplx_overlayed_frames.shape}")
+                    debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_original_rgb.png"
+                    save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
+
+                    # - create smpl overlaye over rendered rgb
+                    smplx_overlayed_frames = overlay_smplx_mesh_pyrender(comp_rgb, smplx_params, smplx_model, render_intrs[0, 0], self.tuner_device)
+                    print(f"Shape of smplx overlayed frames: {smplx_overlayed_frames.shape}")
+                    debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_rendered_rgb.png"
+                    save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
 
                     if pred_depth is not None:
                         # Depth debug for first sample in batch
@@ -1114,9 +1137,14 @@ class MultiHumanFinetuner(Inferrer):
             # Create a video from render vs gt images using call to ffmpeg
             render_vs_gt_dir = root_save_dir / f"{tgt_cam_id}" / "render_vs_gt"
             video_path = root_save_dir / f"{tgt_cam_id}" / f"cam_{tgt_cam_id}_nvs_epoch_{epoch:04d}.mp4"
+            jpg_frames = sorted(p for p in render_vs_gt_dir.glob("*.jpg") if p.stem.isdigit())
+            if not jpg_frames:
+                raise FileNotFoundError(f"No render_vs_gt frames found in {render_vs_gt_dir}")
+            start_number = int(jpg_frames[0].stem)
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",
+                "-start_number", str(start_number),
                 "-framerate", "20",
                 "-i", str(render_vs_gt_dir / "%06d.jpg"),
                 "-c:v", "libx264",

@@ -789,7 +789,6 @@ class GS3DRenderer(nn.Module):
         elif self.smpl_type == "smplx_1":
             raise NotImplementedError("inference version does not support")
         elif self.smpl_type == "smplx_2":
-            print("[INFO] Using SMPLX Voxel Dense Sampling Model")
             self.smplx_model = SMPLXVoxelMeshModel(
                 human_model_path,
                 gender="neutral",

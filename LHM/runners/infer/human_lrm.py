@@ -724,19 +724,20 @@ class HumanLRMInferrer(Inferrer):
         shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
 
         # read motion seq
-        motion_seq = prepare_motion_seqs(
-            motion_seqs_dir,
-            motion_img_dir,
-            save_root=dump_tmp_dir,
-            fps=motion_video_read_fps,
-            bg_color=1.0,
-            aspect_standard=aspect_standard,
-            enlarge_ratio=[1.0, 1, 0],
-            render_image_res=render_size,
-            multiply=16,
-            need_mask=motion_img_need_mask,
-            vis_motion=vis_motion,
-        )
+#         motion_seq = prepare_motion_seqs(
+            # motion_seqs_dir,
+            # motion_img_dir,
+            # save_root=dump_tmp_dir,
+            # fps=motion_video_read_fps,
+            # bg_color=1.0,
+            # aspect_standard=aspect_standard,
+            # enlarge_ratio=[1.0, 1, 0],
+            # render_image_res=render_size,
+            # multiply=16,
+            # need_mask=motion_img_need_mask,
+            # vis_motion=vis_motion,
+        # )
+        motion_seq = prepare_motion_seqs_human3r(Path(motion_seqs_dir))
 
         # Save motion seq
         motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"

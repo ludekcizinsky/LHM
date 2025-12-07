@@ -19,7 +19,7 @@ preprocess_dir="/scratch/izar/cizinsky/thesis/preprocessing/$seq_name/lhm"
 track_dir=$(printf "%02d" "$track_idx")
 frame_file=$(printf "%04d.png" "$ref_frame_idx")
 image_input="$preprocess_dir/masked_images/$track_dir/$frame_file"
-motion_seqs_dir="$preprocess_dir/motion/$track_dir/smplx_params"
+motion_seqs_dir="$preprocess_dir/motion_human3r/$track_dir/smplx_params"
 save_dir=$preprocess_dir/initial_scene_recon/$track_dir
 mkdir -p $save_dir
 
