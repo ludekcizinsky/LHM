@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=eval_lhm
+#SBATCH --job-name=tune_lhm
 #SBATCH --output=/scratch/izar/cizinsky/thesis/slurm/%x.%j.out
 #SBATCH --error=/scratch/izar/cizinsky/thesis/slurm/%x.%j.err
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8           
 #SBATCH --mem=32G                   
@@ -85,7 +85,8 @@ module load gcc ffmpeg
 # --- LHM finetune
 seq_name="hi4d_pair19_piggyback"
 num_persons=2
-exp_name="dev"
+exp_name="v3"
 source_cam_id=4
+target_cam_ids="[4,28,76]"
 root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair19_2/piggyback19
-python LHM/finetune_multi_humans.py scene_name=$seq_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id
+python LHM/train_multi_humans.py scene_name=$seq_name exp_name=$exp_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id nvs_eval.target_camera_ids=$target_cam_ids eval_pretrain=true epochs=50 eval_every_epoch=25
