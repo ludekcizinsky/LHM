@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional
 import copy
 from tqdm import tqdm
 import pandas as pd
+from collections import defaultdict
 
 from omegaconf import DictConfig
 from hydra.core.global_hydra import GlobalHydra
@@ -25,11 +26,8 @@ import wandb
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from LHM.models import ModelHumanLRMSapdinoBodyHeadSD3_5
 from LHM.outputs.output import GaussianAppOutput
-from LHM.runners.infer.base_inferrer import Inferrer
-from LHM.utils.hf_hub import wrap_model_hub
-
+from LHM.models.rendering.custom_gs_renderer import GS3DRenderer
 
 # ---------------------------------------------------------------------------
 # Evaluation metrics
@@ -297,10 +295,37 @@ def enable_gaussian_grads(
                 v.requires_grad_(True)
 
 
+def build_renderer():
+    renderer = GS3DRenderer(
+        human_model_path="/scratch/izar/cizinsky/pretrained/pretrained_models/human_model_files",
+        subdivide_num=1,
+        smpl_type="smplx_2",
+        feat_dim=1024,
+        query_dim=1024,
+        use_rgb=True,
+        sh_degree=3,
+        mlp_network_config={'activation': 'silu', 'n_hidden_layers': 2, 'n_neurons': 512},
+        xyz_offset_max_step=1.0,
+        clip_scaling=[100, 0.01, 0.05, 3000],
+        shape_param_dim=10,
+        expr_param_dim=100,
+        cano_pose_type=1,
+        fix_opacity=False,
+        fix_rotation=False,
+        decoder_mlp=False,
+        skip_decoder=True,
+        decode_with_extra_info=None,
+        gradient_checkpointing=True,
+        apply_pose_blendshape=False,
+        dense_sample_pts=40000,
+    )
+
+    return renderer
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
-class MultiHumanTrainer(Inferrer):
+class MultiHumanTrainer:
     EXP_TYPE = "multi_human_finetune"
 
     def __init__(self, cfg: DictConfig):
@@ -314,7 +339,7 @@ class MultiHumanTrainer(Inferrer):
 
         self._load_gs_model(self.output_dir)
         self._prepare_joined_inputs()
-        self.model: ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model().to(self.tuner_device)
+        self.renderer : GS3DRenderer = build_renderer().to(self.tuner_device)
 
         self.frames_dir = self.output_dir / "frames"
         self.masks_dir = self.output_dir / "masks" / "union"
@@ -322,11 +347,6 @@ class MultiHumanTrainer(Inferrer):
 
 
     # ---------------- Model / data loading ----------------
-    def _build_model(self):
-        hf_model_cls = wrap_model_hub(ModelHumanLRMSapdinoBodyHeadSD3_5)
-        model_name = "/scratch/izar/cizinsky/pretrained/huggingface/models--3DAIGC--LHM-1B/snapshots/cd8a1cc900a557d83187cfc2e0a91cef3eba969d/"
-        return hf_model_cls.from_pretrained(model_name)
-
     def _load_gs_model(self, root_output_dir: Path):
         refined_dir = root_output_dir / "refined_scene_recon" / self.cfg.exp_name
         root_gs_model_dir = refined_dir if (refined_dir / "00").exists() else root_output_dir / "initial_scene_recon"
@@ -525,29 +545,25 @@ class MultiHumanTrainer(Inferrer):
 
         if self.cfg.tune_motion:
             # enable grads on SMPL-X params inside the renderer if present
-            if hasattr(self.model.renderer, "smplx_model"):
-                smplx = self.model.renderer.smplx_model
-                # enable trainable skinning if available
-                if hasattr(smplx, "use_trainable_skinning"):
-                    print(f"[INFO] Enabling trainable skinning")
-                    smplx.use_trainable_skinning = True
-                for attr in ("shape_params", "pose_params", "expr_dirs", "pose_dirs", "shape_dirs", "voxel_ws", "skinning_weight"):
-                    if hasattr(smplx, attr):
-                        v = getattr(smplx, attr)
-                        if torch.is_tensor(v):
-                            v.requires_grad_(True)
-                            params.append(v)
+            smplx = self.renderer.smplx_model
+            # enable trainable skinning if available
+            if hasattr(smplx, "use_trainable_skinning"):
+                smplx.use_trainable_skinning = True
+            for attr in ("shape_params", "pose_params", "expr_dirs", "pose_dirs", "shape_dirs", "voxel_ws", "skinning_weight"):
+                if hasattr(smplx, attr):
+                    v = getattr(smplx, attr)
+                    if torch.is_tensor(v):
+                        v.requires_grad_(True)
+                        params.append(v)
         else:
-            if hasattr(self.model.renderer, "smplx_model"):
-                smplx = self.model.renderer.smplx_model
-                if hasattr(smplx, "use_trainable_skinning"):
-                    print(f"[INFO] Disabling trainable skinning")
-                    smplx.use_trainable_skinning = False
-                for attr in ("voxel_ws", "skinning_weight"):
-                    if hasattr(smplx, attr):
-                        v = getattr(smplx, attr)
-                        if torch.is_tensor(v):
-                            v.requires_grad_(False)
+            smplx = self.renderer.smplx_model
+            if hasattr(smplx, "use_trainable_skinning"):
+                smplx.use_trainable_skinning = False
+            for attr in ("voxel_ws", "skinning_weight"):
+                if hasattr(smplx, attr):
+                    v = getattr(smplx, attr)
+                    if torch.is_tensor(v):
+                        v.requires_grad_(False)
         return params
 
     def _slice_motion(self, frame_indices: torch.Tensor):
@@ -574,11 +590,53 @@ class MultiHumanTrainer(Inferrer):
         render_bg_colors = torch.index_select(self.motion_seq["render_bg_colors"], 1, frame_indices).to(self.tuner_device)
         return smplx, render_c2ws, render_intrs, render_bg_colors
 
+    def animation_infer_custom(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_hw):
+        '''Inference code avoid repeat forward.
+        '''
+
+        # render target views
+        render_res_list = []
+        num_views = render_c2ws.shape[1]
+        render_h, render_w = render_hw
+
+        for view_idx in range(num_views):
+            smplx_single_view = self.renderer.get_single_view_smpl_data(smplx_params, view_idx)
+            render_res = self.renderer.forward_animate_gs_custom(
+                gs_model_list,
+                query_points,
+                smplx_single_view,
+                render_c2ws[:, view_idx : view_idx + 1],
+                render_intrs[:, view_idx : view_idx + 1],
+                render_h,
+                render_w,
+                render_bg_colors[:, view_idx : view_idx + 1],
+            )
+            render_res_list.append(render_res)
+
+        out = defaultdict(list)
+        for res in render_res_list:
+            for k, v in res.items():
+                if isinstance(v[0], torch.Tensor):
+                    out[k].append(v)
+                else:
+                    out[k].append(v)
+        for k, v in out.items():
+            # print(f"out key:{k}")
+            if isinstance(v[0], torch.Tensor):
+                out[k] = torch.concat(v, dim=1)
+                if k in ["comp_rgb", "comp_mask", "comp_depth"]:
+                    out[k] = out[k][0].permute(
+                        0, 2, 3, 1
+                    )  # [1, Nv, 3, H, W] -> [Nv, 3, H, W] - > [Nv, H, W, 3]
+            else:
+                out[k] = v
+        return out
+
     def _render_batch(self, frame_indices: torch.Tensor):
         smplx_params, render_c2ws, render_intrs, render_bg_colors = self._slice_motion(frame_indices)
         # Override background to black
         render_bg_colors = torch.zeros_like(render_bg_colors)
-        return self.model.animation_infer_custom(
+        return self.animation_infer_custom(
             self.gs_model_list,
             self.query_points,
             smplx_params,
@@ -819,7 +877,7 @@ class MultiHumanTrainer(Inferrer):
                     )
 
                     # Render with the model
-                    res = self.model.animation_infer_custom(
+                    res = self.animation_infer_custom(
                         self.gs_model_list,
                         self.query_points,
                         smplx_params,
@@ -846,7 +904,7 @@ class MultiHumanTrainer(Inferrer):
                     for idx, alpha in enumerate(alpha_candidates):
                         cand_c2ws = render_c2ws.clone()
                         cand_c2ws[:, :, :3, 3] -= alpha * delta_world.unsqueeze(0)
-                        cand_res = self.model.animation_infer_custom(
+                        cand_res = self.animation_infer_custom(
                             self.gs_model_list,
                             self.query_points,
                             smplx_params,
@@ -989,14 +1047,7 @@ class MultiHumanTrainer(Inferrer):
         if self.cfg.wandb.enable:
             to_log = {f"eval_nv/all_cam/{metric_name}": v for metric_name, v in overall_avg.items()}
             to_log["epoch"] = epoch
-
-    def infer(self):
-        # keep this here for compatibility
-        pass
-
-    def infer_single(self):
-        # keep this here for compatibility
-        pass
+            wandb.log(to_log)
 
 
 @hydra.main(config_path="configs", config_name="train", version_base="1.3")

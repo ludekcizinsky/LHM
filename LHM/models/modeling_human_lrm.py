@@ -149,6 +149,29 @@ class ModelHumanLRM(nn.Module):
             apply_pose_blendshape=kwargs.get("apply_pose_blendshape", False),
             dense_sample_pts=dense_sample_pts,
         )
+        # debug: print values of all arguments that go to init of the renderer (one arg per lien)
+#         print(f"human_model_path={human_model_path}")
+        # print(f"subdivide_num={smplx_subdivide_num}")
+        # print(f"smpl_type={smplx_type}")
+        # print(f"feat_dim={transformer_dim}")
+        # print(f"query_dim={gs_query_dim}")
+        # print(f"use_rgb={gs_use_rgb}")
+        # print(f"sh_degree={gs_sh}")
+        # print(f"mlp_network_config={gs_mlp_network_config}")
+        # print(f"xyz_offset_max_step={gs_xyz_offset_max_step}")
+        # print(f"clip_scaling={gs_clip_scaling}")
+        # print(f"shape_param_dim={shape_param_dim}")
+        # print(f"expr_param_dim={expr_param_dim}")
+        # print(f"cano_pose_type={cano_pose_type}")
+        # print(f"fix_opacity={fix_opacity}")
+        # print(f"fix_rotation={fix_rotation}")
+        # print(f"decoder_mlp={kwargs.get('decoder_mlp', False)}")
+        # print(f"skip_decoder={skip_decoder}")
+        # print(f"decode_with_extra_info={kwargs.get('decode_with_extra_info', None)}")
+        # print(f"gradient_checkpointing={self.gradient_checkpointing}")
+        # print(f"apply_pose_blendshape={kwargs.get('apply_pose_blendshape', False)}")
+        # print(f"dense_sample_pts={dense_sample_pts}")
+        # quit()
 
         # face_id
         self.use_face_id = use_face_id
