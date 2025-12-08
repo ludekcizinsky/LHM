@@ -663,7 +663,7 @@ class MultiHumanTrainer(Inferrer):
         optimizer = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
         # Pre-optimization visualization (epoch 0).
-        if getattr(self.cfg, "eval_every_epoch", 0) > 0:
+        if self.cfg.eval_pretrain:
             self.eval_loop(0)
 
         # Training loop
@@ -729,8 +729,19 @@ class MultiHumanTrainer(Inferrer):
                         }
                     )
 
-                batch += 1
+                # Debug saving of image
+                if batch in [0,2,4]:
+                    # define debug save dir
+                    debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name
+                    debug_save_dir.mkdir(parents=True, exist_ok=True)
 
+                    # - create a joined image from pred_masked and gt_masked for debugging
+                    overlay = comp_rgb*0.5 + gt_masked*0.5
+                    joined_image = torch.cat([comp_rgb, gt_masked, overlay], dim=3)  # Concatenate along width
+                    debug_image_path = debug_save_dir / f"rgb_loss_input.png"
+                    save_image(joined_image.permute(0, 3, 1, 2), str(debug_image_path))
+
+                batch += 1
 
             # End of epoch
             # - Report average loss
@@ -955,6 +966,13 @@ class MultiHumanTrainer(Inferrer):
         csv_path_avg_cam = root_save_dir / "metrics_avg_per_camera.csv"
         df_avg_cam.to_csv(csv_path_avg_cam, index=False)
 
+        # - log to wandb the per cam metrics
+        if self.cfg.wandb.enable:
+            for _, row in df_avg_cam.iterrows():
+                to_log = {f"eval_nv/cam_{row['camera_id']}/{metric_name}": row[metric_name] for metric_name in ["psnr", "ssim", "lpips"]}
+                to_log["epoch"] = epoch
+                wandb.log(to_log)
+
         # - save overall average metrics excluding self.cfg.nvs_eval.source_camera_id
         df_excluding_source = df[df["camera_id"] != self.cfg.nvs_eval.source_camera_id]
         overall_avg = {
@@ -967,6 +985,10 @@ class MultiHumanTrainer(Inferrer):
             for k, v in overall_avg.items():
                 f.write(f"{k}: {v:.4f}\n")
 
+        # - log the overall average metrics to wandb
+        if self.cfg.wandb.enable:
+            to_log = {f"eval_nv/all_cam/{metric_name}": v for metric_name, v in overall_avg.items()}
+            to_log["epoch"] = epoch
 
     def infer(self):
         # keep this here for compatibility
@@ -977,9 +999,9 @@ class MultiHumanTrainer(Inferrer):
         pass
 
 
-@hydra.main(config_path="configs", config_name="finetune", version_base="1.3")
+@hydra.main(config_path="configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig):
-    tuner = MultiHumanFinetuner(cfg)
+    tuner = MultiHumanTrainer(cfg)
     tuner.train_loop()
 
 
