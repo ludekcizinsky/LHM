@@ -1,14 +1,6 @@
-"""
-Finetune canonical Gaussian params for multiple humans using original frames as supervision.
-"""
-
-
 import os
 import sys
-import shutil
-import math
 import subprocess
-import imageio.v2 as imageio
 from dataclasses import fields
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -28,7 +20,6 @@ import kornia
 from torch.utils.data import DataLoader, Dataset
 
 from fused_ssim import fused_ssim
-import matplotlib.cm as cm
 import pyiqa
 import wandb
 
@@ -39,7 +30,6 @@ from LHM.outputs.output import GaussianAppOutput
 from LHM.runners.infer.base_inferrer import Inferrer
 from LHM.utils.hf_hub import wrap_model_hub
 
-from LHM.debug import overlay_smplx_mesh_pyrender 
 
 # ---------------------------------------------------------------------------
 # Evaluation metrics
@@ -289,76 +279,6 @@ def save_image(tensor: torch.Tensor, filename: str):
     image = (image * 255).clip(0, 255).astype("uint8")
     Image.fromarray(image).save(filename)
 
-def compute_frame_centers_from_smplx(smplx_params: dict) -> torch.Tensor:
-    """
-    smplx_params: dict containing key "trans" of shape [num_people, T, 3]
-    returns: centers of shape [1, T, 3] (mean of all people per frame)
-    """
-    trans = smplx_params["trans"]  # [num_people, T, 3]
-    centers = trans.mean(dim=0, keepdim=True)  # [1, T, 3]
-    return centers
-
-def rotate_c2ws_y_about_center(c2ws: torch.Tensor, centers: torch.Tensor, degrees: float) -> torch.Tensor:
-    """
-    Yaw cameras around a per-frame center on the world Y-axis.
-    c2ws: [..., 4, 4]
-    centers: [..., 3] matching leading dims of c2ws
-    returns: same shape as c2ws
-    """
-    # Ensure dtype/device alignment
-    centers = centers.to(dtype=c2ws.dtype, device=c2ws.device)
-
-    rad = math.radians(-degrees)
-    cos, sin = math.cos(rad), math.sin(rad)
-    R = torch.tensor(
-        [[cos, 0.0, sin, 0.0],
-         [0.0, 1.0, 0.0, 0.0],
-         [-sin, 0.0, cos, 0.0],
-         [0.0, 0.0, 0.0, 1.0]],
-        dtype=c2ws.dtype,
-        device=c2ws.device,
-    )
-
-    # Broadcast R to leading dims
-    while R.dim() < c2ws.dim():
-        R = R.unsqueeze(0)
-
-    # Build T(-center) and T(center) with shapes matching c2ws leading dims.
-    leading_shape = c2ws.shape[:-2]
-    I = torch.eye(4, dtype=c2ws.dtype, device=c2ws.device)
-    T_neg = I.expand(*leading_shape, 4, 4).clone()
-    T_pos = I.expand(*leading_shape, 4, 4).clone()
-    T_neg[..., :3, 3] = -centers
-    T_pos[..., :3, 3] = centers
-
-    # Apply: T(center) @ R_y @ T(-center) @ c2w
-    return T_pos @ (R @ (T_neg @ c2ws))
-
-
-def depth_to_color(
-    arr: np.ndarray, mask: np.ndarray | None = None, vmin: float | None = None, vmax: float | None = None
-) -> np.ndarray:
-    """Normalize depth array to 0-1 (optionally over masked region and shared vmin/vmax) and apply magma colormap."""
-    arr = arr.copy()
-    if mask is not None:
-        arr = arr * (mask > 0.5)
-        vals = arr[mask > 0.5]
-    else:
-        vals = arr
-    vals = vals[np.isfinite(vals)]
-    if vmin is None or vmax is None:
-        if vals.size > 0:
-            vmin = vals.min()
-            vmax = vals.max()
-        else:
-            vmin, vmax = 0.0, 1.0
-    if vmax > vmin:
-        norm = (arr - vmin) / (vmax - vmin)
-    else:
-        norm = arr * 0.0
-    norm = np.clip(norm, 0, 1)
-    return (cm.magma(norm)[..., :3] * 255).astype(np.uint8)
-
 
 def enable_gaussian_grads(
     gauss: GaussianAppOutput,
@@ -378,9 +298,9 @@ def enable_gaussian_grads(
 
 
 # ---------------------------------------------------------------------------
-# Finetuner
+# Trainer
 # ---------------------------------------------------------------------------
-class MultiHumanFinetuner(Inferrer):
+class MultiHumanTrainer(Inferrer):
     EXP_TYPE = "multi_human_finetune"
 
     def __init__(self, cfg: DictConfig):
