@@ -781,7 +781,7 @@ class SMPLXVoxelMeshModel(nn.Module):
         # Obtain skinning weights for the nearest vertices
         skinning_weight = self.smplx_layer.lbs_weights.float()
         skinning_weight = _query(skinning_weight, query_indx)
-        self.skinning_weight = skinning_weight.contiguous()
+        self.skinning_weight = skinning_weight.contiguous().to("cuda")
 
 
         # Obtain pose, expression, and shape directions for the original vertices

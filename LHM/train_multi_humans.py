@@ -11,6 +11,7 @@ from collections import defaultdict
 
 from omegaconf import DictConfig
 from hydra.core.global_hydra import GlobalHydra
+
 GlobalHydra.instance().clear()
 import hydra
 import numpy as np
@@ -28,6 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from LHM.outputs.output import GaussianAppOutput
 from LHM.models.rendering.custom_gs_renderer import GS3DRenderer
+from LHM.debug import overlay_smplx_mesh_pyrender
 
 # ---------------------------------------------------------------------------
 # Evaluation metrics
@@ -326,8 +328,6 @@ def build_renderer():
 # Trainer
 # ---------------------------------------------------------------------------
 class MultiHumanTrainer:
-    EXP_TYPE = "multi_human_finetune"
-
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
@@ -345,8 +345,67 @@ class MultiHumanTrainer:
         self.masks_dir = self.output_dir / "masks" / "union"
         self.depth_dir = self.output_dir / "depth_maps" / "raw"
 
+        self._load_gt_parameters()
+
 
     # ---------------- Model / data loading ----------------
+    def _load_gt_parameters(self):
+
+        root_gt_dir_path: Path = Path(self.cfg.nvs_eval.root_gt_dir_path)
+
+        # Load and prepare the gt camera parameters
+        camera_params_path: Path = root_gt_dir_path / "cameras" / "rgb_cameras.npz"
+        cam_id = self.cfg.nvs_eval.source_camera_id
+        intr, extr = load_camera_from_npz(camera_params_path, cam_id, device=self.tuner_device)
+        w2c = extr_to_w2c_4x4(extr, self.tuner_device)
+        self.c2w = torch.inverse(w2c) # shape is [4, 4]
+        self.K = intr_to_4x4(intr, self.tuner_device) # shape is [4,4]
+
+        # SMPLX
+        smplx_dir: Path = root_gt_dir_path / "smplx"
+        frame_paths = sorted([p for p in os.listdir(smplx_dir) if p.endswith(".npz")])
+        npzs = []
+        for fp in frame_paths:
+            npz = np.load(smplx_dir / f"{Path(fp).stem}.npz")
+            npzs.append(npz)
+
+        def stack_key(key):
+            arrs = [torch.from_numpy(n[key]).float() for n in npzs]
+            return torch.stack(arrs, dim=1).to(self.tuner_device)  # [P, F, ...]
+
+        betas = stack_key("betas")[:, 0, :10] # [P, 10]
+        gt_smplx = {
+            "betas": betas,
+            "root_pose": stack_key("root_pose"),   # [P,F,3] world axis-angle
+            "body_pose": stack_key("body_pose"),
+            "jaw_pose": stack_key("jaw_pose"),
+            "leye_pose": stack_key("leye_pose"),
+            "reye_pose": stack_key("reye_pose"),
+            "lhand_pose": stack_key("lhand_pose"),
+            "rhand_pose": stack_key("rhand_pose"),
+            "trans": stack_key("trans"),           # [P,F,3] world translation
+            "expr": stack_key("expression"),
+        }
+
+        gt_smplx["expr"] = torch.zeros(gt_smplx["expr"].shape[0], gt_smplx["expr"].shape[1], 100, device=self.tuner_device)
+
+        self.gt_query_points, self.gt_smplx = self.renderer.get_query_points(gt_smplx, self.tuner_device)
+
+        # Canonical 3DGS
+        root_gs_model_dir = self.output_dir / "initial_scene_recon"
+        track_ids = sorted(
+            [
+                track_id
+                for track_id in os.listdir(root_gs_model_dir)
+                if (root_gs_model_dir / track_id).is_dir()
+            ]
+        )
+        self.gt_gs_model_list = []
+        for track_id in track_ids:
+            gs_model_dir = root_gs_model_dir / track_id
+            gs_model_list = torch.load(gs_model_dir / "gt_gs_model_list.pt", map_location=self.tuner_device)
+            self.gt_gs_model_list.extend(gs_model_list)
+
     def _load_gs_model(self, root_output_dir: Path):
         refined_dir = root_output_dir / "refined_scene_recon" / self.cfg.exp_name
         root_gs_model_dir = refined_dir if (refined_dir / "00").exists() else root_output_dir / "initial_scene_recon"
@@ -358,7 +417,6 @@ class MultiHumanTrainer:
             ]
         )
         self.all_model_list = []
-        self.track_meta = []
         for track_id in track_ids:
             gs_model_dir = root_gs_model_dir / track_id
             gs_model_list = torch.load(gs_model_dir / "gs_model_list.pt", map_location=self.tuner_device)
@@ -370,17 +428,7 @@ class MultiHumanTrainer:
             shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).unsqueeze(0).to(self.tuner_device)
             model = (gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_params)
             self.all_model_list.append(model)
-            motion_seq_for_save = copy.deepcopy(motion_seq)
-            self.track_meta.append(
-                {
-                    "track_id": track_id,
-                    "gs_count": len(gs_model_list),
-                    "query_count": query_points.shape[0],
-                    "transform_count": transform_mat_neutral_pose.shape[0],
-                    "motion_seq": motion_seq_for_save,
-                    "shape_params": shape_params,
-                }
-            )
+
 
     def _prepare_joined_inputs(self):
         train_fields = tuple(self.train_params)
@@ -589,6 +637,41 @@ class MultiHumanTrainer:
         render_intrs = torch.index_select(self.motion_seq["render_intrs"], 1, frame_indices).to(self.tuner_device)
         return smplx, render_c2ws, render_intrs
 
+    def _slice_motion_using_gt(self, frame_indices: torch.Tensor):
+
+        # Batched smplx params
+        keys = [
+            "root_pose",
+            "body_pose",
+            "jaw_pose",
+            "leye_pose",
+            "reye_pose",
+            "lhand_pose",
+            "rhand_pose",
+            "trans",
+            "expr",
+        ]
+        batch_smplx = dict()
+        batch_smplx["transform_mat_neutral_pose"] = self.gt_smplx["transform_mat_neutral_pose"]
+        batch_smplx["betas"] = self.gt_smplx["betas"]
+        for key in keys:
+            batch_smplx[key] = torch.index_select(
+                self.gt_smplx[key], 1, frame_indices.to(self.gt_smplx[key].device)
+            ).to(self.tuner_device)
+
+        # Camera parameters
+        bsize = frame_indices.shape[0]
+
+        batch_c2w = self.c2w.to(self.tuner_device)          # [4, 4]
+        batch_c2w = batch_c2w.unsqueeze(0).unsqueeze(1)     # [1, 1, 4, 4]
+        batch_c2w = batch_c2w.expand(1, bsize, 4, 4)        # [1, bsize, 4, 4]
+
+        batch_intr = self.K.to(self.tuner_device) # [4,4]
+        batch_intr = batch_intr.unsqueeze(0).unsqueeze(1) # [1, 1, 4, 4]
+        batch_intr = batch_intr.expand(1, bsize, 4, 4) # [1, bsize, 4, 4]
+
+        return batch_smplx, batch_c2w, batch_intr
+
     def animation_infer_custom(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_hw):
         '''Inference code avoid repeat forward.
         '''
@@ -634,15 +717,15 @@ class MultiHumanTrainer:
     def _render_batch(self, frame_indices: torch.Tensor):
 
         # Prepare rendering inputs
-        smplx_params, render_c2ws, render_intrs = self._slice_motion(frame_indices)
+        smplx_params, render_c2ws, render_intrs = self._slice_motion_using_gt(frame_indices)
 
         # Override background to black
-        render_bg_colors = torch.zeros((1, self.cfg.batch_size, 3))
+        render_bg_colors = torch.zeros((1, self.cfg.batch_size, 3), device=self.tuner_device)
 
         # Render
         return self.animation_infer_custom(
-            self.gs_model_list,
-            self.query_points,
+            self.gt_gs_model_list,
+            self.gt_query_points,
             smplx_params,
             render_c2ws=render_c2ws,
             render_intrs=render_intrs,
@@ -717,7 +800,7 @@ class MultiHumanTrainer:
         first_frame = dataset[0][1]
         self.trn_render_hw = first_frame.shape[:2]
         loader = DataLoader(
-            dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, drop_last=False
+            dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=0, drop_last=False
         )
 
         # Initialize optimizer
@@ -802,6 +885,19 @@ class MultiHumanTrainer:
                     joined_image = torch.cat([comp_rgb, gt_masked, overlay], dim=3)  # Concatenate along width
                     debug_image_path = debug_save_dir / f"rgb_loss_input.png"
                     save_image(joined_image.permute(0, 3, 1, 2), str(debug_image_path))
+
+                    # - create smpl overlay over original rgb
+                    smplx_model = self.renderer.smplx_model
+                    smplx_overlayed_frames = overlay_smplx_mesh_pyrender(frames, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
+                    debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_original_rgb.png"
+                    save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
+
+                    # - create smpl overlaye over rendered rgb
+                    smplx_overlayed_frames = overlay_smplx_mesh_pyrender(comp_rgb, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
+                    debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_rendered_rgb.png"
+                    save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
+                    quit()
+
 
                 batch += 1
 

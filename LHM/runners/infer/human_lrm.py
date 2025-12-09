@@ -721,32 +721,40 @@ class HumanLRMInferrer(Inferrer):
         torch.save(motion_seq, motion_seq_save_path)
         print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
 
-        # prepare smplx params 
-        smplx_params = motion_seq['smplx_params']
-        smplx_params['betas'] = shape_param.to(device)
-        for k in smplx_params:
-            print(f"[DEBUG] smplx x params key: {k}, shape: {smplx_params[k].shape}")
 
-
-        # Get canonical gs model and query points
+        # Get canonical gs model based on the predicted betas
         self.model.to(dtype)
-        gs_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
+        gs_model_list, _, _ = self.model.infer_single_view(
             image.unsqueeze(0).to(device, dtype),
             src_head_rgb.unsqueeze(0).to(device, dtype),
-            smplx_params={
-                k: v.to(device) for k, v in smplx_params.items()
-            },
+            smplx_params={"betas": shape_param.to(device)}
         )
-        # Save gs model, query points and transform_mat_neutral_pose
+        print(f"Shape of the shape params: {shape_param.shape}")
         gs_model_save_path = Path(self.cfg.save_dir) / "gs_model_list.pt"
-        query_points_save_path = Path(self.cfg.save_dir) / "query_points.pt"
-        transform_mat_save_path = Path(self.cfg.save_dir) / "transform_mat_neutral_pose.pt"
         torch.save(gs_model_list, gs_model_save_path)
-        torch.save(query_points, query_points_save_path)
-        torch.save(transform_mat_neutral_pose, transform_mat_save_path)
-        print(f"[DEBUG] saved gs model list to {gs_model_save_path}")
-        print(f"[DEBUG] saved query points to {query_points_save_path}")
-        print(f"[DEBUG] saved transform matrix to {transform_mat_save_path}")
+
+
+#        # Get canonical gs model based on the gt betas
+        #smplx_dir = Path("/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair17_1/pair17/dance17/smplx")
+        #frame_paths = sorted([p for p in os.listdir(smplx_dir) if p.endswith(".npz")])
+        #npzs = []
+        #for fp in frame_paths:
+            #npz = np.load(smplx_dir / f"{Path(fp).stem}.npz")
+            #npzs.append(npz)
+
+        #def stack_key(key):
+            #arrs = [torch.from_numpy(n[key]).float() for n in npzs]
+            #return torch.stack(arrs, dim=1).to(device)  # [P, F, ...]
+
+        #betas = stack_key("betas")[1:2, 0, :10] # [P, 10]
+
+        #gs_model_list, _, _ = self.model.infer_single_view(
+            #image.unsqueeze(0).to(device, dtype),
+            #src_head_rgb.unsqueeze(0).to(device, dtype),
+            #smplx_params={"betas": betas.to(device)}
+        #)
+        #gs_model_save_path = Path(self.cfg.save_dir) / "gt_gs_model_list.pt"
+        #torch.save(gs_model_list, gs_model_save_path)
 
         return 
 
