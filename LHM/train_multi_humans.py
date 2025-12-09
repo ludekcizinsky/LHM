@@ -888,16 +888,19 @@ class MultiHumanTrainer:
 
                     # - create smpl overlay over original rgb
                     smplx_model = self.renderer.smplx_model
-                    smplx_overlayed_frames = overlay_smplx_mesh_pyrender(frames, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
+                    smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(gt_masked, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
                     debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_original_rgb.png"
                     save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
+                    avg_first_frame_iou = sum(ious[0]) / len(ious[0])
+                    print(f"Average IoU original RGB first frame: {avg_first_frame_iou:.2f}")
 
                     # - create smpl overlaye over rendered rgb
-                    smplx_overlayed_frames = overlay_smplx_mesh_pyrender(comp_rgb, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
+                    smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(comp_rgb, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
                     debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_rendered_rgb.png"
                     save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
+                    avg_first_frame_iou = sum(ious[0]) / len(ious[0])
+                    print(f"Average IoU rendered RGB first frame: {avg_first_frame_iou:.2f}")
                     quit()
-
 
                 batch += 1
 

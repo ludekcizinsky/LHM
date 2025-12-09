@@ -78,11 +78,14 @@ def overlay_smplx_mesh_pyrender(
     )
 
     out_frames: List[torch.Tensor] = []
+    out_ious: List[float] = []
     for fi in range(num_frames):
         base_img = (images[fi].detach().cpu().numpy() * 255).astype(np.uint8)
         depth_map = np.ones((H, W)) * np.inf
-        overlay_img = base_img.astype(np.float32)
+        base_img_float = base_img.astype(np.float32)
+        overlay_img = base_img_float.copy()
 
+        p_ious = list()
         for pid in range(num_people):
             verts = smplx_base_vertices(
                 smplx_model, smplx_params, pid, fi, device
@@ -118,12 +121,30 @@ def overlay_smplx_mesh_pyrender(
             valid_mask = (rend_depth < depth_map) & (rend_depth > 0)
             depth_map[valid_mask] = rend_depth[valid_mask]
             valid_mask = valid_mask[..., None]
+
+
+            color_mask = np.any(color[..., :3] != 0, axis=-1)
+            overlay_mask = np.any(overlay_img[..., :3] != 0, axis=-1) 
+            union_mask = color_mask | overlay_mask
+            if union_mask.any():
+                intersection = color_mask & overlay_mask
+                iou = float(
+                    intersection.sum(dtype=np.float32)
+                    / union_mask.sum(dtype=np.float32)
+                )
+            else:
+                iou = 0.0
+            
+            p_ious.append(iou)
+
+            # overlay
             overlay_img = valid_mask * color[..., :3] + (1.0 - valid_mask) * overlay_img
 
         overlay_tensor = (
             torch.from_numpy(overlay_img).to(device=images.device, dtype=images.dtype) / 255.0
         )
         out_frames.append(overlay_tensor)
+        out_ious.append(p_ious)
     renderer.delete()
 
-    return torch.stack(out_frames, dim=0)
+    return torch.stack(out_frames, dim=0), out_ious
