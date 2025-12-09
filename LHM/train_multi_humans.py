@@ -587,8 +587,7 @@ class MultiHumanTrainer:
 
         render_c2ws = torch.index_select(self.motion_seq["render_c2ws"], 1, frame_indices).to(self.tuner_device)
         render_intrs = torch.index_select(self.motion_seq["render_intrs"], 1, frame_indices).to(self.tuner_device)
-        render_bg_colors = torch.index_select(self.motion_seq["render_bg_colors"], 1, frame_indices).to(self.tuner_device)
-        return smplx, render_c2ws, render_intrs, render_bg_colors
+        return smplx, render_c2ws, render_intrs
 
     def animation_infer_custom(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_hw):
         '''Inference code avoid repeat forward.
@@ -633,9 +632,14 @@ class MultiHumanTrainer:
         return out
 
     def _render_batch(self, frame_indices: torch.Tensor):
-        smplx_params, render_c2ws, render_intrs, render_bg_colors = self._slice_motion(frame_indices)
+
+        # Prepare rendering inputs
+        smplx_params, render_c2ws, render_intrs = self._slice_motion(frame_indices)
+
         # Override background to black
-        render_bg_colors = torch.zeros_like(render_bg_colors)
+        render_bg_colors = torch.zeros((1, self.cfg.batch_size, 3))
+
+        # Render
         return self.animation_infer_custom(
             self.gs_model_list,
             self.query_points,
