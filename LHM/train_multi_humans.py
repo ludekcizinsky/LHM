@@ -543,27 +543,6 @@ class MultiHumanTrainer:
                 if torch.is_tensor(t) and t.requires_grad:
                     params.append(t)
 
-        if self.cfg.tune_motion:
-            # enable grads on SMPL-X params inside the renderer if present
-            smplx = self.renderer.smplx_model
-            # enable trainable skinning if available
-            if hasattr(smplx, "use_trainable_skinning"):
-                smplx.use_trainable_skinning = True
-            for attr in ("shape_params", "pose_params", "expr_dirs", "pose_dirs", "shape_dirs", "voxel_ws", "skinning_weight"):
-                if hasattr(smplx, attr):
-                    v = getattr(smplx, attr)
-                    if torch.is_tensor(v):
-                        v.requires_grad_(True)
-                        params.append(v)
-        else:
-            smplx = self.renderer.smplx_model
-            if hasattr(smplx, "use_trainable_skinning"):
-                smplx.use_trainable_skinning = False
-            for attr in ("voxel_ws", "skinning_weight"):
-                if hasattr(smplx, attr):
-                    v = getattr(smplx, attr)
-                    if torch.is_tensor(v):
-                        v.requires_grad_(False)
         return params
 
     def _slice_motion(self, frame_indices: torch.Tensor):

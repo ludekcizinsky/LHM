@@ -735,16 +735,6 @@ class GS3DRenderer(nn.Module):
             mean_3d = (
                 query_points + gs_attr.offset_xyz
             )  # [N, 3]  # canonical space offset.
-            # Debug extent of canonical points (before LBS)
-
-#             assert mean_3d.shape[1] == 3 and len(mean_3d.shape) == 2, "Unexpected shape for mean 3d"
-            # x_min, x_max = mean_3d[:, 0].min(), mean_3d[:, 0].max()
-            # y_min, y_max = mean_3d[:, 1].min(), mean_3d[:, 1].max()
-            # z_min, z_max = mean_3d[:, 2].min(), mean_3d[:, 2].max()
-            # print(f"[DEBUG] Canonical GS extent along X-axis min: {x_min.detach().cpu().numpy()}, max: {x_max.detach().cpu().numpy()}")
-            # print(f"[DEBUG] Canonical GS extent along Y-axis min: {y_min.detach().cpu().numpy()}, max: {y_max.detach().cpu().numpy()}")
-            # print(f"[DEBUG] Canonical GS extent along Z-axis min: {z_min.detach().cpu().numpy()}, max: {z_max.detach().cpu().numpy()}")
-            # quit()
 
             # matrix to warp predefined pose to zero-pose
             transform_mat_neutral_pose = merge_smplx_data[

@@ -764,9 +764,9 @@ class SMPLXVoxelMeshModel(nn.Module):
 
             return weights[indx]
 
-        smpl_x = self.smpl_x
 
-        # using KNN to query subdivided mesh
+        # For each dense point, compute the nearest vertex index on the template mesh
+        # result: query_indx with shape [num_dense_points]
         dense_pts = self.dense_pts.cuda()
         template_verts = self.smplx_layer.v_template
 
@@ -778,10 +778,14 @@ class SMPLXVoxelMeshModel(nn.Module):
         ).idx
         query_indx = nn_vertex_idxs.squeeze(0, -1).detach().cpu()
 
+        # Obtain skinning weights for the nearest vertices
         skinning_weight = self.smplx_layer.lbs_weights.float()
+        skinning_weight = _query(skinning_weight, query_indx)
+        self.skinning_weight = skinning_weight.contiguous()
 
-        """ PCA regression function w.r.t vertices offset
-        """
+
+        # Obtain pose, expression, and shape directions for the original vertices
+        smpl_x = self.smpl_x
         pose_dirs = self.smplx_layer.posedirs.permute(1, 0).reshape(
             smpl_x.vertex_num, 3 * (smpl_x.joint_num - 1) * 9
         )
@@ -792,6 +796,18 @@ class SMPLXVoxelMeshModel(nn.Module):
             smpl_x.vertex_num, 3 * smpl_x.shape_param_dim
         )
 
+        # Obtain pose, expression, and shape directions for the upsampled vertices
+        vertex_num_upsampled = self.dense_pts.shape[0]
+        pose_dirs = _query(pose_dirs, query_indx)
+        shape_dirs = _query(shape_dirs, query_indx)
+        expr_dirs = _query(expr_dirs, query_indx)
+        pose_dirs = pose_dirs.reshape(
+            vertex_num_upsampled * 3, (smpl_x.joint_num - 1) * 9
+        ).permute(1, 0)
+        expr_dirs = expr_dirs.view(vertex_num_upsampled, 3, smpl_x.expr_param_dim)
+        shape_dirs = shape_dirs.view(vertex_num_upsampled, 3, smpl_x.shape_param_dim)
+
+        # For each original vertex, determine if it belongs to specific body parts
         (
             is_rhand,
             is_lhand,
@@ -821,10 +837,7 @@ class SMPLXVoxelMeshModel(nn.Module):
 
         is_cavity = torch.FloatTensor(smpl_x.is_cavity)[:, None]
 
-        skinning_weight = _query(skinning_weight, query_indx)
-        pose_dirs = _query(pose_dirs, query_indx)
-        shape_dirs = _query(shape_dirs, query_indx)
-        expr_dirs = _query(expr_dirs, query_indx)
+        # Query body part membership for dense points based on nearest vertices
         is_rhand = _query(is_rhand, query_indx)
         is_lhand = _query(is_lhand, query_indx)
         is_face = _query(is_face, query_indx)
@@ -833,15 +846,6 @@ class SMPLXVoxelMeshModel(nn.Module):
         is_upper_body = _query(is_upper_body, query_indx)
         is_constrain_body = _query(is_constrain_body, query_indx)
         is_cavity = _query(is_cavity, query_indx)
-
-        vertex_num_upsampled = self.dense_pts.shape[0]
-
-        pose_dirs = pose_dirs.reshape(
-            vertex_num_upsampled * 3, (smpl_x.joint_num - 1) * 9
-        ).permute(1, 0)
-        expr_dirs = expr_dirs.view(vertex_num_upsampled, 3, smpl_x.expr_param_dim)
-        shape_dirs = shape_dirs.view(vertex_num_upsampled, 3, smpl_x.shape_param_dim)
-
         (
             is_rhand,
             is_lhand,
@@ -861,8 +865,7 @@ class SMPLXVoxelMeshModel(nn.Module):
         )
         is_cavity = is_cavity[:, 0] > 0
 
-        # self.register_buffer('pos_enc_mesh', xyz)
-        self.skinning_weight = torch.nn.Parameter(skinning_weight.contiguous(), requires_grad=True)
+        # Finally, for all the upsampled attributes, register them as buffers
         self.register_buffer("pose_dirs", pose_dirs.contiguous())
         self.register_buffer("expr_dirs", expr_dirs.contiguous())
         self.register_buffer("shape_dirs", shape_dirs.contiguous())
@@ -875,14 +878,14 @@ class SMPLXVoxelMeshModel(nn.Module):
         self.register_buffer("is_constrain_body", is_constrain_body.contiguous())
         self.register_buffer("is_cavity", is_cavity.contiguous())
 
+        # Save the number of upsampled vertices
         self.vertex_num_upsampled = vertex_num_upsampled
         self.smpl_x.vertex_num_upsampled = vertex_num_upsampled  # compatible with SMPLX
 
-        voxel_skinning_weight, voxel_bbox = self.voxel_skinning_init(voxel_size=192)
-        self.voxel_ws = torch.nn.Parameter(voxel_skinning_weight, requires_grad=True)
-        self.register_buffer("voxel_bbox", voxel_bbox)
-        # Controls whether to use trainable voxel weights for all points.
-        self.use_trainable_skinning = False
+        # Init the voxel skinning
+#        voxel_skinning_weight, voxel_bbox = self.voxel_skinning_init(voxel_size=192)
+        #self.voxel_ws = voxel_skinning_weight
+        #self.register_buffer("voxel_bbox", voxel_bbox)
 
 
     def get_body_infos(self):
@@ -1030,22 +1033,30 @@ class SMPLXVoxelMeshModel(nn.Module):
         return transform_mat_joint, posed_joints
 
     def get_transform_mat_vertex(self, transform_mat_joint, query_points, fix_mask):
+
+        # Old implementation:
+#        batch_size = transform_mat_joint.shape[0]
+
+        #query_skinning = self.query_voxel_skinning_weights(query_points)
+        #skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1).to("cuda")
+        #query_skinning[fix_mask] = skinning_weight[fix_mask]
+
+        #transform_mat_vertex = torch.matmul(
+            #skinning_weight,
+            #transform_mat_joint.view(batch_size, self.smpl_x.joint_num, 16),
+        #).view(batch_size, self.smpl_x.vertex_num_upsampled, 4, 4)
+        #return transform_mat_vertex
+
+        # New implementation
         batch_size = transform_mat_joint.shape[0]
-
-        query_skinning = self.query_voxel_skinning_weights(query_points)
-
-        if self.use_trainable_skinning:
-            # Start from trainable base weights to preserve initialization quality.
-            skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)
-        else:
-            # Original behavior: use base skinning weights (voxel query ignored in final mat).
-            skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)
+        skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1).to("cuda")
 
         transform_mat_vertex = torch.matmul(
             skinning_weight,
             transform_mat_joint.view(batch_size, self.smpl_x.joint_num, 16),
         ).view(batch_size, self.smpl_x.vertex_num_upsampled, 4, 4)
         return transform_mat_vertex
+
 
     def get_posed_blendshape(self, smplx_param):
         # posed_blendshape is only applied on hand and face, which parts are closed to smplx model
@@ -1159,9 +1170,15 @@ class SMPLXVoxelMeshModel(nn.Module):
         # get nearest vertex
 
         # for hands and face, assign original vertex index to use sknning weight of the original vertex
+        mask = (
+            ((self.is_rhand + self.is_lhand + self.is_face) > 0)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        ).to(device)
+
         # compute vertices-LBS function
         transform_mat_null_vertex = self.get_transform_mat_vertex(
-            transform_mat_neutral_pose, mean_3d, None
+            transform_mat_neutral_pose, mean_3d, mask
         )
 
         null_mean_3d = self.lbs(
@@ -1187,7 +1204,7 @@ class SMPLXVoxelMeshModel(nn.Module):
 
         # compute vertices-LBS function
         transform_mat_vertex = self.get_transform_mat_vertex(
-            transform_mat_joint, mean_3d, None
+            transform_mat_joint, mean_3d, mask
         )
 
         posed_mean_3d = self.lbs(
