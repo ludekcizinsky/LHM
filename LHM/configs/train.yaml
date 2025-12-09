@@ -4,16 +4,16 @@ exp_name: ???
 output_dir: /scratch/izar/cizinsky/thesis/preprocessing/${scene_name}/lhm
 epochs: 50
 batch_size: 5
-lr: 1e-8
+lr: 1e-4
 weight_decay: 5e-4
 grad_clip: 0.1
 sample_every: 1
 eval_every_epoch: 25
-train_params: 
-#  - offset_xyz
+train_params:
+  #- offset_xyz
   #- rotation
-  #- scaling
-  #- opacity
+  - scaling
+  - opacity
   - shs
 
 

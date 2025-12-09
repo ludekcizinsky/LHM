@@ -389,6 +389,7 @@ class MultiHumanTrainer:
         self.transform_mat_neutral_pose = None
         self.motion_seq = None
         self.shape_param = None
+        self.body_pose_param: Optional[torch.nn.Parameter] = None
 
         self.gs_track_offsets = []
         self.query_track_offsets = []
@@ -441,6 +442,23 @@ class MultiHumanTrainer:
             else:
                 self.shape_param = torch.cat([self.shape_param, p_shape_param], dim=0)
 
+        # self._init_body_pose_parameter()
+
+    def _init_body_pose_parameter(self):
+        """
+        Promote SMPL-X body pose tensor to a trainable parameter so it can
+        receive gradients alongside the Gaussian attributes.
+        """
+        if self.motion_seq is None:
+            return
+        smplx_params = self.motion_seq["smplx_params"]
+        body_pose = smplx_params.get("body_pose")
+        if body_pose is None:
+            return
+
+        body_pose = body_pose.to(self.tuner_device)
+        self.body_pose_param = torch.nn.Parameter(body_pose.detach().clone(), requires_grad=True)
+        smplx_params["body_pose"] = self.body_pose_param
 
     # ---------------- Evaluation utilities ----------------
     def _load_gt_smplx_params(self, frame_paths: List[str], smplx_dir: Path):
@@ -542,6 +560,9 @@ class MultiHumanTrainer:
                 t = getattr(gauss, name, None)
                 if torch.is_tensor(t) and t.requires_grad:
                     params.append(t)
+
+        if self.body_pose_param is not None and self.body_pose_param.requires_grad:
+            params.append(self.body_pose_param)
 
         return params
 
