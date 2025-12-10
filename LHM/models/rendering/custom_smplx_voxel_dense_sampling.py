@@ -781,8 +781,7 @@ class SMPLXVoxelMeshModel(nn.Module):
         # Obtain skinning weights for the nearest vertices
         skinning_weight = self.smplx_layer.lbs_weights.float()
         skinning_weight = _query(skinning_weight, query_indx)
-        self.skinning_weight = skinning_weight.contiguous().to("cuda")
-
+        self.register_buffer("skinning_weight", skinning_weight.contiguous())
 
         # Obtain pose, expression, and shape directions for the original vertices
         smpl_x = self.smpl_x
@@ -886,7 +885,6 @@ class SMPLXVoxelMeshModel(nn.Module):
 #        voxel_skinning_weight, voxel_bbox = self.voxel_skinning_init(voxel_size=192)
         #self.voxel_ws = voxel_skinning_weight
         #self.register_buffer("voxel_bbox", voxel_bbox)
-
 
     def get_body_infos(self):
 
@@ -1034,22 +1032,12 @@ class SMPLXVoxelMeshModel(nn.Module):
 
     def get_transform_mat_vertex(self, transform_mat_joint, query_points, fix_mask):
 
-        # Old implementation:
-#        batch_size = transform_mat_joint.shape[0]
-
-        #query_skinning = self.query_voxel_skinning_weights(query_points)
-        #skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1).to("cuda")
-        #query_skinning[fix_mask] = skinning_weight[fix_mask]
-
-        #transform_mat_vertex = torch.matmul(
-            #skinning_weight,
-            #transform_mat_joint.view(batch_size, self.smpl_x.joint_num, 16),
-        #).view(batch_size, self.smpl_x.vertex_num_upsampled, 4, 4)
-        #return transform_mat_vertex
-
-        # New implementation
         batch_size = transform_mat_joint.shape[0]
-        skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1).to("cuda")
+        skinning_weight = (
+            self.skinning_weight.unsqueeze(0)
+            .repeat(batch_size, 1, 1)
+            .to(transform_mat_joint.device)
+        )
 
         transform_mat_vertex = torch.matmul(
             skinning_weight,
@@ -1111,7 +1099,13 @@ class SMPLXVoxelMeshModel(nn.Module):
         return idx
 
     def transform_to_posed_verts_from_neutral_pose(
-        self, mean_3d, smplx_data, mesh_neutral_pose, transform_mat_neutral_pose, device
+        self,
+        mean_3d,
+        smplx_data,
+        mesh_neutral_pose,
+        transform_mat_neutral_pose,
+        device,
+        return_joints: bool = False,
     ):
         """
         Transform the mean 3D vertices to posed vertices from the neutral pose.
@@ -1216,6 +1210,8 @@ class SMPLXVoxelMeshModel(nn.Module):
             transform_mat_vertex, transform_mat_null_vertex
         )  # [B, N, 4, 4]
 
+        if return_joints:
+            return posed_mean_3d, neutral_to_posed_vertex, j3d
         return posed_mean_3d, neutral_to_posed_vertex
 
     def get_query_points(self, smplx_data, device):
@@ -1250,12 +1246,13 @@ class SMPLXVoxelMeshModel(nn.Module):
         )
 
         # print(mesh_neutral_pose.shape, transform_mat_neutral_pose.shape, mesh_neutral_pose.shape, smplx_data["body_pose"].shape)
-        mean_3d, transform_matrix = self.transform_to_posed_verts_from_neutral_pose(
+        mean_3d, transform_matrix, _ = self.transform_to_posed_verts_from_neutral_pose(
             mesh_neutral_pose,
             smplx_data,
             mesh_neutral_pose,
             transform_mat_neutral_pose,
             device,
+            return_joints=True,
         )
 
         return mean_3d, transform_matrix

@@ -875,32 +875,35 @@ class MultiHumanTrainer:
                     )
 
                 # Debug saving of image
-                if batch in [0,2,4]:
+                if True:
                     # define debug save dir
-                    debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name
+                    debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name / f"epoch_{epoch+1:04d}"
                     debug_save_dir.mkdir(parents=True, exist_ok=True)
 
                     # - create a joined image from pred_masked and gt_masked for debugging
                     overlay = comp_rgb*0.5 + gt_masked*0.5
                     joined_image = torch.cat([comp_rgb, gt_masked, overlay], dim=3)  # Concatenate along width
                     debug_image_path = debug_save_dir / f"rgb_loss_input.png"
-                    save_image(joined_image.permute(0, 3, 1, 2), str(debug_image_path))
+                    for i in range(joined_image.shape[0]):
+                        image = joined_image[i:i+1]
+                        global_idx = batch * self.cfg.batch_size + i
+                        debug_image_path = debug_save_dir / f"rgb_loss_input_{global_idx}.png"
+                        save_image(image.permute(0, 3, 1, 2), str(debug_image_path))
 
-                    # - create smpl overlay over original rgb
-                    smplx_model = self.renderer.smplx_model
-                    smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(gt_masked, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
-                    debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_original_rgb.png"
-                    save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
-                    avg_first_frame_iou = sum(ious[0]) / len(ious[0])
-                    print(f"Average IoU original RGB first frame: {avg_first_frame_iou:.2f}")
+#                     # - create smpl overlay over original rgb
+                    # smplx_model = self.renderer.smplx_model
+                    # smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(gt_masked, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
+                    # debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_original_rgb.png"
+                    # save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
+                    # avg_first_frame_iou = sum(ious[0]) / len(ious[0])
+                    # print(f"Average IoU original RGB first frame: {avg_first_frame_iou:.2f}")
 
-                    # - create smpl overlaye over rendered rgb
-                    smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(comp_rgb, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
-                    debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_rendered_rgb.png"
-                    save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
-                    avg_first_frame_iou = sum(ious[0]) / len(ious[0])
-                    print(f"Average IoU rendered RGB first frame: {avg_first_frame_iou:.2f}")
-                    quit()
+                    # # - create smpl overlaye over rendered rgb
+                    # smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(comp_rgb, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
+                    # debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_rendered_rgb.png"
+                    # save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
+                    # avg_first_frame_iou = sum(ious[0]) / len(ious[0])
+                    # print(f"Average IoU rendered RGB first frame: {avg_first_frame_iou:.2f}")
 
                 batch += 1
 
@@ -913,6 +916,8 @@ class MultiHumanTrainer:
             # - Run eval loop if neccesary
             if getattr(self.cfg, "eval_every_epoch", 0) > 0 and (epoch + 1) % self.cfg.eval_every_epoch == 0:
                 self.eval_loop(epoch + 1)
+            
+            quit()
 
         if self.wandb_run is not None:
             self.wandb_run.finish()
