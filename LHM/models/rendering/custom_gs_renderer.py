@@ -785,28 +785,28 @@ class GS3DRenderer(nn.Module):
                 )
             )  # [B, N, 3]
 
-            # Joint alignment to avoid misalignment between rendered gaussians and GT images
-            # - Compute the pelvis position from the posed gaussians
-            pelvis_idx = self.smplx_model.smpl_x.root_joint_idx
-            pelvis_world = posed_joints[:, pelvis_idx, :] + merge_smplx_data["trans"]
-            gaussian_pelvis = self._compute_joint_position_based_on_gaussians(
-                joint_idx=pelvis_idx, mean_3d=mean_3d, device=device
-            )
-            pelvis_delta = pelvis_world - gaussian_pelvis
-            # - Compute the ??? position from the posed gaussians
-            chest_idx = self.smplx_model.smpl_x.joints_name.index("Spine_3")
-            chest_world = posed_joints[:, chest_idx, :] + merge_smplx_data["trans"]
-            gaussian_chest = self._compute_joint_position_based_on_gaussians(
-                joint_idx=chest_idx, mean_3d=mean_3d, device=device
-            )
-            chest_delta = chest_world - gaussian_chest
-            # - Average the two deltas to get a final delta
-            delta = (pelvis_delta + chest_delta) / 2.0  # [Nv, 3]
+#            # Joint alignment to avoid misalignment between rendered gaussians and GT images
+            ## - Compute the pelvis position from the posed gaussians
+            #pelvis_idx = self.smplx_model.smpl_x.root_joint_idx
+            #pelvis_world = posed_joints[:, pelvis_idx, :] + merge_smplx_data["trans"]
+            #gaussian_pelvis = self._compute_joint_position_based_on_gaussians(
+                #joint_idx=pelvis_idx, mean_3d=mean_3d, device=device
+            #)
+            #pelvis_delta = pelvis_world - gaussian_pelvis
+            ## - Compute the ??? position from the posed gaussians
+            #chest_idx = self.smplx_model.smpl_x.joints_name.index("Spine_3")
+            #chest_world = posed_joints[:, chest_idx, :] + merge_smplx_data["trans"]
+            #gaussian_chest = self._compute_joint_position_based_on_gaussians(
+                #joint_idx=chest_idx, mean_3d=mean_3d, device=device
+            #)
+            #chest_delta = chest_world - gaussian_chest
+            ## - Average the two deltas to get a final delta
+            #delta = (pelvis_delta + chest_delta) / 2.0  # [Nv, 3]
 
-            # - Here, we use the sign of the mean offset z to determine whether to add or subtract the delta
-            # - Note to future self: this is where things could go wrong - only tested for a single scene and 2 humans only
-            delta_sign = -1 if gs_attr.offset_xyz.mean(dim=0)[-1] < 0 else 1
-            mean_3d = mean_3d + delta.unsqueeze(1) * delta_sign
+            ## - Here, we use the sign of the mean offset z to determine whether to add or subtract the delta
+            ## - Note to future self: this is where things could go wrong - only tested for a single scene and 2 humans only
+            #delta_sign = -1 if gs_attr.offset_xyz.mean(dim=0)[-1] < 0 else 1
+            #mean_3d = mean_3d + delta.unsqueeze(1) * delta_sign
 
             # rotation appearance from canonical space to view_posed
             num_view, N, _, _ = transform_matrix.shape

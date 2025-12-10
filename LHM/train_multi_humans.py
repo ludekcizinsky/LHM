@@ -1,7 +1,7 @@
 import os
 import sys
 import subprocess
-from dataclasses import fields
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import List, Tuple, Optional
 import copy
@@ -874,36 +874,6 @@ class MultiHumanTrainer:
                         }
                     )
 
-                # Debug saving of image
-                if True:
-                    # define debug save dir
-                    debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name / f"epoch_{epoch+1:04d}"
-                    debug_save_dir.mkdir(parents=True, exist_ok=True)
-
-                    # - create a joined image from pred_masked and gt_masked for debugging
-                    overlay = comp_rgb*0.5 + gt_masked*0.5
-                    joined_image = torch.cat([comp_rgb, gt_masked, overlay], dim=3)  # Concatenate along width
-                    debug_image_path = debug_save_dir / f"rgb_loss_input.png"
-                    for i in range(joined_image.shape[0]):
-                        image = joined_image[i:i+1]
-                        global_idx = batch * self.cfg.batch_size + i
-                        debug_image_path = debug_save_dir / f"rgb_loss_input_{global_idx}.png"
-                        save_image(image.permute(0, 3, 1, 2), str(debug_image_path))
-
-#                     # - create smpl overlay over original rgb
-                    # smplx_model = self.renderer.smplx_model
-                    # smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(gt_masked, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
-                    # debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_original_rgb.png"
-                    # save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
-                    # avg_first_frame_iou = sum(ious[0]) / len(ious[0])
-                    # print(f"Average IoU original RGB first frame: {avg_first_frame_iou:.2f}")
-
-                    # # - create smpl overlaye over rendered rgb
-                    # smplx_overlayed_frames, ious = overlay_smplx_mesh_pyrender(comp_rgb, smplx_params, smplx_model, render_intrs[0, 0], render_c2ws[0, 0], self.tuner_device)
-                    # debug_smplx_overlay_path = debug_save_dir / f"smplx_overlay_rendered_rgb.png"
-                    # save_image(smplx_overlayed_frames.permute(0, 3, 1, 2), str(debug_smplx_overlay_path))
-                    # avg_first_frame_iou = sum(ious[0]) / len(ious[0])
-                    # print(f"Average IoU rendered RGB first frame: {avg_first_frame_iou:.2f}")
 
                 batch += 1
 
@@ -917,12 +887,11 @@ class MultiHumanTrainer:
             if getattr(self.cfg, "eval_every_epoch", 0) > 0 and (epoch + 1) % self.cfg.eval_every_epoch == 0:
                 self.eval_loop(epoch + 1)
             
-            quit()
-
         if self.wandb_run is not None:
             self.wandb_run.finish()
 
     # ---------------- Evaluation -------------------
+    @torch.no_grad()
     def eval_loop(self, epoch):
 
         # Parse the evaluation setup
@@ -954,7 +923,6 @@ class MultiHumanTrainer:
             tgt_c2w = torch.inverse(tgt_w2c)
             tgt_intr4 = intr_to_4x4(tgt_intr, self.tuner_device)
 
-
             # Prepare dataset and dataloader for loading frames and masks
             dataset = FrameMaskDataset(tgt_gt_frames_dir_path, tgt_gt_masks_dir_path, self.tuner_device, sample_every=1)
             loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=0, drop_last=False)
@@ -980,14 +948,12 @@ class MultiHumanTrainer:
                     
                     # Load the gt SMPL-X parameters
                     frame_indices = frame_indices.to(self.tuner_device)
-                    smplx_params = self._load_gt_smplx_params(
-                        frame_paths, root_gt_dir_path / "smplx"
-                    )
+                    smplx_params, _, _ = self._slice_motion_using_gt(frame_indices)
 
                     # Render with the model
                     res = self.animation_infer_custom(
-                        self.gs_model_list,
-                        self.query_points,
+                        self.gt_gs_model_list,
+                        self.gt_query_points,
                         smplx_params,
                         render_c2ws=render_c2ws,
                         render_intrs=render_intrs,
@@ -995,37 +961,37 @@ class MultiHumanTrainer:
                         render_hw=(gt_h, gt_w),
                     )
 
-                    # Estimate translation offset between rendered and GT masks
-                    delta_world = self._estimate_world_translation_offset(
-                        render_mask=res["comp_rgb"] > 0.05,
-                        gt_mask=masks,
-                        intr=tgt_intr,
-                        c2w=tgt_c2w,
-                        w2c=tgt_w2c,
-                        smplx_trans=smplx_params["trans"],
-                    )
-                    delta_world = delta_world.clamp(-max_shift_m, max_shift_m)
+#                    # Estimate translation offset between rendered and GT masks
+                    #delta_world = self._estimate_world_translation_offset(
+                        #render_mask=res["comp_rgb"] > 0.05,
+                        #gt_mask=masks,
+                        #intr=tgt_intr,
+                        #c2w=tgt_c2w,
+                        #w2c=tgt_w2c,
+                        #smplx_trans=smplx_params["trans"],
+                    #)
+                    #delta_world = delta_world.clamp(-max_shift_m, max_shift_m)
 
-                    # Find the best alpha for the translation offset
-                    best_res = res
-                    best_iou = -1.0
-                    for idx, alpha in enumerate(alpha_candidates):
-                        cand_c2ws = render_c2ws.clone()
-                        cand_c2ws[:, :, :3, 3] -= alpha * delta_world.unsqueeze(0)
-                        cand_res = self.animation_infer_custom(
-                            self.gs_model_list,
-                            self.query_points,
-                            smplx_params,
-                            render_c2ws=cand_c2ws,
-                            render_intrs=render_intrs,
-                            render_bg_colors=render_bg_colors,
-                            render_hw=(gt_h, gt_w),
-                        )
-                        iou = self._mask_iou(cand_res["comp_rgb"] > 0.05, masks).mean()
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_res = cand_res
-                    res = best_res
+                    ## Find the best alpha for the translation offset
+                    #best_res = res
+                    #best_iou = -1.0
+                    #for idx, alpha in enumerate(alpha_candidates):
+                        #cand_c2ws = render_c2ws.clone()
+                        #cand_c2ws[:, :, :3, 3] -= alpha * delta_world.unsqueeze(0)
+                        #cand_res = self.animation_infer_custom(
+                            #self.gs_model_list,
+                            #self.query_points,
+                            #smplx_params,
+                            #render_c2ws=cand_c2ws,
+                            #render_intrs=render_intrs,
+                            #render_bg_colors=render_bg_colors,
+                            #render_hw=(gt_h, gt_w),
+                        #)
+                        #iou = self._mask_iou(cand_res["comp_rgb"] > 0.05, masks).mean()
+                        #if iou > best_iou:
+                            #best_iou = iou
+                            #best_res = cand_res
+                    #res = best_res
 
                     # Save rendered images
                     renders = res["comp_rgb"]  # [B, H, W, 3]
