@@ -686,6 +686,30 @@ class GS3DRenderer(nn.Module):
 
         return ret
 
+
+    def _compute_joint_position_based_on_gaussians(self, joint_idx, mean_3d, device):
+        joint_weights_full = self.smplx_model.skinning_weight[:, joint_idx].to(
+            device
+        ) # [N,]
+        # - Select only the gaussians that have non-negligible weights for the given joint
+        joint_mask = joint_weights_full > 0.2
+        if joint_mask.sum() < 10:
+            print("[WARNING] Too few gaussians selected for joint alignment!")
+            # -- If too few gaussians are selected, pick the top 500 weighted ones
+            joint_mask = joint_weights_full.topk(500).indices
+            mask_tensor = torch.zeros_like(joint_weights_full, dtype=torch.bool)
+            mask_tensor[joint_mask] = True
+            joint_mask = mask_tensor
+        # - Normalize the weights
+        joint_weights = joint_weights_full[joint_mask].clamp_min(1e-6)
+        joint_weights = joint_weights / joint_weights.sum()
+        # - Compute the weighted average position
+        gaussian_joint = (
+            mean_3d[:, joint_mask, :] * joint_weights.view(1, -1, 1)
+        ).sum(dim=1)
+
+        return gaussian_joint
+
     def animate_gs_model_custom(
         self, gs_attr: GaussianAppOutput, query_points, smplx_data
     ):
@@ -761,34 +785,24 @@ class GS3DRenderer(nn.Module):
                 )
             )  # [B, N, 3]
 
-            # Pelvis alignment to avoid misalignment between rendered gaussians and GT images
-            # - Compute pelvis position in world space
+            # Joint alignment to avoid misalignment between rendered gaussians and GT images
+            # - Compute the pelvis position from the posed gaussians
             pelvis_idx = self.smplx_model.smpl_x.root_joint_idx
             pelvis_world = posed_joints[:, pelvis_idx, :] + merge_smplx_data["trans"]
+            gaussian_pelvis = self._compute_joint_position_based_on_gaussians(
+                joint_idx=pelvis_idx, mean_3d=mean_3d, device=device
+            )
+            pelvis_delta = pelvis_world - gaussian_pelvis
+            # - Compute the ??? position from the posed gaussians
+            chest_idx = self.smplx_model.smpl_x.joints_name.index("Spine_3")
+            chest_world = posed_joints[:, chest_idx, :] + merge_smplx_data["trans"]
+            gaussian_chest = self._compute_joint_position_based_on_gaussians(
+                joint_idx=chest_idx, mean_3d=mean_3d, device=device
+            )
+            chest_delta = chest_world - gaussian_chest
+            # - Average the two deltas to get a final delta
+            delta = (pelvis_delta + chest_delta) / 2.0  # [Nv, 3]
 
-            # - Compute pelvis position from gaussians using skinning weights
-            pelvis_weights_full = self.smplx_model.skinning_weight[:, pelvis_idx].to(
-                device
-            ) # [N,]
-            # - Select only the gaussians that have non-negligible weights for pelvis
-            pelvis_mask = pelvis_weights_full > 0.2
-            if pelvis_mask.sum() < 10:
-                print("[WARNING] Too few gaussians selected for pelvis alignment!")
-                # -- If too few gaussians are selected, pick the top 500 weighted ones
-                pelvis_mask = pelvis_weights_full.topk(500).indices
-                mask_tensor = torch.zeros_like(pelvis_weights_full, dtype=torch.bool)
-                mask_tensor[pelvis_mask] = True
-                pelvis_mask = mask_tensor
-            # - Normalize the weights
-            pelvis_weights = pelvis_weights_full[pelvis_mask].clamp_min(1e-6)
-            pelvis_weights = pelvis_weights / pelvis_weights.sum()
-            # - Compute the weighted average position
-            gaussian_pelvis = (
-                mean_3d[:, pelvis_mask, :] * pelvis_weights.view(1, -1, 1)
-            ).sum(dim=1)
-
-            # - Finally compute delta 
-            delta = pelvis_world - gaussian_pelvis
             # - Here, we use the sign of the mean offset z to determine whether to add or subtract the delta
             # - Note to future self: this is where things could go wrong - only tested for a single scene and 2 humans only
             delta_sign = -1 if gs_attr.offset_xyz.mean(dim=0)[-1] < 0 else 1
