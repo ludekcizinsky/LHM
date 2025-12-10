@@ -405,6 +405,8 @@ class MultiHumanTrainer:
             gs_model_dir = root_gs_model_dir / track_id
             gs_model_list = torch.load(gs_model_dir / "gt_gs_model_list.pt", map_location=self.tuner_device)
             self.gt_gs_model_list.extend(gs_model_list)
+        
+        print(f" len of gt gs model list is {len(self.gt_gs_model_list)}")
 
     def _load_gs_model(self, root_output_dir: Path):
         refined_dir = root_output_dir / "refined_scene_recon" / self.cfg.exp_name
@@ -603,14 +605,13 @@ class MultiHumanTrainer:
     # ---------------- Training utilities ----------------
     def _trainable_tensors(self) -> List[torch.Tensor]:
         params = []
-        for gauss in self.gs_model_list:
+        for gauss in self.gt_gs_model_list:
             for name in self.train_params:
                 t = getattr(gauss, name, None)
-                if torch.is_tensor(t) and t.requires_grad:
+                if torch.is_tensor(t):
+                    t.requires_grad_(True)
+                    print(f"Adding trainable tensor: {name} from gauss model")
                     params.append(t)
-
-        if self.body_pose_param is not None and self.body_pose_param.requires_grad:
-            params.append(self.body_pose_param)
 
         return params
 
@@ -1101,7 +1102,7 @@ class MultiHumanTrainer:
         # - log to wandb the per cam metrics
         if self.cfg.wandb.enable:
             for _, row in df_avg_cam.iterrows():
-                to_log = {f"eval_nv/cam_{row['camera_id']}/{metric_name}": row[metric_name] for metric_name in ["psnr", "ssim", "lpips"]}
+                to_log = {f"eval_nv/cam_{int(row['camera_id'])}/{metric_name}": row[metric_name] for metric_name in ["psnr", "ssim", "lpips"]}
                 to_log["epoch"] = epoch
                 wandb.log(to_log)
 

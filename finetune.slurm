@@ -91,10 +91,16 @@ module load gcc ffmpeg
 # root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair19_2/piggyback19
 # python LHM/train_multi_humans.py scene_name=$seq_name exp_name=$exp_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id nvs_eval.target_camera_ids=$target_cam_ids eval_pretrain=true epochs=50 eval_every_epoch=25
 
+# seq_name="hi4d_pair17_dance"
+# num_persons=2
+# exp_name="tune_offsets"
+# source_cam_id=28
+# root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair17_1/pair17/dance17
+# python LHM/train_multi_humans.py scene_name=$seq_name exp_name=$exp_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id
+
 seq_name="hi4d_pair17_dance"
 num_persons=2
-exp_name="v3"
+exp_name="tune_offsets_lr1e-5"
 source_cam_id=28
-target_cam_ids="[4,76]"
 root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair17_1/pair17/dance17
-python LHM/train_multi_humans.py scene_name=$seq_name exp_name=$exp_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id nvs_eval.target_camera_ids=$target_cam_ids 
+python LHM/train_multi_humans.py scene_name=$seq_name exp_name=$exp_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id eval_pretrain=false lr=1e-5

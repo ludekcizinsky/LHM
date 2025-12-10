@@ -2,7 +2,7 @@ scene_name: ???
 num_persons: ???
 exp_name: ???
 output_dir: /scratch/izar/cizinsky/thesis/preprocessing/${scene_name}/lhm
-epochs: 50
+epochs: 100
 batch_size: 5
 lr: 1e-4
 weight_decay: 5e-4
@@ -10,11 +10,11 @@ grad_clip: 0.1
 sample_every: 1
 eval_every_epoch: 25
 train_params:
-  #- offset_xyz
+  - offset_xyz
   #- rotation
-  - scaling
-  - opacity
-  - shs
+  #- scaling
+  #- opacity
+  #- shs
 
 
 wandb:
@@ -22,7 +22,7 @@ wandb:
   project: "hybrid-lhm"
   entity: "ludekcizinsky"
   tags:
-    - v3
+    - v4
 
 loss_weights:
   rgb: 20.0
@@ -31,8 +31,6 @@ loss_weights:
   depth: 0.1
   reg_asap: 200.0
   reg_acap: 200.0
-
-tune_motion: true
 
 eval_pretrain: true
 nvs_eval:
