@@ -18,6 +18,8 @@ from LHM.models.rendering.utils.typing import *
 from LHM.models.rendering.utils.utils import MLP
 from LHM.outputs.output import GaussianAppOutput
 
+from gsplat.rendering import rasterization
+
 
 def auto_repeat_size(tensor, repeat_num, axis=0):
     repeat_size = [1] * tensor.dim()
@@ -244,92 +246,55 @@ class GS3DRenderer(nn.Module):
         )
         return positions, smplx_data
 
-    def forward_single_view(
+    def forward_single_view_gsplat(
         self,
         gs: GaussianModel,
         viewpoint_camera: Camera,
         background_color: Optional[Float[Tensor, "3"]],
         ret_mask: bool = True,
     ):
-        # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-        screenspace_points = (
-            torch.zeros_like(
-                gs.xyz, dtype=gs.xyz.dtype, requires_grad=True, device=self.device
-            )
-            + 0
-        )
-        try:
-            screenspace_points.retain_grad()
-        except:
-            pass
 
-        bg_color = background_color
-        # Set up rasterization configuration
-        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-        raster_settings = GaussianRasterizationSettings(
-            image_height=int(viewpoint_camera.height),
-            image_width=int(viewpoint_camera.width),
-            tanfovx=tanfovx,
-            tanfovy=tanfovy,
-            bg=bg_color,
-            scale_modifier=self.scaling_modifier,
-            viewmatrix=viewpoint_camera.world_view_transform,
-            projmatrix=viewpoint_camera.full_proj_transform.float(),
-            sh_degree=self.sh_degree,
-            campos=viewpoint_camera.camera_center,
-            prefiltered=False,
-            debug=False,
-        )
-
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-        means3D = gs.xyz
-        means2D = screenspace_points
-        opacity = gs.opacity
-
-        # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-        # scaling / rotation by the rasterizer.
-        scales = None
-        rotations = None
-        cov3D_precomp = None
+        # Prepare inputs for rasterization
+        means = gs.xyz
+        quats = gs.rotation
         scales = gs.scaling
-        rotations = gs.rotation
+        opacities = gs.opacity.squeeze(-1)
+        colors = gs.shs.squeeze(1).float()
+        viewmats = viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0)
+        Ks = viewpoint_camera.intrinsic[:3, :3].unsqueeze(0)
+        width = viewpoint_camera.width
+        height = viewpoint_camera.height
+        near_plane = viewpoint_camera.znear
+        far_plane = viewpoint_camera.zfar
+        render_mode = "RGB+D"
 
-        # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-        # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-        shs = None
-        colors_precomp = None
-        if self.use_rgb:
-            colors_precomp = gs.shs.squeeze(1).float()
-            shs = None
-        else:
-            colors_precomp = None
-            shs = gs.shs.float()
+        # Perform rasterization
+        renders, alphas, _ = rasterization(
+            means,
+            quats,
+            scales,
+            opacities,
+            colors,
+            viewmats,
+            Ks,
+            width,
+            height,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            render_mode=render_mode,
+            packed=False,
+        )
 
-        # Rasterize visible Gaussians to image, obtain their radii (on screen).
-        # NOTE that dadong tries to regress rgb not shs
-        with torch.autocast(device_type=self.device.type, dtype=torch.float32):
-            rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(
-                means3D=means3D.float(),
-                means2D=means2D.float(),
-                shs=shs,
-                colors_precomp=colors_precomp,
-                opacities=opacity.float(),
-                scales=scales.float(),
-                rotations=rotations.float(),
-                cov3D_precomp=cov3D_precomp,
-            )
 
+        # Pack outputs
         ret = {
-            "comp_rgb": rendered_image.permute(1, 2, 0),  # [H, W, 3]
-            "comp_rgb_bg": bg_color,
-            "comp_mask": rendered_alpha.permute(1, 2, 0),
-            "comp_depth": rendered_depth.permute(1, 2, 0),
+            "comp_rgb": renders.squeeze(0)[..., :3],  # [H, W, 3]
+            "comp_rgb_bg": background_color,
+            "comp_mask": alphas.squeeze(0),  # [H, W, 1]
+            "comp_depth": renders.squeeze(0)[..., 3:],  # [H, W, 1]
         }
 
-        return ret 
+        return ret
 
     def forward_single_batch_custom(
         self,
@@ -346,7 +311,7 @@ class GS3DRenderer(nn.Module):
 
         for v_idx, (c2w, intrinsic) in enumerate(zip(c2ws, intrinsics)):
             out_list.append(
-                self.forward_single_view(
+                self.forward_single_view_gsplat(
                     gs_list[v_idx],
                     Camera.from_c2w(c2w, intrinsic, height, width),
                     background_color[v_idx],
