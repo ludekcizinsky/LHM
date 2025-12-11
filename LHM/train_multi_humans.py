@@ -830,7 +830,7 @@ class MultiHumanTrainer:
                 total = offsets.shape[0]
                 percent_outside = (num_outside / total) * 100.0
                 to_log = {"debug/acap_percent_outside": percent_outside}
-                if self.wandb_run.enable:
+                if self.wandb_run is not None:
                     wandb.log(to_log)
 
         asap_loss = torch.stack(asap_terms).mean() * self.cfg.regularization["asap_w"]
