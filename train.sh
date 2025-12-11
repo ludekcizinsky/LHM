@@ -37,7 +37,7 @@ cd /home/cizinsky/LHM
 
 seq_name="hi4d_pair17_dance"
 num_persons=2
-exp_name="tune_all_params"
+exp_name="tune_all_params_with_reg"
 source_cam_id=28
 # target_cam_ids="[4,16,28,40,52,64,76,88]"
 # train_params="[]"

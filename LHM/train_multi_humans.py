@@ -605,12 +605,13 @@ class MultiHumanTrainer:
     # ---------------- Training utilities ----------------
     def _trainable_tensors(self) -> List[torch.Tensor]:
         params = []
-        for gauss in self.gt_gs_model_list:
+        for pidx, gauss in enumerate(self.gt_gs_model_list):
+            print(f"For the {pidx}-th gauss model, adding trainable tensors:")
             for name in self.train_params:
                 t = getattr(gauss, name, None)
                 if torch.is_tensor(t):
                     t.requires_grad_(True)
-                    print(f"Adding trainable tensor: {name} from gauss model")
+                    print(f"    - {name}")
                     params.append(t)
 
         return params
@@ -738,27 +739,21 @@ class MultiHumanTrainer:
         """Return combined canonical regularization and its components."""
         asap_terms = []
         acap_terms = []
-        margin = 0.0525  # meters
-        for gauss in self.gs_model_list:
+        for gauss in self.gt_gs_model_list:
             # Gaussian Shape Regularization (ASAP): encourage isotropic scales.
-            scales = gauss.scaling
             # If scaling is stored in log-space, exp() keeps positivity; otherwise it’s a smooth surrogate.
+            scales = gauss.scaling
             scales_pos = torch.exp(scales)
             asap = ((scales_pos - scales_pos.mean(dim=-1, keepdim=True)) ** 2).sum(dim=-1).mean()
             asap_terms.append(asap)
 
             # Positional anchoring (ACAP): hinge on offset magnitude beyond margin.
             offsets = gauss.offset_xyz
-            acap = torch.clamp(offsets.norm(dim=-1) - margin, min=0.0).mean()
+            acap = torch.clamp(offsets.norm(dim=-1) - self.cfg.regularization['acap_margin'], min=0.0).mean()
             acap_terms.append(acap)
 
-        if len(asap_terms) == 0:
-            return torch.tensor(0.0, device=self.tuner_device), torch.tensor(0.0, device=self.tuner_device), torch.tensor(
-                0.0, device=self.tuner_device
-            )
-
-        asap_loss = torch.stack(asap_terms).mean() * self.cfg.loss_weights["reg_asap"]
-        acap_loss = torch.stack(acap_terms).mean() * self.cfg.loss_weights["reg_acap"]
+        asap_loss = torch.stack(asap_terms).mean() * self.cfg.regularization["asap_w"]
+        acap_loss = torch.stack(acap_terms).mean() * self.cfg.regularization["acap_w"]
 
         return asap_loss, acap_loss
 
@@ -835,20 +830,15 @@ class MultiHumanTrainer:
                 gt_masked = frames * mask3
 
                 # Compute loss
-                rgb_loss = F.mse_loss(comp_rgb, gt_masked)
-                sil_loss = F.mse_loss(comp_mask, masks)
+                rgb_loss = self.cfg.loss_weights["rgb"] * F.mse_loss(comp_rgb, gt_masked)
+                sil_loss = self.cfg.loss_weights["sil"] * F.mse_loss(comp_mask, masks)
                 ssim_val = fused_ssim(_ensure_nchw(comp_rgb), _ensure_nchw(gt_masked), padding="valid")
-                ssim_loss = 1.0 - ssim_val
+                ssim_loss = self.cfg.loss_weights["ssim"] * (1.0 - ssim_val)
                 asap_loss, acap_loss = self._canonical_regularization()
                 reg_loss = asap_loss + acap_loss
 
-                loss = (
-                    self.cfg.loss_weights["rgb"] * rgb_loss
-                    + self.cfg.loss_weights["sil"] * sil_loss
-                    + self.cfg.loss_weights["ssim"] * ssim_loss
-                    + reg_loss
-                )
-
+                loss = rgb_loss + sil_loss + ssim_loss + reg_loss
+                
                 # Backpropagation
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, self.cfg.grad_clip)

@@ -27,9 +27,11 @@ loss_weights:
   rgb: 20.0
   sil: 4.0
   ssim: 0.4
-  depth: 0.1
-  reg_asap: 200.0
-  reg_acap: 200.0
+
+regularization:
+  asap_w: 200.0
+  acap_w: 200.0
+  acap_margin: 0.01 # meters (1 cm)
 
 eval_pretrain: true
 nvs_eval:
