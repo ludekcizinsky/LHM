@@ -324,6 +324,80 @@ def build_renderer():
 
     return renderer
 
+
+def get_masks_based_bbox(masks: torch.Tensor, pad: int = 5) -> List[Tuple[int, int, int, int]]:
+    """
+    Get bounding boxes around masks with optional padding.
+
+    Args:
+        masks: Tensor of shape [B, H, W, 1] with mask values in [0, 1].
+        pad: Number of pixels to pad the bounding box on each side.
+
+    Returns:
+        List of bounding boxes [(y_min, y_max, x_min, x_max)] for each mask in the batch.
+    """
+
+    per_item_bboxes = []
+    global_bbox = None
+
+    for b in range(masks.shape[0]):
+        ys, xs = torch.where(masks[b, :, :, 0] > 0.5)
+        # No mask, use full image
+        if ys.numel() == 0 or xs.numel() == 0:
+            y_min, y_max = 0, masks.shape[1] - 1
+            x_min, x_max = 0, masks.shape[2] - 1
+        else:
+            y_min, y_max = ys.min(), ys.max()
+            x_min, x_max = xs.min(), xs.max()
+            # Add padding
+            y_center = (y_min + y_max) / 2
+            x_center = (x_min + x_max) / 2
+            h_half = (y_max - y_min) / 2 + pad
+            w_half = (x_max - x_min) / 2 + pad
+            y_min = max(int(y_center - h_half), 0)
+            y_max = min(int(y_center + h_half), masks.shape[1] - 1)
+            x_min = max(int(x_center - w_half), 0)
+            x_max = min(int(x_center + w_half), masks.shape[2] - 1)
+
+        bbox = (y_min, y_max, x_min, x_max)
+        per_item_bboxes.append(bbox)
+
+        if global_bbox is None:
+            global_bbox = bbox
+        else:
+            global_bbox = (
+                min(global_bbox[0], y_min),
+                max(global_bbox[1], y_max),
+                min(global_bbox[2], x_min),
+                max(global_bbox[3], x_max),
+            )
+
+    if global_bbox is None:
+        return []
+
+    return [global_bbox for _ in per_item_bboxes]
+
+def bbox_crop(bboxes: List[Tuple[int, int, int, int]], to_crop: torch.Tensor) -> torch.Tensor:
+    """
+    Crop a batch of tensors according to the provided bounding boxes.
+
+    Args:
+        bboxes: List of bounding boxes [(y_min, y_max, x_min, x_max)] for each tensor in the batch.
+        to_crop: Tensor of shape [B, H, W, C] to be cropped where C can be any number of channels.
+
+    Returns:
+        Cropped tensor of shape [B, H_crop, W_crop, C].
+    """
+
+    # Crop tensors
+    cropped = []
+    for b in range(to_crop.shape[0]):
+        y_min, y_max, x_min, x_max = bboxes[b]
+        cropped.append(to_crop[b, y_min : y_max + 1, x_min : x_max + 1, :])
+
+    return torch.stack(cropped, dim=0)
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -406,8 +480,6 @@ class MultiHumanTrainer:
             gs_model_list = torch.load(gs_model_dir / "gt_gs_model_list.pt", map_location=self.tuner_device)
             self.gt_gs_model_list.extend(gs_model_list)
         
-        print(f" len of gt gs model list is {len(self.gt_gs_model_list)}")
-
     def _load_gs_model(self, root_output_dir: Path):
         refined_dir = root_output_dir / "refined_scene_recon" / self.cfg.exp_name
         root_gs_model_dir = refined_dir if (refined_dir / "00").exists() else root_output_dir / "initial_scene_recon"
@@ -820,8 +892,8 @@ class MultiHumanTrainer:
                 # Forward pass
                 frame_indices = frame_indices.to(self.tuner_device)
                 res, smplx_params, render_c2ws, render_intrs = self._render_batch(frame_indices)
-                comp_rgb = res["comp_rgb"]  # [B, H, W, 3], 0-1
-                comp_mask = res["comp_mask"][..., :1]  # [B, H, W, 1]
+                pred_rgb = res["comp_rgb"]  # [B, H, W, 3], 0-1
+                pred_mask = res["comp_mask"][..., :1]  # [B, H, W, 1]
 
                 # Compute masked ground truth
                 mask3 = masks
@@ -829,10 +901,23 @@ class MultiHumanTrainer:
                     mask3 = mask3.repeat(1, 1, 1, 3)
                 gt_masked = frames * mask3
 
+                # BBOX crop around the union person mask
+                if self.cfg.use_bbox_crop:
+                    bboxes = get_masks_based_bbox(masks, pad=self.cfg.bbox_pad)
+                    loss_pred_rgb = bbox_crop(bboxes, pred_rgb)
+                    loss_pred_mask = bbox_crop(bboxes, pred_mask)
+                    loss_gt_masked = bbox_crop(bboxes, gt_masked)
+                    loss_masks = bbox_crop(bboxes, masks)
+                else:
+                    loss_pred_rgb = pred_rgb
+                    loss_pred_mask = pred_mask
+                    loss_gt_masked = gt_masked
+                    loss_masks = masks
+
                 # Compute loss
-                rgb_loss = self.cfg.loss_weights["rgb"] * F.mse_loss(comp_rgb, gt_masked)
-                sil_loss = self.cfg.loss_weights["sil"] * F.mse_loss(comp_mask, masks)
-                ssim_val = fused_ssim(_ensure_nchw(comp_rgb), _ensure_nchw(gt_masked), padding="valid")
+                rgb_loss = self.cfg.loss_weights["rgb"] * F.mse_loss(loss_pred_rgb, loss_gt_masked)
+                sil_loss = self.cfg.loss_weights["sil"] * F.mse_loss(loss_pred_mask, loss_masks)
+                ssim_val = fused_ssim(_ensure_nchw(loss_pred_rgb), _ensure_nchw(loss_gt_masked), padding="valid")
                 ssim_loss = self.cfg.loss_weights["ssim"] * (1.0 - ssim_val)
                 asap_loss, acap_loss = self._canonical_regularization()
                 reg_loss = asap_loss + acap_loss

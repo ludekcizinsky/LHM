@@ -15,6 +15,9 @@ train_params:
   - scaling
   - opacity
   - shs
+use_bbox_crop: true
+bbox_pad: 5
+
 
 wandb:
   enable: true
