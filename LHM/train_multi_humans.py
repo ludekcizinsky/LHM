@@ -151,11 +151,15 @@ def lpips(images: torch.Tensor, masks: torch.Tensor, renders: torch.Tensor) -> t
 # Dataset
 # ---------------------------------------------------------------------------
 class FrameMaskDataset(Dataset):
-    def __init__(self, frames_dir: Path, masks_dir: Path, device: torch.device, sample_every: int = 1):
-        self.frames_dir = frames_dir
-        self.masks_dir = masks_dir
+    def __init__(self, frames_dir: Path, masks_dir: Path, device: torch.device, sample_every: int = 1, depth_dir: Optional[Path] = None):
         self.device = device
+        self._load_frames(frames_dir, sample_every)
+        self._load_masks(masks_dir)
+        if depth_dir is not None:
+            self._load_depths(depth_dir)
 
+    # --------- Path loaders
+    def _load_frames(self, frames_dir: Path, sample_every: int = 1):
         frame_candidates = []
         for ext in ("*.png", "*.jpg", "*.jpeg"):
             frame_candidates.extend(frames_dir.glob(ext))
@@ -164,6 +168,8 @@ class FrameMaskDataset(Dataset):
             self.frame_paths = self.frame_paths[::sample_every]
         if not self.frame_paths:
             raise RuntimeError(f"No frames found in {frames_dir}")
+
+    def _load_masks(self, masks_dir: Path):
         self.mask_paths = []
         missing = []
         for p in self.frame_paths:
@@ -177,9 +183,21 @@ class FrameMaskDataset(Dataset):
         if missing:
             raise RuntimeError(f"Missing masks for frames (by stem): {missing[:5]}")
 
-    def __len__(self):
-        return len(self.frame_paths)
+    def _load_depths(self, depth_dir: Path):
+        self.depth_paths = []
+        missing = []
+        for p in self.frame_paths:
+            base = p.stem
+            candidates = [depth_dir / f"{base}{ext}" for ext in (".png", ".jpg", ".jpeg", ".npy")]
+            depth_path = next((c for c in candidates if c.exists()), None)
+            if depth_path is None:
+                missing.append(base)
+            else:
+                self.depth_paths.append(depth_path)
+        if missing:
+            raise RuntimeError(f"Missing depth maps for frames (by stem): {missing[:5]}")
 
+    # --------- Data loaders
     def _load_img(self, path: Path) -> torch.Tensor:
         img = Image.open(path).convert("RGB")
         arr = torch.from_numpy(np.array(img)).float() / 255.0
@@ -197,6 +215,10 @@ class FrameMaskDataset(Dataset):
         mask = (arr.max(dim=-1).values > eps * 255).float()  # HxW
         return mask.to(self.device).unsqueeze(-1)  # HxWx1, range [0,1]
 
+    # -------- Dataset interface
+    def __len__(self):
+        return len(self.frame_paths)
+    
     def __getitem__(self, idx: int):
         frame = self._load_img(self.frame_paths[idx])
         mask = self._load_mask(self.mask_paths[idx])
@@ -415,12 +437,16 @@ class MultiHumanTrainer:
         self._prepare_joined_inputs()
         self.renderer : GS3DRenderer = build_renderer().to(self.tuner_device)
 
-        self.frames_dir = self.output_dir / "frames"
-        self.masks_dir = self.output_dir / "masks" / "union"
-        self.depth_dir = self.output_dir / "depth_maps" / "raw"
+        # Directories
+        #self.frames_dir = self.output_dir / "frames"
+        #self.masks_dir = self.output_dir / "masks" / "union"
+        #self.depth_dir = self.output_dir / "depth_maps" / "raw"
+
+        root_gt_dir_path: Path = Path(self.cfg.nvs_eval.root_gt_dir_path)
+        self.frames_dir = root_gt_dir_path / "images" / str(self.cfg.nvs_eval.source_camera_id)
+        self.masks_dir = root_gt_dir_path / "seg" / "img_seg_mask" / str(self.cfg.nvs_eval.source_camera_id) / "all"
 
         self._load_gt_parameters()
-
 
     # ---------------- Model / data loading ----------------
     def _load_gt_parameters(self):
@@ -872,7 +898,7 @@ class MultiHumanTrainer:
 
         # Prepare dataset and dataloader
         dataset = FrameMaskDataset(
-            self.frames_dir, self.masks_dir, self.tuner_device, sample_every=self.cfg.sample_every
+            self.frames_dir, self.masks_dir, self.tuner_device, self.cfg.sample_every
         )
         first_frame = dataset[0][1]
         self.trn_render_hw = first_frame.shape[:2]
