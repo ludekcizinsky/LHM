@@ -824,6 +824,15 @@ class MultiHumanTrainer:
             acap = torch.clamp(offsets.norm(dim=-1) - self.cfg.regularization['acap_margin'], min=0.0).mean()
             acap_terms.append(acap)
 
+            # Compute the percentage of Gaussians that are outside the margin
+            with torch.no_grad():
+                num_outside = (offsets.norm(dim=-1) > self.cfg.regularization['acap_margin']).sum().item()
+                total = offsets.shape[0]
+                percent_outside = (num_outside / total) * 100.0
+                to_log = {"debug/acap_percent_outside": percent_outside}
+                if self.wandb_run.enable:
+                    wandb.log(to_log)
+
         asap_loss = torch.stack(asap_terms).mean() * self.cfg.regularization["asap_w"]
         acap_loss = torch.stack(acap_terms).mean() * self.cfg.regularization["acap_w"]
 
