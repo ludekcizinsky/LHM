@@ -26,7 +26,7 @@ import wandb
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from LHM.models.rendering.custom_gs_renderer import GS3DRenderer
-from LHM.debug import overlay_smplx_mesh_pyrender
+from LHM.debug import overlay_smplx_mesh_pyrender, save_depth_comparison
 
 # ---------------------------------------------------------------------------
 # Evaluation metrics
@@ -152,6 +152,10 @@ class FrameMaskDataset(Dataset):
         self.device = device
         self._load_frames(frames_dir, sample_every)
         self._load_masks(masks_dir)
+
+        first_image = self._load_img(self.frame_paths[0])
+        self.trn_render_hw = (first_image.shape[0], first_image.shape[1])  # (H, W)
+
         if depth_dir is not None:
             self._load_depths(depth_dir)
 
@@ -202,6 +206,23 @@ class FrameMaskDataset(Dataset):
         # Foreground is any pixel whose max channel exceeds eps*255
         mask = (arr.max(dim=-1).values > eps * 255).float()  # HxW
         return mask.to(self.device).unsqueeze(-1)  # HxWx1, range [0,1]
+    
+    def _load_depth(self, path: Path) -> torch.Tensor:
+        """
+        Load and upsample depth map to training resolution.
+
+        Args:
+            path (Path): Path to the depth map file.
+        Returns:
+            torch.Tensor: Upsampled depth map tensor of shape HxW. Unit is the same as input depth map, so meters.
+        """
+
+        depth_np = torch.from_numpy(np.load(path)) # H_depthxW_depth
+
+        height, width = self.trn_render_hw
+        batched = depth_np.unsqueeze(0).unsqueeze(0)
+        upsampled = F.interpolate(batched, size=(height, width), mode="bilinear", align_corners=False)
+        return upsampled.squeeze(0).squeeze(0).to(self.device).unsqueeze(-1)  # HxWx1
 
     # -------- Dataset interface
     def __len__(self):
@@ -210,12 +231,23 @@ class FrameMaskDataset(Dataset):
     def __getitem__(self, idx: int):
         frame = self._load_img(self.frame_paths[idx])
         mask = self._load_mask(self.mask_paths[idx])
-        return (
-            torch.tensor(idx, device=self.device, dtype=torch.long),
-            frame,
-            mask,
-            str(self.frame_paths[idx]),
-        )
+        if hasattr(self, "depth_paths"):
+            depth = self._load_depth(self.depth_paths[idx])
+            return (
+                torch.tensor(idx, device=self.device, dtype=torch.long),
+                frame,
+                mask,
+                str(self.frame_paths[idx]),
+                depth,
+            )
+
+        else:
+            return (
+                torch.tensor(idx, device=self.device, dtype=torch.long),
+                frame,
+                mask,
+                str(self.frame_paths[idx]),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +440,7 @@ class MultiHumanTrainer:
         # Directories
         #self.frames_dir = self.output_dir / "frames"
         #self.masks_dir = self.output_dir / "masks" / "union"
-        #self.depth_dir = self.output_dir / "depth_maps" / "raw"
+        self.depth_dir = self.output_dir / "depth_maps" / "raw"
 
         root_gt_dir_path: Path = Path(self.cfg.nvs_eval.root_gt_dir_path)
         self.frames_dir = root_gt_dir_path / "images" / str(self.cfg.nvs_eval.source_camera_id)
@@ -601,7 +633,7 @@ class MultiHumanTrainer:
         render_bg_colors = torch.zeros((1, self.cfg.batch_size, 3), device=self.tuner_device)
 
         # Render
-        return self.animation_infer_custom(
+        res = self.animation_infer_custom(
             self.gt_gs_model_list,
             self.gt_query_points,
             smplx_params,
@@ -609,7 +641,14 @@ class MultiHumanTrainer:
             render_intrs=render_intrs,
             render_bg_colors=render_bg_colors,
             render_hw=self.trn_render_hw,
-        ), smplx_params, render_c2ws, render_intrs
+        )
+
+        # Parse outputs 
+        pred_rgb = res["comp_rgb"]  # [B, H, W, 3], 0-1
+        pred_mask = res["comp_mask"][..., :1]  # [B, H, W, 1]
+        pred_depth = res["comp_depth"][..., :1]  # [B, H, W, 1]
+
+        return pred_rgb, pred_mask, pred_depth
 
     def _canonical_regularization(self):
         """Return combined canonical regularization and its components."""
@@ -676,10 +715,9 @@ class MultiHumanTrainer:
 
         # Prepare dataset and dataloader
         dataset = FrameMaskDataset(
-            self.frames_dir, self.masks_dir, self.tuner_device, self.cfg.sample_every
+            self.frames_dir, self.masks_dir, self.tuner_device, self.cfg.sample_every, self.depth_dir
         )
-        first_frame = dataset[0][1]
-        self.trn_render_hw = first_frame.shape[:2]
+        self.trn_render_hw = dataset.trn_render_hw
         loader = DataLoader(
             dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=0, drop_last=False
         )
@@ -697,22 +735,21 @@ class MultiHumanTrainer:
             running_loss = 0.0
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.cfg.epochs}", leave=False)
             batch = 0
-            for frame_indices, frames, masks, frame_paths in pbar:
+            for frame_indices, frames, masks, frame_paths, depths in pbar:
 
                 # Reset gradients
                 optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass
                 frame_indices = frame_indices.to(self.tuner_device)
-                res, smplx_params, render_c2ws, render_intrs = self._render_batch(frame_indices)
-                pred_rgb = res["comp_rgb"]  # [B, H, W, 3], 0-1
-                pred_mask = res["comp_mask"][..., :1]  # [B, H, W, 1]
+                pred_rgb, pred_mask, pred_depth = self._render_batch(frame_indices)
 
                 # Compute masked ground truth
                 mask3 = masks
                 if mask3.shape[-1] == 1:
                     mask3 = mask3.repeat(1, 1, 1, 3)
                 gt_masked = frames * mask3
+                gt_depth_masked = depths * masks
 
                 # BBOX crop around the union person mask
                 if self.cfg.use_bbox_crop:
@@ -720,22 +757,27 @@ class MultiHumanTrainer:
                     loss_pred_rgb = bbox_crop(bboxes, pred_rgb)
                     loss_pred_mask = bbox_crop(bboxes, pred_mask)
                     loss_gt_masked = bbox_crop(bboxes, gt_masked)
+                    loss_pred_depth = bbox_crop(bboxes, pred_depth)
+                    loss_gt_depth_masked = bbox_crop(bboxes, gt_depth_masked)
                     loss_masks = bbox_crop(bboxes, masks)
                 else:
                     loss_pred_rgb = pred_rgb
                     loss_pred_mask = pred_mask
                     loss_gt_masked = gt_masked
+                    loss_pred_depth = pred_depth
+                    loss_gt_depth_masked = gt_depth_masked
                     loss_masks = masks
 
                 # Compute loss
                 rgb_loss = self.cfg.loss_weights["rgb"] * F.mse_loss(loss_pred_rgb, loss_gt_masked)
                 sil_loss = self.cfg.loss_weights["sil"] * F.mse_loss(loss_pred_mask, loss_masks)
+                depth_loss = self.cfg.loss_weights["depth"] * F.mse_loss(loss_pred_depth, loss_gt_depth_masked)
                 ssim_val = fused_ssim(_ensure_nchw(loss_pred_rgb), _ensure_nchw(loss_gt_masked), padding="valid")
                 ssim_loss = self.cfg.loss_weights["ssim"] * (1.0 - ssim_val)
                 asap_loss, acap_loss = self._canonical_regularization()
                 reg_loss = asap_loss + acap_loss
 
-                loss = rgb_loss + sil_loss + ssim_loss + reg_loss
+                loss = rgb_loss + sil_loss + ssim_loss + depth_loss + reg_loss
                 
                 # Backpropagation
                 loss.backward()
@@ -757,13 +799,22 @@ class MultiHumanTrainer:
                             "loss/rgb": rgb_loss.item(),
                             "loss/sil": sil_loss.item(),
                             "loss/ssim": ssim_loss.item(),
+                            "loss/depth": depth_loss.item(),
                             "loss/reg": reg_loss.item(),
                             "loss/asap": asap_loss.item(),
                             "loss/acap": acap_loss.item(),
                         }
                     )
 
+                # space for debug stuff is here
+                for i in range(pred_depth.shape[0]):
+                    debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name / f"epoch_{epoch+1:04d}"
+                    debug_save_dir.mkdir(parents=True, exist_ok=True)
+                    global_idx = self.cfg.sample_every * (batch * self.cfg.batch_size + i)
+                    save_path = debug_save_dir / f"depth_comparison_frame_{global_idx:06d}.png"
+                    save_depth_comparison(pred_depth[i].squeeze(-1), gt_depth_masked[i].squeeze(-1), str(save_path))
 
+                quit()
                 batch += 1
 
             # End of epoch

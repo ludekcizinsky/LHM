@@ -148,3 +148,57 @@ def overlay_smplx_mesh_pyrender(
     renderer.delete()
 
     return torch.stack(out_frames, dim=0), out_ious
+
+
+def save_depth_comparison(pred_depth: torch.Tensor, gt_depth: torch.Tensor, save_path: str) -> None:
+    """
+    Save a side-by-side comparison of predicted and ground truth depth maps.
+
+    Args:
+        pred_depth: Tensor of shape (H, W) containing predicted depth values.
+        gt_depth: Tensor of shape (H, W) containing ground truth depth values.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    pred_depth_np = pred_depth.detach().cpu().numpy()
+    gt_depth_np = gt_depth.detach().cpu().numpy()
+
+    def mask_background(depth: np.ndarray) -> np.ma.MaskedArray:
+        # Assume background pixels have zero (or negative) depth.
+        return np.ma.masked_less_equal(depth, 0.0)
+
+    masked_pred = mask_background(pred_depth_np)
+    masked_gt = mask_background(gt_depth_np)
+
+    vmin, vmax = 1.0, 2.0
+    masked_pred = np.ma.clip(masked_pred, vmin, vmax)
+    masked_gt = np.ma.clip(masked_gt, vmin, vmax)
+
+    base_cmap = plt.cm.get_cmap("turbo", 2048)
+    cmap = base_cmap.copy()
+    cmap.set_bad(color="black")  # keep masked background black
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+    fig = plt.figure(figsize=(10, 5), constrained_layout=True)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 0.05])
+    ax_pred = fig.add_subplot(gs[0, 0])
+    ax_gt = fig.add_subplot(gs[0, 1])
+    cax = fig.add_subplot(gs[0, 2])
+
+    im0 = ax_pred.imshow(masked_pred, cmap=cmap, norm=norm)
+    ax_pred.set_title("Predicted Depth")
+    ax_pred.axis("off")
+
+    ax_gt.imshow(masked_gt, cmap=cmap, norm=norm)
+    ax_gt.set_title("Ground Truth Depth")
+    ax_gt.axis("off")
+
+    cbar = fig.colorbar(im0, cax=cax)
+    cbar.set_label("Depth [m]")
+    tick_values = np.linspace(vmin, vmax, num=6)
+    cbar.set_ticks(tick_values)
+    cbar.set_ticklabels([f"{tick:.2f}" for tick in tick_values])
+
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
