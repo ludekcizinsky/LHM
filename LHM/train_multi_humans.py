@@ -807,14 +807,14 @@ class MultiHumanTrainer:
                     )
 
                 # space for debug stuff is here
-                for i in range(pred_depth.shape[0]):
-                    debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name / f"epoch_{epoch+1:04d}"
-                    debug_save_dir.mkdir(parents=True, exist_ok=True)
-                    global_idx = self.cfg.sample_every * (batch * self.cfg.batch_size + i)
-                    save_path = debug_save_dir / f"depth_comparison_frame_{global_idx:06d}.png"
-                    save_depth_comparison(pred_depth[i].squeeze(-1), gt_depth_masked[i].squeeze(-1), str(save_path))
+                if batch == 5 and (epoch + 1) % 2 == 0:
+                    for i in range(pred_depth.shape[0]):
+                        debug_save_dir = self.output_dir / "debug" / self.cfg.exp_name / f"epoch_{epoch+1:04d}"
+                        debug_save_dir.mkdir(parents=True, exist_ok=True)
+                        global_idx = self.cfg.sample_every * (batch * self.cfg.batch_size + i)
+                        save_path = debug_save_dir / f"depth_comparison_frame_{global_idx:06d}.png"
+                        save_depth_comparison(pred_depth[i].squeeze(-1), gt_depth_masked[i].squeeze(-1), str(save_path))
 
-                quit()
                 batch += 1
 
             # End of epoch

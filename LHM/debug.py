@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import List, Tuple
 import numpy as np
 import torch
@@ -172,13 +173,15 @@ def save_depth_comparison(pred_depth: torch.Tensor, gt_depth: torch.Tensor, save
     masked_gt = mask_background(gt_depth_np)
 
     vmin, vmax = 1.0, 2.0
-    masked_pred = np.ma.clip(masked_pred, vmin, vmax)
-    masked_gt = np.ma.clip(masked_gt, vmin, vmax)
+    clipped_pred = np.ma.clip(masked_pred, vmin, vmax)
+    clipped_gt = np.ma.clip(masked_gt, vmin, vmax)
 
     base_cmap = plt.cm.get_cmap("turbo", 2048)
     cmap = base_cmap.copy()
     cmap.set_bad(color="black")  # keep masked background black
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+    save_path = Path(save_path)
 
     fig = plt.figure(figsize=(10, 5), constrained_layout=True)
     gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 0.05])
@@ -186,11 +189,11 @@ def save_depth_comparison(pred_depth: torch.Tensor, gt_depth: torch.Tensor, save
     ax_gt = fig.add_subplot(gs[0, 1])
     cax = fig.add_subplot(gs[0, 2])
 
-    im0 = ax_pred.imshow(masked_pred, cmap=cmap, norm=norm)
+    im0 = ax_pred.imshow(clipped_pred, cmap=cmap, norm=norm)
     ax_pred.set_title("Predicted Depth")
     ax_pred.axis("off")
 
-    ax_gt.imshow(masked_gt, cmap=cmap, norm=norm)
+    ax_gt.imshow(clipped_gt, cmap=cmap, norm=norm)
     ax_gt.set_title("Ground Truth Depth")
     ax_gt.axis("off")
 
@@ -202,3 +205,35 @@ def save_depth_comparison(pred_depth: torch.Tensor, gt_depth: torch.Tensor, save
 
     plt.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
+
+    valid_pred = masked_pred.compressed()
+    valid_gt = masked_gt.compressed()
+    if valid_pred.size > 0 or valid_gt.size > 0:
+        mins = [vmin]
+        maxs = [vmax]
+        if valid_pred.size > 0:
+            mins.append(float(valid_pred.min()))
+            maxs.append(float(valid_pred.max()))
+        if valid_gt.size > 0:
+            mins.append(float(valid_gt.min()))
+            maxs.append(float(valid_gt.max()))
+        combined_min = min(mins)
+        combined_max = max(maxs)
+        if np.isclose(combined_min, combined_max):
+            combined_max = combined_min + 1e-6
+
+        hist_bins = np.linspace(combined_min, combined_max, num=60)
+        hist_fig, hist_ax = plt.subplots(figsize=(6, 4))
+        if valid_pred.size > 0:
+            hist_ax.hist(valid_pred, bins=hist_bins, alpha=0.6, label="Pred", color="#1f77b4")
+        if valid_gt.size > 0:
+            hist_ax.hist(valid_gt, bins=hist_bins, alpha=0.6, label="GT", color="#ff7f0e")
+        hist_ax.set_xlabel("Depth [m]")
+        hist_ax.set_ylabel("Count")
+        hist_ax.set_title("Depth Distribution (unclipped)")
+        hist_ax.legend()
+        suffix = save_path.suffix if save_path.suffix else ".png"
+        hist_path = save_path.with_name(f"{save_path.stem}_hist{suffix}")
+        hist_fig.tight_layout()
+        hist_fig.savefig(hist_path)
+        plt.close(hist_fig)
