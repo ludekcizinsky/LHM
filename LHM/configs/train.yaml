@@ -16,7 +16,7 @@ train_params:
   - opacity
   - shs
 use_bbox_crop: true
-bbox_pad: 5
+bbox_pad: 50
 
 
 wandb:
