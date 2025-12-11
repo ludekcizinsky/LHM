@@ -1,10 +1,8 @@
 import os
 import sys
 import subprocess
-from dataclasses import asdict, fields
 from pathlib import Path
 from typing import List, Tuple, Optional
-import copy
 from tqdm import tqdm
 import pandas as pd
 from collections import defaultdict
@@ -27,7 +25,6 @@ import wandb
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from LHM.outputs.output import GaussianAppOutput
 from LHM.models.rendering.custom_gs_renderer import GS3DRenderer
 from LHM.debug import overlay_smplx_mesh_pyrender
 
@@ -184,18 +181,9 @@ class FrameMaskDataset(Dataset):
             raise RuntimeError(f"Missing masks for frames (by stem): {missing[:5]}")
 
     def _load_depths(self, depth_dir: Path):
-        self.depth_paths = []
-        missing = []
-        for p in self.frame_paths:
-            base = p.stem
-            candidates = [depth_dir / f"{base}{ext}" for ext in (".png", ".jpg", ".jpeg", ".npy")]
-            depth_path = next((c for c in candidates if c.exists()), None)
-            if depth_path is None:
-                missing.append(base)
-            else:
-                self.depth_paths.append(depth_path)
-        if missing:
-            raise RuntimeError(f"Missing depth maps for frames (by stem): {missing[:5]}")
+        depth_files = sorted(p for p in depth_dir.glob("*.npy") if p.is_file())
+        self.depth_paths = [depth_dir / p.name for p in depth_files]
+        assert len(self.depth_paths) == len(self.frame_paths), "Number of depth files must match number of frames."
 
     # --------- Data loaders
     def _load_img(self, path: Path) -> torch.Tensor:
@@ -301,22 +289,6 @@ def save_image(tensor: torch.Tensor, filename: str):
     image = (image * 255).clip(0, 255).astype("uint8")
     Image.fromarray(image).save(filename)
 
-
-def enable_gaussian_grads(
-    gauss: GaussianAppOutput,
-    train_fields: Tuple[str, ...],
-    detach_to_leaf: bool = False,
-):
-    for f in fields(gauss):
-        if f.name not in train_fields:
-            continue
-        v = getattr(gauss, f.name)
-        if torch.is_tensor(v):
-            if detach_to_leaf:
-                v = v.detach().requires_grad_()
-                setattr(gauss, f.name, v)
-            else:
-                v.requires_grad_(True)
 
 
 def build_renderer():
@@ -430,12 +402,8 @@ class MultiHumanTrainer:
         self.tuner_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output_dir = Path(cfg.output_dir).expanduser()
         self.train_params = tuple(cfg.train_params)
-        self.wandb_run = None
-        self.loaded_skinning = None
-
-        self._load_gs_model(self.output_dir)
-        self._prepare_joined_inputs()
         self.renderer : GS3DRenderer = build_renderer().to(self.tuner_device)
+        self.wandb_run = None
 
         # Directories
         #self.frames_dir = self.output_dir / "frames"
@@ -506,107 +474,6 @@ class MultiHumanTrainer:
             gs_model_list = torch.load(gs_model_dir / "gt_gs_model_list.pt", map_location=self.tuner_device)
             self.gt_gs_model_list.extend(gs_model_list)
         
-    def _load_gs_model(self, root_output_dir: Path):
-        refined_dir = root_output_dir / "refined_scene_recon" / self.cfg.exp_name
-        root_gs_model_dir = refined_dir if (refined_dir / "00").exists() else root_output_dir / "initial_scene_recon"
-        track_ids = sorted(
-            [
-                track_id
-                for track_id in os.listdir(root_gs_model_dir)
-                if (root_gs_model_dir / track_id).is_dir()
-            ]
-        )
-        self.all_model_list = []
-        for track_id in track_ids:
-            gs_model_dir = root_gs_model_dir / track_id
-            gs_model_list = torch.load(gs_model_dir / "gs_model_list.pt", map_location=self.tuner_device)
-            query_points = torch.load(gs_model_dir / "query_points.pt", map_location=self.tuner_device)
-            transform_mat_neutral_pose = torch.load(
-                gs_model_dir / "transform_mat_neutral_pose.pt", map_location=self.tuner_device
-            )
-            motion_seq = torch.load(gs_model_dir / "motion_seq.pt", map_location=self.tuner_device)
-            shape_params = torch.from_numpy(np.load(gs_model_dir / "shape_params.npy")).unsqueeze(0).to(self.tuner_device)
-            model = (gs_model_list, query_points, transform_mat_neutral_pose, motion_seq, shape_params)
-            self.all_model_list.append(model)
-
-
-    def _prepare_joined_inputs(self):
-        train_fields = tuple(self.train_params)
-        self.gs_model_list: List[GaussianAppOutput] = []
-        self.query_points = None
-        self.transform_mat_neutral_pose = None
-        self.motion_seq = None
-        self.shape_param = None
-        self.body_pose_param: Optional[torch.nn.Parameter] = None
-
-        self.gs_track_offsets = []
-        self.query_track_offsets = []
-
-        gs_cursor = 0
-        query_cursor = 0
-
-        for track_idx, packed in enumerate(self.all_model_list):
-            (
-                p_gs_model_list,
-                p_query_points,
-                p_transform_mat_neutral_pose,
-                p_motion_seq,
-                p_shape_param,
-            ) = packed
-
-            # Make specified fields trainable.
-            enable_gaussian_grads(p_gs_model_list[0], train_fields, detach_to_leaf=True)
-
-            self.gs_track_offsets.append((gs_cursor, len(p_gs_model_list)))
-            self.query_track_offsets.append((query_cursor, p_query_points.shape[0], p_transform_mat_neutral_pose.shape[0]))
-            gs_cursor += len(p_gs_model_list)
-            query_cursor += p_query_points.shape[0]
-
-            self.gs_model_list.extend(p_gs_model_list)
-
-            if self.query_points is None:
-                self.query_points = p_query_points
-            else:
-                self.query_points = torch.cat([self.query_points, p_query_points], dim=0)
-
-            if self.transform_mat_neutral_pose is None:
-                self.transform_mat_neutral_pose = p_transform_mat_neutral_pose
-            else:
-                self.transform_mat_neutral_pose = torch.cat(
-                    [self.transform_mat_neutral_pose, p_transform_mat_neutral_pose], dim=0
-                )
-
-            if self.motion_seq is None:
-                self.motion_seq = copy.deepcopy(p_motion_seq)
-            else:
-                for key in self.motion_seq["smplx_params"].keys():
-                    self.motion_seq["smplx_params"][key] = torch.cat(
-                        [self.motion_seq["smplx_params"][key], p_motion_seq["smplx_params"][key]],
-                        dim=0,
-                    )
-
-            if self.shape_param is None:
-                self.shape_param = p_shape_param
-            else:
-                self.shape_param = torch.cat([self.shape_param, p_shape_param], dim=0)
-
-        # self._init_body_pose_parameter()
-
-    def _init_body_pose_parameter(self):
-        """
-        Promote SMPL-X body pose tensor to a trainable parameter so it can
-        receive gradients alongside the Gaussian attributes.
-        """
-        if self.motion_seq is None:
-            return
-        smplx_params = self.motion_seq["smplx_params"]
-        body_pose = smplx_params.get("body_pose")
-        if body_pose is None:
-            return
-
-        body_pose = body_pose.to(self.tuner_device)
-        self.body_pose_param = torch.nn.Parameter(body_pose.detach().clone(), requires_grad=True)
-        smplx_params["body_pose"] = self.body_pose_param
 
     # ---------------- Evaluation utilities ----------------
     def _load_gt_smplx_params(self, frame_paths: List[str], smplx_dir: Path):
@@ -636,70 +503,6 @@ class MultiHumanTrainer:
 
         return smplx
 
-    def _mask_centroids(self, masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (cx, cy, valid) for a batch of masks shaped [B, H, W]."""
-        binary = (masks > 0.5).float()
-        area = binary.flatten(1).sum(1)
-        valid = area > 10.0  # ignore tiny masks
-        if not valid.any():
-            zeros = torch.zeros_like(area)
-            return zeros, zeros, valid
-
-        _, h, w = binary.shape
-        xs = torch.arange(w, device=masks.device).view(1, 1, w)
-        ys = torch.arange(h, device=masks.device).view(1, h, 1)
-        cx = (binary * xs).sum((1, 2)) / (area + 1e-6)
-        cy = (binary * ys).sum((1, 2)) / (area + 1e-6)
-        return cx, cy, valid
-
-    def _mask_iou(self, pred_mask: torch.Tensor, gt_mask: torch.Tensor) -> torch.Tensor:
-        """Compute IoU between predicted and GT masks; expects shape [B, H, W, 1]."""
-        p = (pred_mask[..., 0] > 0.5).float()
-        g = (gt_mask[..., 0] > 0.5).float()
-        inter = (p * g).sum((1, 2))
-        union = (p + g - p * g).sum((1, 2)).clamp_min(1e-6)
-        return inter / union
-
-    def _estimate_world_translation_offset(
-        self,
-        render_mask: torch.Tensor,
-        gt_mask: torch.Tensor,
-        intr: torch.Tensor,
-        c2w: torch.Tensor,
-        w2c: torch.Tensor,
-        smplx_trans: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """
-        Estimate per-frame world-space translation that aligns rendered and GT masks.
-        Returns tensor shaped [B, 3] or None if no valid masks.
-        """
-        # strip the channel dim -> [B, H, W]
-        render_mask_b = render_mask[..., 0]
-        gt_mask_b = gt_mask[..., 0]
-
-        render_cx, render_cy, render_valid = self._mask_centroids(render_mask_b)
-        gt_cx, gt_cy, gt_valid = self._mask_centroids(gt_mask_b)
-        valid = render_valid & gt_valid
-        if not valid.any():
-            return None
-
-        dx = gt_cx - render_cx
-        dy = gt_cy - render_cy
-
-        # Depth from SMPL-X translations (projected to camera space)
-        cam_coords = torch.einsum("ij,pbj->pbi", w2c[:3, :3], smplx_trans) + w2c[:3, 3]
-        z = cam_coords[..., 2].mean(dim=0)
-
-        z = z.clamp_min(1e-3)
-        fx, fy = intr[0, 0], intr[1, 1]
-        delta_cam = torch.stack(
-            [dx * z / fx, dy * z / fy, torch.zeros_like(z)],
-            dim=-1,
-        )
-        delta_cam = torch.where(valid[:, None], delta_cam, torch.zeros_like(delta_cam))
-        delta_world = torch.einsum("ij,bj->bi", c2w[:3, :3], delta_cam)
-        return delta_world
-
     # ---------------- Training utilities ----------------
     def _trainable_tensors(self) -> List[torch.Tensor]:
         params = []
@@ -713,29 +516,6 @@ class MultiHumanTrainer:
                     params.append(t)
 
         return params
-
-    def _slice_motion(self, frame_indices: torch.Tensor):
-        keys = [
-            "root_pose",
-            "body_pose",
-            "jaw_pose",
-            "leye_pose",
-            "reye_pose",
-            "lhand_pose",
-            "rhand_pose",
-            "trans",
-            "expr",
-        ]
-        smplx = {"betas": self.shape_param.to(self.tuner_device)}
-        smplx["transform_mat_neutral_pose"] = self.transform_mat_neutral_pose
-        for key in keys:
-            smplx[key] = torch.index_select(
-                self.motion_seq["smplx_params"][key], 1, frame_indices.to(self.motion_seq["smplx_params"][key].device)
-            ).to(self.tuner_device)
-
-        render_c2ws = torch.index_select(self.motion_seq["render_c2ws"], 1, frame_indices).to(self.tuner_device)
-        render_intrs = torch.index_select(self.motion_seq["render_intrs"], 1, frame_indices).to(self.tuner_device)
-        return smplx, render_c2ws, render_intrs
 
     def _slice_motion_using_gt(self, frame_indices: torch.Tensor):
 
@@ -773,8 +553,6 @@ class MultiHumanTrainer:
         return batch_smplx, batch_c2w, batch_intr
 
     def animation_infer_custom(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_hw):
-        '''Inference code avoid repeat forward.
-        '''
 
         # render target views
         render_res_list = []
@@ -1072,37 +850,6 @@ class MultiHumanTrainer:
                         render_hw=(gt_h, gt_w),
                     )
 
-#                    # Estimate translation offset between rendered and GT masks
-                    #delta_world = self._estimate_world_translation_offset(
-                        #render_mask=res["comp_rgb"] > 0.05,
-                        #gt_mask=masks,
-                        #intr=tgt_intr,
-                        #c2w=tgt_c2w,
-                        #w2c=tgt_w2c,
-                        #smplx_trans=smplx_params["trans"],
-                    #)
-                    #delta_world = delta_world.clamp(-max_shift_m, max_shift_m)
-
-                    ## Find the best alpha for the translation offset
-                    #best_res = res
-                    #best_iou = -1.0
-                    #for idx, alpha in enumerate(alpha_candidates):
-                        #cand_c2ws = render_c2ws.clone()
-                        #cand_c2ws[:, :, :3, 3] -= alpha * delta_world.unsqueeze(0)
-                        #cand_res = self.animation_infer_custom(
-                            #self.gs_model_list,
-                            #self.query_points,
-                            #smplx_params,
-                            #render_c2ws=cand_c2ws,
-                            #render_intrs=render_intrs,
-                            #render_bg_colors=render_bg_colors,
-                            #render_hw=(gt_h, gt_w),
-                        #)
-                        #iou = self._mask_iou(cand_res["comp_rgb"] > 0.05, masks).mean()
-                        #if iou > best_iou:
-                            #best_iou = iou
-                            #best_res = cand_res
-                    #res = best_res
 
                     # Save rendered images
                     renders = res["comp_rgb"]  # [B, H, W, 3]

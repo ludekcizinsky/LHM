@@ -67,3 +67,4 @@ gfpgan/
 wandb/
 playground/
 dev.py
+run_dev.sh

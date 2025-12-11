@@ -93,7 +93,7 @@ module load gcc ffmpeg
 
 seq_name="hi4d_pair17_dance"
 num_persons=2
-exp_name="bbox_tune_all_params_acap_weight1000"
+exp_name="gt_mask_bbox_tune_all_params_acap_weight1000"
 acap_weight=1000
 # lr=0.001
 source_cam_id=28
