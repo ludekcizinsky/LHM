@@ -11,11 +11,10 @@ sample_every: 1
 eval_every_epoch: 25
 train_params:
   - offset_xyz
-  #- rotation
-  #- scaling
-  #- opacity
-  #- shs
-
+  - rotation
+  - scaling
+  - opacity
+  - shs
 
 wandb:
   enable: true

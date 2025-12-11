@@ -2,24 +2,19 @@ import math
 from collections import defaultdict
 
 import numpy as np
-import omegaconf
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
 )
-from plyfile import PlyData, PlyElement
 from pytorch3d.transforms import matrix_to_quaternion
 from pytorch3d.transforms.rotation_conversions import quaternion_multiply
 
 
 from LHM.models.rendering.custom_smplx_voxel_dense_sampling import SMPLXVoxelMeshModel
-from LHM.models.rendering.utils.sh_utils import RGB2SH, SH2RGB
 from LHM.models.rendering.utils.typing import *
-from LHM.models.rendering.utils.utils import MLP, trunc_exp
-from LHM.models.utils import LinerParameterTuner, StaticParameterTuner
+from LHM.models.rendering.utils.utils import MLP
 from LHM.outputs.output import GaussianAppOutput
 
 
@@ -190,339 +185,7 @@ class GaussianModel:
         self.shs: Tensor = shs  # [B, SH_Coeff, 3]
 
         self.use_rgb = use_rgb  # shs indicates rgb?
-
-    def construct_list_of_attributes(self):
-        l = ["x", "y", "z", "nx", "ny", "nz"]
-        features_dc = self.shs[:, :1]
-        features_rest = self.shs[:, 1:]
-
-        for i in range(features_dc.shape[1] * features_dc.shape[2]):
-            l.append("f_dc_{}".format(i))
-        for i in range(features_rest.shape[1] * features_rest.shape[2]):
-            l.append("f_rest_{}".format(i))
-        l.append("opacity")
-        for i in range(self.scaling.shape[1]):
-            l.append("scale_{}".format(i))
-        for i in range(self.rotation.shape[1]):
-            l.append("rot_{}".format(i))
-        return l
-
-    def save_ply(self, path):
-
-        xyz = self.xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-
-        if self.use_rgb:
-            shs = RGB2SH(self.shs)
-        else:
-            shs = self.shs
-
-        features_dc = shs[:, :1]
-        features_rest = shs[:, 1:]
-
-        f_dc = (
-            features_dc.float().detach().flatten(start_dim=1).contiguous().cpu().numpy()
-        )
-        f_rest = (
-            features_rest.float()
-            .detach()
-            .flatten(start_dim=1)
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
-        opacities = (
-            inverse_sigmoid(torch.clamp(self.opacity, 1e-3, 1 - 1e-3))
-            .detach()
-            .cpu()
-            .numpy()
-        )
-
-        scale = np.log(self.scaling.detach().cpu().numpy())
-        rotation = self.rotation.detach().cpu().numpy()
-
-        dtype_full = [
-            (attribute, "f4") for attribute in self.construct_list_of_attributes()
-        ]
-
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
-        )
-        elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, "vertex")
-        PlyData([el]).write(path)
-
-    def load_ply(self, path):
-
-        plydata = PlyData.read(path)
-
-        xyz = np.stack(
-            (
-                np.asarray(plydata.elements[0]["x"]),
-                np.asarray(plydata.elements[0]["y"]),
-                np.asarray(plydata.elements[0]["z"]),
-            ),
-            axis=1,
-        )
-        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
-
-        features_dc = np.zeros((xyz.shape[0], 3, 1))
-        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
-        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
-        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
-
-        extra_f_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("f_rest_")
-        ]
-
-        extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-        sh_degree = int(math.sqrt((len(extra_f_names) + 3) / 3)) - 1
-
-        print("load sh degree: ", sh_degree)
-
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        # 0, 3, 8, 15
-        features_extra = features_extra.reshape(
-            (features_extra.shape[0], 3, (sh_degree + 1) ** 2 - 1)
-        )
-
-        scale_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("scale_")
-        ]
-        scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
-        scales = np.zeros((xyz.shape[0], len(scale_names)))
-        for idx, attr_name in enumerate(scale_names):
-            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        rot_names = [
-            p.name for p in plydata.elements[0].properties if p.name.startswith("rot")
-        ]
-        rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
-        rots = np.zeros((xyz.shape[0], len(rot_names)))
-        for idx, attr_name in enumerate(rot_names):
-            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        xyz = torch.from_numpy(xyz).to(self.xyz)
-        opacities = torch.from_numpy(opacities).to(self.opacity)
-        rotation = torch.from_numpy(rots).to(self.rotation)
-        scales = torch.from_numpy(scales).to(self.scaling)
-        features_dc = torch.from_numpy(features_dc).to(self.shs)
-        features_rest = torch.from_numpy(features_extra).to(self.shs)
-
-        shs = torch.cat([features_dc, features_rest], dim=2)
-
-        if self.use_rgb:
-            shs = SH2RGB(shs)
-        else:
-            shs = shs
-
-        self.xyz: Tensor = xyz
-        self.opacity: Tensor = self.opacity_activation(opacities)
-        self.rotation: Tensor = self.rotation_activation(rotation)
-        self.scaling: Tensor = self.scaling_activation(scales)
-        self.shs: Tensor = shs.permute(0, 2, 1)
-
-        self.active_sh_degree = sh_degree
-
-    def clone(self):
-        xyz = self.xyz.clone()
-        opacity = self.opacity.clone()
-        rotation = self.rotation.clone()
-        scaling = self.scaling.clone()
-        shs = self.shs.clone()
-        use_rgb = self.use_rgb
-        return GaussianModel(xyz, opacity, rotation, scaling, shs, use_rgb)
-
-
-class GSLayer(nn.Module):
-    """W/O Activation Function"""
-
-    def setup_functions(self):
-
-        self.scaling_activation = trunc_exp  # proposed by torch-ngp
-        self.scaling_inverse_activation = torch.log
-
-        self.opacity_activation = torch.sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
-        self.rotation_activation = torch.nn.functional.normalize
-
-        self.rgb_activation = torch.sigmoid
-
-    def __init__(
-        self,
-        in_channels,
-        use_rgb,
-        clip_scaling=0.2,
-        init_scaling=-5.0,
-        init_density=0.1,
-        sh_degree=None,
-        xyz_offset=True,
-        restrict_offset=True,
-        xyz_offset_max_step=None,
-        fix_opacity=False,
-        fix_rotation=False,
-        use_fine_feat=False,
-    ):
-        super().__init__()
-        self.setup_functions()
-
-        if isinstance(clip_scaling, omegaconf.listconfig.ListConfig) or isinstance(
-            clip_scaling, list
-        ):
-            self.clip_scaling_pruner = LinerParameterTuner(*clip_scaling)
-        else:
-            self.clip_scaling_pruner = StaticParameterTuner(clip_scaling)
-        self.clip_scaling = self.clip_scaling_pruner.get_value(0)
-
-        self.use_rgb = use_rgb
-        self.restrict_offset = restrict_offset
-        self.xyz_offset = xyz_offset
-        self.xyz_offset_max_step = xyz_offset_max_step  # 1.2 / 32
-        self.fix_opacity = fix_opacity
-        self.fix_rotation = fix_rotation
-        self.use_fine_feat = use_fine_feat
-
-        self.attr_dict = {
-            "shs": (sh_degree + 1) ** 2 * 3,
-            "scaling": 3,
-            "xyz": 3,
-            "opacity": None,
-            "rotation": None,
-        }
-        if not self.fix_opacity:
-            self.attr_dict["opacity"] = 1
-        if not self.fix_rotation:
-            self.attr_dict["rotation"] = 4
-
-        self.out_layers = nn.ModuleDict()
-        for key, out_ch in self.attr_dict.items():
-            if out_ch is None:
-                layer = nn.Identity()
-            else:
-                if key == "shs" and use_rgb:
-                    out_ch = 3
-                if key == "shs":
-                    shs_out_ch = out_ch
-                layer = nn.Linear(in_channels, out_ch)
-            # initialize
-            if not (key == "shs" and use_rgb):
-                if key == "opacity" and self.fix_opacity:
-                    pass
-                elif key == "rotation" and self.fix_rotation:
-                    pass
-                else:
-                    nn.init.constant_(layer.weight, 0)
-                    nn.init.constant_(layer.bias, 0)
-            if key == "scaling":
-                nn.init.constant_(layer.bias, init_scaling)
-            elif key == "rotation":
-                if not self.fix_rotation:
-                    nn.init.constant_(layer.bias, 0)
-                    nn.init.constant_(layer.bias[0], 1.0)
-            elif key == "opacity":
-                if not self.fix_opacity:
-                    nn.init.constant_(layer.bias, inverse_sigmoid(init_density))
-            self.out_layers[key] = layer
-
-        if self.use_fine_feat:
-            fine_shs_layer = nn.Linear(in_channels, shs_out_ch)
-            nn.init.constant_(fine_shs_layer.weight, 0)
-            nn.init.constant_(fine_shs_layer.bias, 0)
-            self.out_layers["fine_shs"] = fine_shs_layer
-
-    def hyper_step(self, step):
-        self.clip_scaling = self.clip_scaling_pruner.get_value(step)
-
-    def constrain_forward(self, ret, constrain_dict):
-
-        # body scaling constrain
-        # gs_attr.scaling[is_constrain_body] = gs_attr.scaling[is_constrain_body].clamp(max=0.02)  # magic number, which is used to constrain 
-        # hand opacity constrain 
-
-        # force the hand's opacity to be 0.95
-        # gs_attr.opacity[is_hand] = gs_attr.opacity[is_hand].clamp(min=0.95)
-
-        # body scaling constrain
-        # is_constrain_body = constrain_dict['is_constrain_body']
-        is_upper_body = constrain_dict['is_upper_body']
-        scaling = ret['scaling'] 
-        # scaling[is_constrain_body] body_constrain= scaling[is_constrain_body].clamp(max = 0.02)
-        scaling[is_upper_body] = scaling[is_upper_body].clamp(max = 0.02)
-        # scaling = scaling.clamp(max=0.02)
-        ret['scaling'] = scaling
-
-        return ret
-
-    def forward(self, x, pts, x_fine=None, constrain_dict=None):
-        assert len(x.shape) == 2
-        ret = {}
-        for k in self.attr_dict:
-            layer = self.out_layers[k]
-
-            v = layer(x)
-            if k == "rotation":
-                if self.fix_rotation:
-                    v = matrix_to_quaternion(
-                        torch.eye(3).type_as(x)[None, :, :].repeat(x.shape[0], 1, 1)
-                    )  # constant rotation
-                else:
-                    # v = torch.nn.functional.normalize(v)
-                    v = self.rotation_activation(v)
-            elif k == "scaling":
-                # v = trunc_exp(v)
-                v = self.scaling_activation(v)
-
-                if self.clip_scaling is not None:
-                    v = torch.clamp(v, min=0, max=self.clip_scaling)
-            elif k == "opacity":
-                if self.fix_opacity:
-                    v = torch.ones_like(x)[..., 0:1]
-                else:
-                    # v = torch.sigmoid(v)
-                    v = self.opacity_activation(v)
-            elif k == "shs":
-                if self.use_rgb:
-                    # v = torch.sigmoid(v)
-                    v = self.rgb_activation(v)
-
-                    if self.use_fine_feat:
-                        v_fine = self.out_layers["fine_shs"](x_fine)
-                        v_fine = torch.tanh(v_fine)
-                        v = v + v_fine
-                else:
-                    if self.use_fine_feat:
-                        v_fine = self.out_layers["fine_shs"](x_fine)
-                        v = v + v_fine
-                v = torch.reshape(v, (v.shape[0], -1, 3))
-            elif k == "xyz":
-                # TODO check
-                if self.restrict_offset:
-                    max_step = self.xyz_offset_max_step
-                    v = (torch.sigmoid(v) - 0.5) * max_step
-                if self.xyz_offset:
-                    pass
-                else:
-                    assert NotImplementedError
-                    v = v + pts
-                k = "offset_xyz"
-            ret[k] = v
-
-        ret["use_rgb"] = self.use_rgb
-
-        if constrain_dict is not None:
-            ret = self.constrain_forward(ret, constrain_dict)
-
-        return GaussianAppOutput(**ret)
-
-
+ 
 class GS3DRenderer(nn.Module):
     def __init__(
         self,
@@ -550,15 +213,9 @@ class GS3DRenderer(nn.Module):
     ):
 
         super().__init__()
-        self.gradient_checkpointing = gradient_checkpointing
-        self.skip_decoder = skip_decoder
-        self.smpl_type = smpl_type
-        assert self.smpl_type in ["smplx", "smplx_0", "smplx_1", "smplx_2"]
-
         self.scaling_modifier = 1.0
         self.sh_degree = sh_degree
-
-
+        self.use_rgb = use_rgb
         self.smplx_model = SMPLXVoxelMeshModel(
             human_model_path,
             gender="neutral",
@@ -570,34 +227,21 @@ class GS3DRenderer(nn.Module):
             apply_pose_blendshape=apply_pose_blendshape,
         )
 
-        self.mlp_network_config = mlp_network_config
 
-        # using to mapping transformer decode feature to regression features. as decode feature is processed by NormLayer.
-        if self.mlp_network_config is not None:
-            self.mlp_net = MLP(query_dim, query_dim, **self.mlp_network_config)
+    # --------------------------------------------------------------------------
+    # Animate + Render
+    # --------------------------------------------------------------------------
+    def get_query_points(self, smplx_data, device):
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.float32):
+                positions, pos_wo_upsample, transform_mat_neutral_pose = (
+                    self.smplx_model.get_query_points(smplx_data, device=device)
+                )  # [B, N, 3]
 
-        self.gs_net = GSLayer(
-            in_channels=query_dim,
-            use_rgb=use_rgb,
-            sh_degree=self.sh_degree,
-            clip_scaling=clip_scaling,
-            init_scaling=-5.0,
-            init_density=0.1,
-            xyz_offset=True,
-            restrict_offset=True,
-            xyz_offset_max_step=xyz_offset_max_step,
-            fix_opacity=fix_opacity,
-            fix_rotation=fix_rotation,
-            use_fine_feat=(
-                True
-                if decode_with_extra_info is not None
-                and decode_with_extra_info["type"] is not None
-                else False
-            ),
+        smplx_data["transform_mat_neutral_pose"] = (
+            transform_mat_neutral_pose  # [B, 55, 4, 4]
         )
-
-    def hyper_step(self, step):
-        self.gs_net.hyper_step(step)
+        return positions, smplx_data
 
     def forward_single_view(
         self,
@@ -656,7 +300,7 @@ class GS3DRenderer(nn.Module):
         # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
         shs = None
         colors_precomp = None
-        if self.gs_net.use_rgb:
+        if self.use_rgb:
             colors_precomp = gs.shs.squeeze(1).float()
             shs = None
         else:
@@ -684,31 +328,38 @@ class GS3DRenderer(nn.Module):
             "comp_depth": rendered_depth.permute(1, 2, 0),
         }
 
-        return ret
+        return ret 
 
+    def forward_single_batch_custom(
+        self,
+        gs_list: list[GaussianModel],
+        c2ws: Float[Tensor, "Nv 4 4"],
+        intrinsics: Float[Tensor, "Nv 4 4"],
+        height: int,
+        width: int,
+        background_color: Optional[Float[Tensor, "Nv 3"]],
+        debug: bool = False,
+    ):
+        out_list = []
+        self.device = gs_list[0].xyz.device
 
-    def _compute_joint_position_based_on_gaussians(self, joint_idx, mean_3d, device):
-        joint_weights_full = self.smplx_model.skinning_weight[:, joint_idx].to(
-            device
-        ) # [N,]
-        # - Select only the gaussians that have non-negligible weights for the given joint
-        joint_mask = joint_weights_full > 0.2
-        if joint_mask.sum() < 10:
-            print("[WARNING] Too few gaussians selected for joint alignment!")
-            # -- If too few gaussians are selected, pick the top 500 weighted ones
-            joint_mask = joint_weights_full.topk(500).indices
-            mask_tensor = torch.zeros_like(joint_weights_full, dtype=torch.bool)
-            mask_tensor[joint_mask] = True
-            joint_mask = mask_tensor
-        # - Normalize the weights
-        joint_weights = joint_weights_full[joint_mask].clamp_min(1e-6)
-        joint_weights = joint_weights / joint_weights.sum()
-        # - Compute the weighted average position
-        gaussian_joint = (
-            mean_3d[:, joint_mask, :] * joint_weights.view(1, -1, 1)
-        ).sum(dim=1)
+        for v_idx, (c2w, intrinsic) in enumerate(zip(c2ws, intrinsics)):
+            out_list.append(
+                self.forward_single_view(
+                    gs_list[v_idx],
+                    Camera.from_c2w(c2w, intrinsic, height, width),
+                    background_color[v_idx],
+                )
+            )
 
-        return gaussian_joint
+        out = defaultdict(list)
+        for out_ in out_list:
+            for k, v in out_.items():
+                out[k].append(v)
+        out = {k: torch.stack(v, dim=0) for k, v in out.items()}
+        out["3dgs"] = gs_list
+
+        return out
 
     def animate_gs_model_custom(
         self, gs_attr: GaussianAppOutput, query_points, smplx_data
@@ -785,29 +436,6 @@ class GS3DRenderer(nn.Module):
                 )
             )  # [B, N, 3]
 
-#            # Joint alignment to avoid misalignment between rendered gaussians and GT images
-            ## - Compute the pelvis position from the posed gaussians
-            #pelvis_idx = self.smplx_model.smpl_x.root_joint_idx
-            #pelvis_world = posed_joints[:, pelvis_idx, :] + merge_smplx_data["trans"]
-            #gaussian_pelvis = self._compute_joint_position_based_on_gaussians(
-                #joint_idx=pelvis_idx, mean_3d=mean_3d, device=device
-            #)
-            #pelvis_delta = pelvis_world - gaussian_pelvis
-            ## - Compute the ??? position from the posed gaussians
-            #chest_idx = self.smplx_model.smpl_x.joints_name.index("Spine_3")
-            #chest_world = posed_joints[:, chest_idx, :] + merge_smplx_data["trans"]
-            #gaussian_chest = self._compute_joint_position_based_on_gaussians(
-                #joint_idx=chest_idx, mean_3d=mean_3d, device=device
-            #)
-            #chest_delta = chest_world - gaussian_chest
-            ## - Average the two deltas to get a final delta
-            #delta = (pelvis_delta + chest_delta) / 2.0  # [Nv, 3]
-
-            ## - Here, we use the sign of the mean offset z to determine whether to add or subtract the delta
-            ## - Note to future self: this is where things could go wrong - only tested for a single scene and 2 humans only
-            #delta_sign = -1 if gs_attr.offset_xyz.mean(dim=0)[-1] < 0 else 1
-            #mean_3d = mean_3d + delta.unsqueeze(1) * delta_sign
-
             # rotation appearance from canonical space to view_posed
             num_view, N, _, _ = transform_matrix.shape
             transform_rotation = transform_matrix[:, :, :3, :3]
@@ -842,7 +470,7 @@ class GS3DRenderer(nn.Module):
                 rotation=rotation_pose_verts[i],
                 scaling=gs_attr.scaling,
                 shs=gs_attr.shs,
-                use_rgb=self.gs_net.use_rgb,
+                use_rgb=self.use_rgb,
             )  # [N, 3]
 
             if i == num_view - 1:
@@ -853,116 +481,6 @@ class GS3DRenderer(nn.Module):
                 gs_list.append(gs_copy)
 
         return gs_list, cano_gs_list
-
-
-    def forward_gs_attr(self, x, query_points, smplx_data, debug=False, x_fine=None):
-        """
-        x: [N, C] Float[Tensor, "Np Cp"],
-        query_points: [N, 3] Float[Tensor, "Np 3"]
-        """
-        device = x.device
-        if self.mlp_network_config is not None:
-            # x is processed by LayerNorm
-            x = self.mlp_net(x)
-            if x_fine is not None:
-                x_fine = self.mlp_net(x_fine)
-
-        # NOTE that gs_attr contains offset xyz
-        is_constrain_body = self.smplx_model.is_constrain_body
-        is_hands =  self.smplx_model.is_rhand + self.smplx_model.is_lhand 
-        is_upper_body = self.smplx_model.is_upper_body
-
-        constrain_dict=dict(
-            is_constrain_body=is_constrain_body,
-            is_hands=is_hands,
-            is_upper_body=is_upper_body,
-        )
-
-        gs_attr: GaussianAppOutput = self.gs_net(x, query_points, x_fine, constrain_dict)
-
-        return gs_attr
-
-    def get_query_points(self, smplx_data, device):
-        with torch.no_grad():
-            with torch.autocast(device_type=device.type, dtype=torch.float32):
-                # print(smplx_data["betas"].shape, smplx_data["face_offset"].shape, smplx_data["joint_offset"].shape)
-                positions, pos_wo_upsample, transform_mat_neutral_pose = (
-                    self.smplx_model.get_query_points(smplx_data, device=device)
-                )  # [B, N, 3]
-
-        smplx_data["transform_mat_neutral_pose"] = (
-            transform_mat_neutral_pose  # [B, 55, 4, 4]
-        )
-        return positions, smplx_data
-
-
-    def query_latent_feat(
-        self,
-        positions: Float[Tensor, "*B N1 3"],
-        smplx_data,
-        latent_feat: Float[Tensor, "*B N2 C"],
-        extra_info,
-    ):
-        device = latent_feat.device
-        if self.skip_decoder:
-            gs_feats = latent_feat
-            assert positions is not None
-        else:
-            assert positions is None
-            if positions is None:
-                positions, smplx_data = self.get_query_points(smplx_data, device)
-
-            with torch.autocast(device_type=device.type, dtype=torch.float32):
-                pcl_embed = self.pcl_embed(positions)
-
-            gs_feats = self.decoder_cross_attn(
-                pcl_embed.to(dtype=latent_feat.dtype), latent_feat, extra_info
-            )
-
-        return gs_feats, positions, smplx_data
-
-
-    def forward_single_batch_custom(
-        self,
-        gs_list: list[GaussianModel],
-        c2ws: Float[Tensor, "Nv 4 4"],
-        intrinsics: Float[Tensor, "Nv 4 4"],
-        height: int,
-        width: int,
-        background_color: Optional[Float[Tensor, "Nv 3"]],
-        debug: bool = False,
-    ):
-        out_list = []
-        self.device = gs_list[0].xyz.device
-
-        for v_idx, (c2w, intrinsic) in enumerate(zip(c2ws, intrinsics)):
-            out_list.append(
-                self.forward_single_view(
-                    gs_list[v_idx],
-                    Camera.from_c2w(c2w, intrinsic, height, width),
-                    background_color[v_idx],
-                )
-            )
-
-        out = defaultdict(list)
-        for out_ in out_list:
-            for k, v in out_.items():
-                out[k].append(v)
-        out = {k: torch.stack(v, dim=0) for k, v in out.items()}
-        out["3dgs"] = gs_list
-
-        # debug = True
-        if debug:
-            import cv2
-
-            cv2.imwrite(
-                "fuck.png",
-                (out["comp_rgb"].detach().cpu().numpy()[0, ..., ::-1] * 255).astype(
-                    np.uint8
-                ),
-            )
-
-        return out
 
 
     def get_single_batch_smpl_data(self, smpl_data, bidx):
@@ -997,42 +515,6 @@ class GS3DRenderer(nn.Module):
                 # print(f"  Key {k} shape: {smpl_data_single_view[k].shape}")
         return smpl_data_single_view
 
-    def forward_gs(
-        self,
-        gs_hidden_features: Float[Tensor, "B Np Cp"],
-        query_points: Float[Tensor, "B Np_q 3"],
-        smplx_data,  # e.g., body_pose:[B, Nv, 21, 3], betas:[B, 100]
-        additional_features: Optional[dict] = None,
-        debug: bool = False,
-        **kwargs,
-    ):
-
-        batch_size = gs_hidden_features.shape[0]
-
-        # obtain gs_features embedding, cur points position, and also smplx params
-        query_gs_features, query_points, smplx_data = self.query_latent_feat(
-            query_points, smplx_data, gs_hidden_features, additional_features
-        )
-
-        gs_attr_list = []
-        for b in range(batch_size):
-            if isinstance(query_gs_features, dict):
-                gs_attr = self.forward_gs_attr(
-                    query_gs_features["coarse"][b],
-                    query_points[b],
-                    None,
-                    debug,
-                    x_fine=query_gs_features["fine"][b],
-                )
-            else:
-                gs_attr = self.forward_gs_attr(
-                    query_gs_features[b], query_points[b], None, debug
-                )
-            gs_attr_list.append(gs_attr)
-
-        return gs_attr_list, query_points, smplx_data
-
-
     def forward_animate_gs_custom(
         self,
         gs_attr_list,
@@ -1048,11 +530,6 @@ class GS3DRenderer(nn.Module):
     ):
         batch_size = len(gs_attr_list)
         out_list = []
-        cano_out_list = []  # inference DO NOT use
-
-        N_view = smplx_data["root_pose"].shape[1]
-        # print(f"[DEBUG] N_view: {N_view}")
-
 
         # step 1: animate gs model = canonical -> posed view
         all_posed_gs_list = []
@@ -1080,7 +557,7 @@ class GS3DRenderer(nn.Module):
                 rotation=merged_rotation,
                 scaling=merged_scaling,
                 shs=merged_shs,
-                use_rgb=self.gs_net.use_rgb,
+                use_rgb=self.use_rgb,
             )
         ]
 
@@ -1116,45 +593,4 @@ class GS3DRenderer(nn.Module):
         out["comp_depth"] = out["comp_depth"].permute(
             0, 1, 4, 2, 3
         )  # [B, NV, H, W, 3] -> [B, NV, 1, H, W]
-        return out
-
-    def forward(
-        self,
-        gs_hidden_features: Float[Tensor, "B Np Cp"],
-        query_points: Float[Tensor, "B Np 3"],
-        smplx_data,  # e.g., body_pose:[B, Nv, 21, 3], betas:[B, 100]
-        c2w: Float[Tensor, "B Nv 4 4"],
-        intrinsic: Float[Tensor, "B Nv 4 4"],
-        height,
-        width,
-        additional_features: Optional[Float[Tensor, "B C H W"]] = None,
-        background_color: Optional[Float[Tensor, "B Nv 3"]] = None,
-        debug: bool = False,
-        **kwargs,
-    ):
-
-        # need shape_params of smplx_data to get querty points and get "transform_mat_neutral_pose"
-        # only forward gs params
-        gs_attr_list, query_points, smplx_data = self.forward_gs(
-            gs_hidden_features,
-            query_points,
-            smplx_data=smplx_data,
-            additional_features=additional_features,
-            debug=debug,
-        )
-
-        out = self.forward_animate_gs(
-            gs_attr_list,
-            query_points,
-            smplx_data,
-            c2w,
-            intrinsic,
-            height,
-            width,
-            background_color,
-            debug,
-            df_data=kwargs["df_data"],
-        )
-        out["gs_attr"] = gs_attr_list
-
         return out
