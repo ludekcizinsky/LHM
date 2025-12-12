@@ -953,6 +953,20 @@ class MultiHumanTrainer:
                     for i in range(joined.shape[0]):
                         save_path = metrics_debug_dir / Path(frame_paths[i]).name
                         save_image(joined[i].permute(2, 0, 1), str(save_path))
+
+                    
+#                    # debug - for difix
+                    #difix_debug_dir = save_dir / "difix_inputs"
+                    #difix_debug_render_dir = difix_debug_dir / "renders"
+                    #difix_debug_render_dir.mkdir(parents=True, exist_ok=True)
+                    #difix_debug_gt_dir = difix_debug_dir / "gt_frames"
+                    #difix_debug_gt_dir.mkdir(parents=True, exist_ok=True)
+                    #for i in range(frames.shape[0]):
+                        #save_path = difix_debug_render_dir / Path(frame_paths[i]).name
+                        #save_image(renders[i].permute(2, 0, 1), str(save_path))
+
+                        #save_path = difix_debug_gt_dir / Path(frame_paths[i]).name
+                        #save_image(frames[i].permute(2, 0, 1), str(save_path))
                     
                     # Compute metrics
                     psnr_vals = psnr(
