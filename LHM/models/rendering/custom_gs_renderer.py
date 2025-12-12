@@ -9,7 +9,6 @@ from pytorch3d.transforms.rotation_conversions import quaternion_multiply
 
 from LHM.models.rendering.custom_smplx_voxel_dense_sampling import SMPLXVoxelMeshModel
 from LHM.models.rendering.utils.typing import *
-from LHM.models.rendering.utils.utils import MLP
 from LHM.outputs.output import GaussianAppOutput
 
 from gsplat.rendering import rasterization
