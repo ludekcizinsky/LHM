@@ -30,7 +30,7 @@ loss_weights:
   rgb: 20.0
   sil: 4.0
   ssim: 0.4
-  depth: 10.0
+  depth: 0.0
 
 regularization:
   asap_w: 200.0

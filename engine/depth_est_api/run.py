@@ -25,23 +25,25 @@ def load_frames(frames_dir: Path):
     return frame_paths, images
 
 
-def save_depth_maps(depth_batch: torch.Tensor, frame_paths, output_dir: Path, masks_dir: Path):
+def save_depth_maps(depth_np: np.ndarray, frame_paths, output_dir: Path, masks_dir: Path):
+
+    # Prepare directories
     raw_dir = output_dir / "raw"
     png_dir = output_dir / "png"
     masked_dir = output_dir / "masked_png"
     raw_dir.mkdir(parents=True, exist_ok=True)
     png_dir.mkdir(parents=True, exist_ok=True)
     masked_dir.mkdir(parents=True, exist_ok=True)
-    if isinstance(depth_batch, torch.Tensor):
-        depth_np = depth_batch.cpu().numpy()
-    else:
-        depth_np = np.asarray(depth_batch)
+
     for dp, src_path in zip(depth_np, frame_paths):
+
+        # Save the raw depth map as a per frame numpy file 
+        np.save(raw_dir / (src_path.stem + ".npy"), dp.astype(np.float32))
+
         # Upsample depth to original image resolution
         orig_hw = Image.open(src_path).size[::-1]  # (H,W)
         dp_resized = np.array(Image.fromarray(dp).resize(orig_hw[::-1], resample=Image.BILINEAR))
 
-        np.save(raw_dir / (src_path.stem + ".npy"), dp.astype(np.float32))
         # Normalize depth for visualization; handle zero/inf safely.
         depth_vis = dp_resized.copy()
         depth_vis[~np.isfinite(depth_vis)] = 0.0
@@ -131,21 +133,30 @@ def main():
     depth_out_dir = output_dir / "depth_maps"
     masks_dir = output_dir / "masks" / "union"
 
+    cameras_path = output_dir / "motion_human3r" / "cameras.npz"
+    K = np.load(cameras_path)["K"][0] # [3, 3] 
+    fx, fy = K[0, 0], K[1, 1]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DepthAnything3.from_pretrained("depth-anything/da3metric-large").to(device)
 
     frame_paths, images = load_frames(frames_dir)
-    # DepthAnything3 expects a non-None export_format; use "npz" but ignore exported files.
     prediction = model.inference(
         images,
         export_dir=str(depth_out_dir / "raw"),
         export_format="npz",
     )
 
-    # Depth is canonical metric depth (meters). No focal scaling needed for meters here.
-    save_depth_maps(prediction.depth, frame_paths, depth_out_dir, masks_dir)
-    print(f"Saved {len(frame_paths)} depth maps to {depth_out_dir}")
+    # Convert from relative depth to the metric depth (as described in the docs)
+    # Also since the intrinsics are in the original resolution, scale them accordingly
+    W_orig, H_orig = images[0].size
+    _, H_infer, W_infer, _ = prediction.processed_images.shape
+    focal_orig = (fx + fy) / 2
+    focal_eff = focal_orig * (W_infer / W_orig)
+    metric_depth = focal_eff * prediction.depth  / 300
 
+    # Depth is canonical metric depth (meters). No focal scaling needed for meters here.
+    save_depth_maps(metric_depth, frame_paths, depth_out_dir, masks_dir)
 
 if __name__ == "__main__":
     main()

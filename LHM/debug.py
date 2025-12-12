@@ -172,7 +172,7 @@ def save_depth_comparison(pred_depth: torch.Tensor, gt_depth: torch.Tensor, save
     masked_pred = mask_background(pred_depth_np)
     masked_gt = mask_background(gt_depth_np)
 
-    vmin, vmax = 1.0, 2.0
+    vmin, vmax = 1.5, 4.0
     clipped_pred = np.ma.clip(masked_pred, vmin, vmax)
     clipped_gt = np.ma.clip(masked_gt, vmin, vmax)
 

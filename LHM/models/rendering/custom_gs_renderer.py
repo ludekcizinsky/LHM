@@ -1,17 +1,11 @@
 import math
-import os
 from collections import defaultdict
 
 import numpy as np
 import torch
 import torch.nn as nn
-from diff_gaussian_rasterization import (
-    GaussianRasterizationSettings,
-    GaussianRasterizer,
-)
 from pytorch3d.transforms import matrix_to_quaternion
 from pytorch3d.transforms.rotation_conversions import quaternion_multiply
-
 
 from LHM.models.rendering.custom_smplx_voxel_dense_sampling import SMPLXVoxelMeshModel
 from LHM.models.rendering.utils.typing import *
@@ -255,7 +249,7 @@ class GS3DRenderer(nn.Module):
     ):
 
         # Prepare inputs for rasterization
-        means = gs.xyz
+        means = gs.xyz # [N, 3]
         quats = gs.rotation
         scales = gs.scaling
         opacities = gs.opacity.squeeze(-1)

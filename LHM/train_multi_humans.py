@@ -844,8 +844,6 @@ class MultiHumanTrainer:
         render_bg_colors_template = torch.zeros(
             (num_tracks, num_frames, 3), device=self.tuner_device, dtype=torch.float32
         )  # black
-        alpha_candidates = torch.arange(-0.9, 1.1, 0.1, device=self.tuner_device)
-        max_shift_m = 0.2
 
         # Collector for metrics
         metrics_all_cams_per_frame = list()
