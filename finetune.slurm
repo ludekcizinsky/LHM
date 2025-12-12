@@ -93,10 +93,10 @@ module load gcc ffmpeg
 
 seq_name="hi4d_pair17_dance"
 num_persons=2
-exp_name="gsplat_tune_color"
+exp_name="gsplat_depth_loss_w1.0_tune_color"
 source_cam_id=28
 # target_cam_ids="[4,16,28,40,52,64,76,88]"
 train_params="[shs]"
 target_cam_ids="[4,28,52]"
 root_gt_dir_path=/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair17_1/pair17/dance17
-python LHM/train_multi_humans.py scene_name=$seq_name exp_name=$exp_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id nvs_eval.target_camera_ids=$target_cam_ids eval_pretrain=true epochs=50 eval_every_epoch=25 wandb.enable=true train_params=$train_params
+python LHM/train_multi_humans.py scene_name=$seq_name exp_name=$exp_name num_persons=$num_persons nvs_eval.root_gt_dir_path=$root_gt_dir_path nvs_eval.source_camera_id=$source_cam_id nvs_eval.target_camera_ids=$target_cam_ids eval_pretrain=true epochs=50 eval_every_epoch=25 wandb.enable=true loss_weights.depth=1.0 train_params=$train_params
