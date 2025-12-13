@@ -7,6 +7,7 @@
 
 import os
 from pathlib import Path
+import json
 
 import cv2
 import numpy as np
@@ -221,6 +222,11 @@ def infer_preprocess_image(
     )  # [1, 1, H, W]
     return rgb, mask, intr
 
+def save_image(image: torch.Tensor, image_path: str):
+    image_to_save = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
+        np.uint8
+    )
+    Image.fromarray(image_to_save).save(image_path)
 
 class HumanLRMInferrer(Inferrer):
 
@@ -229,17 +235,60 @@ class HumanLRMInferrer(Inferrer):
     def __init__(self, cfg):
         super().__init__()
 
+        # Config setup
         self.cfg = cfg
+        self.output_dir = Path(cfg.output_dir)
+        self.save_dir = self.output_dir / "canon_3dgs_lhm"
+        os.makedirs(self.save_dir, exist_ok=True)
         print("\n--- Inference with config:")
         print(OmegaConf.to_yaml(self.cfg))
 
+        # Input data loading
+        self._load_inference_inputs()
+
+        # Model loading
+        print(f"\n--- Loading Models")
         self.facedetect = FaceDetector(
             "/scratch/izar/cizinsky/pretrained/pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
             device=avaliable_device(),
         )
-
-        print(f"\n--- Loading Large Human Model")
         self.model: ModelHumanLRM = self._build_model(self.cfg).to(self.device)
+
+
+    def _load_inference_inputs(self):
+        # Load inputs for the inference
+        # - Masked images
+        masked_images_dir = self.output_dir / "masked_images"
+        person_ids = sorted([pid for pid in os.listdir(masked_images_dir) if pid.isdigit()])
+        self.image_paths = []
+        for pid in person_ids:
+            image_path = masked_images_dir / pid / f"{self.cfg.input_image_id:04d}.png"
+            assert image_path.exists(), f"Image path does not exist: {image_path}"
+            self.image_paths.append(image_path)
+
+        # - Shape params
+        # -- Estimated from human3r
+        shape_params_dir = self.output_dir / "motion_human3r"
+        self.estimated_shape_params = []
+        for pid in person_ids:
+            shaper_params_path = shape_params_dir / pid / "smplx_params" / "00000.json"
+            assert shaper_params_path.exists(), f"Shape params path does not exist: {shaper_params_path}"
+            with open(shaper_params_path, 'r') as f:
+                smplx_params = json.load(f)
+                betas = np.array(smplx_params['betas']) # [10,]
+                self.estimated_shape_params.append(betas)
+        assert len(self.image_paths) == len(self.estimated_shape_params), "Number of images and shape params do not match"
+
+        # -- Hi4D GT shape params
+        if self.cfg.hi4d_gt_root_dir is not None:
+            gt_smplx_params_dir = Path(self.cfg.hi4d_gt_root_dir) / "smplx"
+            gt_smplx_params_path = gt_smplx_params_dir / "000001.npz"
+            params = np.load(gt_smplx_params_path)
+            betas = params['betas'] # [2, 10]
+            self.hi4d_gt_shape_params = [betas[i] for i in range(betas.shape[0])]
+            assert len(self.image_paths) == len(self.hi4d_gt_shape_params), "Number of images and shape params do not match"
+        else:
+            self.hi4d_gt_shape_params = list()
 
     def _build_model(self, cfg):
         from LHM.models import model_dict
@@ -261,20 +310,21 @@ class HumanLRMInferrer(Inferrer):
     def infer_single(
         self,
         image_path: str,
-        motion_seqs_dir,
+        shape_param: np.ndarray,
+        shape_params_source: str = "estimated",
+        person_id: int = 0,
     ):
+        # create save dir
+        save_dir_root = self.save_dir / f"{person_id:02d}"
+        os.makedirs(save_dir_root, exist_ok=True)
 
-        source_size = self.cfg.source_size
-        aspect_standard = 5.0 / 3
-        motion_img_need_mask = self.cfg.get("motion_img_need_mask", False)  # False
-        vis_motion = self.cfg.get("vis_motion", False)  # False
-        print(f"[DEBUG] motion_img_need_mask: {motion_img_need_mask}, vis_motion: {vis_motion}")
-
+        # prepare input image
+        # - preprocess
         img_np = cv2.imread(image_path)
         remove_np = remove(img_np)
-        parsing_mask = remove_np[...,3]
-        
-        # prepare reference image
+        parsing_mask = remove_np[...,3] 
+        source_size = self.cfg.source_size
+        aspect_standard = 5.0 / 3
         image, _, _ = infer_preprocess_image(
             image_path,
             mask=parsing_mask,
@@ -289,133 +339,62 @@ class HumanLRMInferrer(Inferrer):
             need_mask=True,
         )
 
+        # - visualise and save
+        image_save_path = save_dir_root / f"{shape_params_source}_input_image.png"
+        save_image(image, image_save_path)
+
         # prepare head image
-        print(f"[DEBUG] preparing head image for {image_path}")
-        try:
-            src_head_rgb = self.crop_face_image(image_path)
-        except:
-            print("[WARNING] w/o head input!")
-            src_head_rgb = np.zeros((112, 112, 3), dtype=np.uint8)
-
-
-        try:
-            src_head_rgb = cv2.resize(
-                src_head_rgb,
-                dsize=(self.cfg.src_head_size, self.cfg.src_head_size),
-                interpolation=cv2.INTER_AREA,
-            )  # resize to dino size
-        except:
-            src_head_rgb = np.zeros(
-                (self.cfg.src_head_size, self.cfg.src_head_size, 3), dtype=np.uint8
-            )
-
+        # - preprocess
+        src_head_rgb = self.crop_face_image(image_path)
+        src_head_rgb = cv2.resize(
+            src_head_rgb,
+            dsize=(self.cfg.src_head_size, self.cfg.src_head_size),
+            interpolation=cv2.INTER_AREA,
+        )  # resize to dino size
         src_head_rgb = (
             torch.from_numpy(src_head_rgb / 255.0).float().permute(2, 0, 1).unsqueeze(0)
         )  # [1, 3, H, W]
 
-        # save masked image for vis
-        save_ref_img_path = os.path.join(
-            dump_tmp_dir, "refer_" + os.path.basename(image_path)
-        )
-        vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
-            np.uint8
-        )
-        Image.fromarray(vis_ref_img).save(save_ref_img_path)
-        print(f"[DEBUG] saved refer image to {save_ref_img_path}")
+        # - visualise and save
+        head_image_save_path = save_dir_root / f"{shape_params_source}_input_head.png"
+        save_image(src_head_rgb, head_image_save_path)
 
-        # save head image for vis
-        save_head_img_path = os.path.join(
-            dump_tmp_dir, "head_" + os.path.basename(image_path)
-        )
-        vis_head_img = (src_head_rgb[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
-            np.uint8
-        )
-        Image.fromarray(vis_head_img).save(save_head_img_path)
-        print(f"[DEBUG] saved head image to {save_head_img_path}")
 
-        # Infer canonical gs model and query points
+        # get canonical gs model based on the predicted betas
         device = "cuda"
         dtype = torch.float32
         shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
-
-        # read motion seq
-#         motion_seq = prepare_motion_seqs(
-            # motion_seqs_dir,
-            # motion_img_dir,
-            # save_root=dump_tmp_dir,
-            # fps=motion_video_read_fps,
-            # bg_color=1.0,
-            # aspect_standard=aspect_standard,
-            # enlarge_ratio=[1.0, 1, 0],
-            # render_image_res=render_size,
-            # multiply=16,
-            # need_mask=motion_img_need_mask,
-            # vis_motion=vis_motion,
-        # )
-        motion_seq = prepare_motion_seqs_human3r(Path(motion_seqs_dir))
-
-        # Save motion seq
-        motion_seq_save_path = Path(self.cfg.save_dir) / f"motion_seq.pt"
-        torch.save(motion_seq, motion_seq_save_path)
-        print(f"[DEBUG] saved motion sequence to {motion_seq_save_path}")
-
-
-        # Get canonical gs model based on the predicted betas
         self.model.to(dtype)
         gs_model_list, _, _ = self.model.infer_single_view(
             image.unsqueeze(0).to(device, dtype),
             src_head_rgb.unsqueeze(0).to(device, dtype),
             smplx_params={"betas": shape_param.to(device)}
         )
-        print(f"Shape of the shape params: {shape_param.shape}")
-        gs_model_save_path = Path(self.cfg.save_dir) / "gs_model_list.pt"
-        torch.save(gs_model_list, gs_model_save_path)
-
-
-#        # Get canonical gs model based on the gt betas
-        #smplx_dir = Path("/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair17_1/pair17/dance17/smplx")
-        #frame_paths = sorted([p for p in os.listdir(smplx_dir) if p.endswith(".npz")])
-        #npzs = []
-        #for fp in frame_paths:
-            #npz = np.load(smplx_dir / f"{Path(fp).stem}.npz")
-            #npzs.append(npz)
-
-        #def stack_key(key):
-            #arrs = [torch.from_numpy(n[key]).float() for n in npzs]
-            #return torch.stack(arrs, dim=1).to(device)  # [P, F, ...]
-
-        #betas = stack_key("betas")[1:2, 0, :10] # [P, 10]
-
-        #gs_model_list, _, _ = self.model.infer_single_view(
-            #image.unsqueeze(0).to(device, dtype),
-            #src_head_rgb.unsqueeze(0).to(device, dtype),
-            #smplx_params={"betas": betas.to(device)}
-        #)
-        #gs_model_save_path = Path(self.cfg.save_dir) / "gt_gs_model_list.pt"
-        #torch.save(gs_model_list, gs_model_save_path)
-
-        return 
-
+        gs_model_save_path = save_dir_root / f"{shape_params_source}_gs.pt"
+        torch.save(gs_model_list[0], gs_model_save_path)
 
     def infer(self):
+        
+        # Inference per person
+        n_images = len(self.image_paths)
+        estimated_canon_3dgs = []
+        hi4d_gt_canon_3dgs = []
+        for pid in range(n_images):
+            print(f"\n--- Inference for person {pid+1} / {n_images}")
+            person_image_path = self.image_paths[pid]
+            person_estimated_shape_params = self.estimated_shape_params[pid]
+            canon_gs = self.infer_single(person_image_path, person_estimated_shape_params, "human3r", pid)
+            estimated_canon_3dgs.append(canon_gs)
 
-        image_paths = []
-        if os.path.isfile(self.cfg.image_input):
-            omit_prefix = os.path.dirname(self.cfg.image_input)
-            image_paths.append(self.cfg.image_input)
-        else:
-            omit_prefix = self.cfg.image_input
-            suffixes = (".jpg", ".jpeg", ".png", ".webp", ".JPG")
-            for root, dirs, files in os.walk(self.cfg.image_input):
-                for file in files:
-                    if file.endswith(suffixes):
-                        image_paths.append(os.path.join(root, file))
-            image_paths.sort()
+            if len(self.hi4d_gt_shape_params) > 0:
+                person_gt_shape_params = self.hi4d_gt_shape_params[pid]
+                canon_gs = self.infer_single(person_image_path, person_gt_shape_params, "hi4d", pid)
+                hi4d_gt_canon_3dgs.append(canon_gs)
+        
+        # Joined the outputs per person into a single dir
+        save_dir_root = self.save_dir / f"union"
+        os.makedirs(save_dir_root, exist_ok=True)
+        torch.save(estimated_canon_3dgs, save_dir_root / "human3r_gs.pt")
 
-        print(f"[DEBUG] total {len(image_paths)} images to process. Path to the first image: {image_paths[0]}")
-
-
-
-
-        for image_path in tqdm(image_paths):
-            self.infer_single(image_path, motion_seqs_dir=self.cfg.motion_seqs_dir)
+        if len(hi4d_gt_canon_3dgs) > 0:
+            torch.save(hi4d_gt_canon_3dgs, save_dir_root / "hi4d_gs.pt")

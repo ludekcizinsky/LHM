@@ -23,6 +23,14 @@ def parse_configs():
         "--output_dir",
         type=Path
     )
+    parser.add_argument(
+        "--hi4d_gt_root_dir",
+        type=Path
+    )
+    parser.add_argument(
+        "--input_image_id",
+        type=int
+    )
     args, unknown = parser.parse_known_args()
 
     cfg = OmegaConf.create()
