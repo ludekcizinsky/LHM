@@ -222,8 +222,6 @@ def infer_preprocess_image(
     return rgb, mask, intr
 
 
-
-
 class HumanLRMInferrer(Inferrer):
 
     EXP_TYPE: str = "human_lrm_sapdino_bh_sd3_5"
@@ -232,31 +230,16 @@ class HumanLRMInferrer(Inferrer):
         super().__init__()
 
         self.cfg = cfg
-        os.makedirs(self.cfg.save_dir, exist_ok=True)
-        print("----- Inference with config:")
+        print("\n--- Inference with config:")
         print(OmegaConf.to_yaml(self.cfg))
-        print("-"*50)
-        quit()
-
-        configure_logger(
-            stream_level=self.cfg.logger,
-            log_level=self.cfg.logger,
-        )  # logger function
-
-        # if do not download prior model, we automatically download them.
-        prior_check()
 
         self.facedetect = FaceDetector(
             "/scratch/izar/cizinsky/pretrained/pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
             device=avaliable_device(),
         )
-        self.pose_estimator = PoseEstimator(
-            "/scratch/izar/cizinsky/pretrained/pretrained_models/human_model_files/", device=avaliable_device()
-        )
 
+        print(f"\n--- Loading Large Human Model")
         self.model: ModelHumanLRM = self._build_model(self.cfg).to(self.device)
-
-        self.motion_dict = dict()
 
     def _build_model(self, cfg):
         from LHM.models import model_dict
@@ -279,14 +262,6 @@ class HumanLRMInferrer(Inferrer):
         self,
         image_path: str,
         motion_seqs_dir,
-        motion_img_dir,
-        motion_video_read_fps,
-        export_video: bool,
-        export_mesh: bool,
-        dump_tmp_dir: str,  # require by extracting motion seq from video, to save some results
-        dump_image_dir: str,
-        dump_video_path: str,
-        shape_param=None,
     ):
 
         source_size = self.cfg.source_size
@@ -439,79 +414,8 @@ class HumanLRMInferrer(Inferrer):
 
         print(f"[DEBUG] total {len(image_paths)} images to process. Path to the first image: {image_paths[0]}")
 
-        # alloc to each DDP worker
-        image_paths = image_paths[
-            self.accelerator.process_index :: self.accelerator.num_processes
-        ]
 
 
-        for image_path in tqdm(image_paths,
-            disable=not self.accelerator.is_local_main_process,
-        ):
 
-            # prepare dump paths
-            image_name = os.path.basename(image_path)
-            uid = image_name.split(".")[0]
-            subdir_path = os.path.dirname(image_path).replace(omit_prefix, "")
-            subdir_path = (
-                subdir_path[1:] if subdir_path.startswith("/") else subdir_path
-            )
-            print("subdir_path and uid:", subdir_path, uid)
-
-            # setting config
-            motion_seqs_dir = self.cfg.motion_seqs_dir
-            print(f"[DEBUG] motion_seqs_dir: {motion_seqs_dir}")
-            motion_name = os.path.dirname(
-                motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
-            )
-            motion_name = os.path.basename(motion_name)
-            dump_video_path = os.path.join(
-                self.cfg.video_dump,
-                subdir_path,
-                motion_name,
-                f"{uid}.mp4",
-            )
-            dump_image_dir = os.path.join(
-                self.cfg.image_dump,
-                subdir_path,
-            )
-            dump_mesh_dir = os.path.join(
-                self.cfg.mesh_dump,
-                subdir_path,
-            )
-            dump_tmp_dir = os.path.join(self.cfg.image_dump, subdir_path, "tmp_res")
-            os.makedirs(dump_image_dir, exist_ok=True)
-            os.makedirs(dump_tmp_dir, exist_ok=True)
-            os.makedirs(dump_mesh_dir, exist_ok=True)
-            print(f"[DEBUG] dump_video_path: {dump_video_path}")
-            print(f"[DEBUG] dump_image_dir: {dump_image_dir}")
-            print(f"[DEBUG] dump_mesh_dir: {dump_mesh_dir}")
-            print(f"[DEBUG] dump_tmp_dir: {dump_tmp_dir}")
-
-            shape_pose = self.pose_estimator(image_path)
-            print(f"[DEBUG] estimated body ratio: {shape_pose.ratio}")
-            print(f"[DEBUG] estimated body shape parameters: {shape_pose.beta.shape}")
-
-            # Save shape pose beta
-            beta_save_path = Path(self.cfg.save_dir) / "shape_params.npy"
-            np.save(beta_save_path, shape_pose.beta)
-            print(f"[DEBUG] saved shape parameters to {beta_save_path}")
-
-            try:
-                assert shape_pose.ratio>0.4, f"body ratio is too small: {shape_pose.ratio}"
-            except:
-                continue
-
-
-            self.infer_single(
-                image_path,
-                motion_seqs_dir=self.cfg.motion_seqs_dir,
-                motion_img_dir=self.cfg.motion_img_dir,
-                motion_video_read_fps=self.cfg.motion_video_read_fps,
-                export_video=self.cfg.export_video,
-                export_mesh=self.cfg.export_mesh,
-                dump_tmp_dir=dump_tmp_dir,
-                dump_image_dir=dump_image_dir,
-                dump_video_path=dump_video_path,
-                shape_param=shape_pose.beta,
-            )
+        for image_path in tqdm(image_paths):
+            self.infer_single(image_path, motion_seqs_dir=self.cfg.motion_seqs_dir)
