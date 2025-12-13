@@ -1,0 +1,3 @@
+[submodule "submodules/difix3d"]
+	path = submodules/difix3d
+	url = git@github.com:ludekcizinsky/Difix3D.git
