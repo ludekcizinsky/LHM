@@ -32,7 +32,7 @@ MOTION_VIDEO_READ_FPS=30
 EXPORT_VIDEO=True
 
 # inference
-python -m LHM.launch infer.human_lrm model_name=$model_name \
+python inference.py model_name=$model_name \
         image_input=$image_input \
         export_video=$EXPORT_VIDEO \
         motion_seqs_dir=$motion_seqs_dir motion_img_dir=$MOTION_IMG_DIR  \

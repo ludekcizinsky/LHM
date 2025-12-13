@@ -5,16 +5,12 @@
 # @Time          : 2025-03-1 17:30:37
 # @Function      : Inference code for human_lrm model
 
-import argparse
 import os
-import pdb
-import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-from accelerate.logging import get_logger
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm.auto import tqdm
@@ -22,19 +18,10 @@ from tqdm.auto import tqdm
 from engine.pose_estimation.pose_estimator import PoseEstimator
 from engine.SegmentAPI.base import Bbox
 
-# from LHM.utils.model_download_utils import AutoModelQuery
-from LHM.utils.model_download_utils import AutoModelQuery
 
 from rembg import remove
 
-from LHM.datasets.cam_utils import (
-    build_camera_principle,
-    build_camera_standard,
-    create_intrinsics,
-    surrounding_views_linspace,
-)
 from LHM.models.modeling_human_lrm import ModelHumanLRM
-from LHM.runners import REGISTRY_RUNNERS
 from LHM.runners.infer.utils import (
     calc_new_tgt_size_by_aspect,
     center_crop_according_to_mask,
@@ -42,31 +29,11 @@ from LHM.runners.infer.utils import (
     prepare_motion_seqs_human3r,
     resize_image_keepaspect_np,
 )
-from LHM.utils.download_utils import download_extract_tar_from_url, download_from_url
 from LHM.utils.face_detector import FaceDetector
-
-# from LHM.utils.video import images_to_video
-from LHM.utils.ffmpeg_utils import images_to_video
 from LHM.utils.hf_hub import wrap_model_hub
 from LHM.utils.logging import configure_logger
-from LHM.utils.model_card import MODEL_CARD, MODEL_CONFIG
-
-
-def download_geo_files():
-    if not os.path.exists('/scratch/izar/cizinsky/pretrained/dense_sample_points/1_20000.ply'):
-        os.makedirs('/scratch/izar/cizinsky/pretrained/dense_sample_points/', exist_ok=True)
-        download_from_url('https://virutalbuy-public.oss-cn-hangzhou.aliyuncs.com/share/aigc3d/data/LHM/1_20000.ply','/scratch/izar/cizinsky/pretrained/dense_sample_points/')
-
-def prior_check():
-    if not os.path.exists('/scratch/izar/cizinsky/pretrained'):
-        prior_data = MODEL_CARD['prior_model']
-        download_extract_tar_from_url(prior_data)
-
 
 from .base_inferrer import Inferrer
-
-logger = get_logger(__name__)
-
 
 def avaliable_device():
     if torch.cuda.is_available():
@@ -128,25 +95,6 @@ def get_bbox(mask):
     scale_box = box.scale(1.1, width=width, height=height)
     return scale_box
 
-def query_model_name(model_name):
-    if model_name in MODEL_PATH:
-        model_path = MODEL_PATH[model_name]
-        if not os.path.exists(model_path):
-            model_url = MODEL_CARD[model_name]
-            download_extract_tar_from_url(model_url, './')
-    else:
-        model_path = model_name
-    
-    return model_path
-
-
-def query_model_config(model_name):
-    try:
-        model_params = model_name.split('-')[1]
-        
-        return MODEL_CONFIG[model_params] 
-    except:
-        return None
 
 def infer_preprocess_image(
     rgb_path,
@@ -274,97 +222,21 @@ def infer_preprocess_image(
     return rgb, mask, intr
 
 
-def parse_configs():
 
 
-    download_geo_files()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--infer", type=str)
-    parser.add_argument(
-        "--save_dir",
-        type=Path
-    )
-    args, unknown = parser.parse_known_args()
-
-    cfg = OmegaConf.create()
-    cli_cfg = OmegaConf.from_cli(unknown)
-
-    if "export_mesh" not in cli_cfg: 
-        cli_cfg.export_mesh = None
-    if "export_video" not in cli_cfg: 
-        cli_cfg.export_video= None
-
-    query_model = AutoModelQuery()
-
-    # parse from ENV
-    if os.environ.get("APP_INFER") is not None:
-        args.infer = os.environ.get("APP_INFER")
-    if os.environ.get("APP_MODEL_NAME") is not None:
-        model_name = query_model_name(os.environ.get("APP_MODEL_NAME"))
-        cli_cfg.model_name = os.environ.get("APP_MODEL_NAME")
-    else:
-        model_name = cli_cfg.model_name
-        model_path= query_model.query(model_name) 
-        cli_cfg.model_name = model_path 
-
-    model_config = query_model_config(model_name)
-
-    if model_config is not None:
-        cfg_train = OmegaConf.load(model_config)
-        cfg.source_size = cfg_train.dataset.source_image_res
-        try:
-            cfg.src_head_size = cfg_train.dataset.src_head_size
-        except:
-            cfg.src_head_size = 112
-        cfg.render_size = cfg_train.dataset.render_image.high
-        _relative_path = os.path.join(
-            cfg_train.experiment.parent,
-            cfg_train.experiment.child,
-            os.path.basename(cli_cfg.model_name).split("_")[-1],
-        )
-
-        cfg.save_tmp_dump = os.path.join("exps", "save_tmp", _relative_path)
-        cfg.image_dump = os.path.join("exps", "images", _relative_path)
-        cfg.video_dump = os.path.join("exps", "videos", _relative_path)  # output path
-        cfg.mesh_dump = os.path.join("exps", "meshs", _relative_path)  # output path
-
-    if args.infer is not None:
-        cfg_infer = OmegaConf.load(args.infer)
-        cfg.merge_with(cfg_infer)
-        cfg.setdefault(
-            "save_tmp_dump", os.path.join("exps", cli_cfg.model_name, "save_tmp")
-        )
-        cfg.setdefault("image_dump", os.path.join("exps", cli_cfg.model_name, "images"))
-        cfg.setdefault(
-            "video_dump", os.path.join("dumps", cli_cfg.model_name, "videos")
-        )
-        cfg.setdefault("mesh_dump", os.path.join("dumps", cli_cfg.model_name, "meshes"))
-
-    cfg.motion_video_read_fps = 6
-    cfg.merge_with(cli_cfg)
-
-    cfg.setdefault("logger", "INFO")
-
-    assert cfg.model_name is not None, "model_name is required"
-
-    return cfg, cfg_train
-
-
-@REGISTRY_RUNNERS.register("infer.human_lrm")
 class HumanLRMInferrer(Inferrer):
 
     EXP_TYPE: str = "human_lrm_sapdino_bh_sd3_5"
-    # EXP_TYPE: str = "human_lrm_sd3"
 
-    def __init__(self):
+    def __init__(self, cfg):
         super().__init__()
 
-        self.cfg, cfg_train = parse_configs()
+        self.cfg = cfg
         os.makedirs(self.cfg.save_dir, exist_ok=True)
         print("----- Inference with config:")
         print(OmegaConf.to_yaml(self.cfg))
         print("-"*50)
+        quit()
 
         configure_logger(
             stream_level=self.cfg.logger,
@@ -394,107 +266,6 @@ class HumanLRMInferrer(Inferrer):
         model = hf_model_cls.from_pretrained(cfg.model_name)
         return model
 
-    def _default_source_camera(
-        self,
-        dist_to_center: float = 2.0,
-        batch_size: int = 1,
-        device: torch.device = torch.device("cpu"),
-    ):
-        # return: (N, D_cam_raw)
-        canonical_camera_extrinsics = torch.tensor(
-            [
-                [
-                    [1, 0, 0, 0],
-                    [0, 0, -1, -dist_to_center],
-                    [0, 1, 0, 0],
-                ]
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
-        canonical_camera_intrinsics = create_intrinsics(
-            f=0.75,
-            c=0.5,
-            device=device,
-        ).unsqueeze(0)
-        source_camera = build_camera_principle(
-            canonical_camera_extrinsics, canonical_camera_intrinsics
-        )
-        return source_camera.repeat(batch_size, 1)
-
-    def _default_render_cameras(
-        self,
-        n_views: int,
-        batch_size: int = 1,
-        device: torch.device = torch.device("cpu"),
-    ):
-        # return: (N, M, D_cam_render)
-        render_camera_extrinsics = surrounding_views_linspace(
-            n_views=n_views, device=device
-        )
-        render_camera_intrinsics = (
-            create_intrinsics(
-                f=0.75,
-                c=0.5,
-                device=device,
-            )
-            .unsqueeze(0)
-            .repeat(render_camera_extrinsics.shape[0], 1, 1)
-        )
-        render_cameras = build_camera_standard(
-            render_camera_extrinsics, render_camera_intrinsics
-        )
-        return render_cameras.unsqueeze(0).repeat(batch_size, 1, 1)
-
-    def infer_video(
-        self,
-        planes: torch.Tensor,
-        frame_size: int,
-        render_size: int,
-        render_views: int,
-        render_fps: int,
-        dump_video_path: str,
-    ):
-        N = planes.shape[0]
-        render_cameras = self._default_render_cameras(
-            n_views=render_views, batch_size=N, device=self.device
-        )
-        render_anchors = torch.zeros(N, render_cameras.shape[1], 2, device=self.device)
-        render_resolutions = (
-            torch.ones(N, render_cameras.shape[1], 1, device=self.device) * render_size
-        )
-        render_bg_colors = (
-            torch.ones(
-                N, render_cameras.shape[1], 1, device=self.device, dtype=torch.float32
-            )
-            * 1.0
-        )
-
-        frames = []
-        for i in range(0, render_cameras.shape[1], frame_size):
-            frames.append(
-                self.model.synthesizer(
-                    planes=planes,
-                    cameras=render_cameras[:, i : i + frame_size],
-                    anchors=render_anchors[:, i : i + frame_size],
-                    resolutions=render_resolutions[:, i : i + frame_size],
-                    bg_colors=render_bg_colors[:, i : i + frame_size],
-                    region_size=render_size,
-                )
-            )
-        # merge frames
-        frames = {k: torch.cat([r[k] for r in frames], dim=1) for k in frames[0].keys()}
-        # dump
-        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
-        for k, v in frames.items():
-            if k == "images_rgb":
-                images_to_video(
-                    images=v[0],
-                    output_path=dump_video_path,
-                    fps=render_fps,
-                    gradio_codec=self.cfg.app_enabled,
-                )
-
     def crop_face_image(self, image_path):
         rgb = np.array(Image.open(image_path))
         rgb = torch.from_numpy(rgb).permute(2, 0, 1)
@@ -503,107 +274,6 @@ class HumanLRMInferrer(Inferrer):
         head_rgb = head_rgb.permute(1, 2, 0)
         head_rgb = head_rgb.cpu().numpy()
         return head_rgb
-
-    def infer_mesh(
-        self,
-        image_path: str,
-        dump_tmp_dir: str,  
-        dump_mesh_dir: str,
-        shape_param=None,
-    ):
-
-        source_size = self.cfg.source_size
-        aspect_standard = 5.0 / 3
-
-        parsing_mask = self.parsing(image_path)
-
-        # prepare reference image
-        image, _, _ = infer_preprocess_image(
-            image_path,
-            mask=parsing_mask,
-            intr=None,
-            pad_ratio=0,
-            bg_color=1.0,
-            max_tgt_size=896,
-            aspect_standard=aspect_standard,
-            enlarge_ratio=[1.0, 1.0],
-            render_tgt_size=source_size,
-            multiply=14,
-            need_mask=True,
-        )
-        try:
-            src_head_rgb = self.crop_face_image(image_path)
-        except:
-            print("w/o head input!")
-            src_head_rgb = np.zeros((112, 112, 3), dtype=np.uint8)
-
-
-        try:
-            src_head_rgb = cv2.resize(
-                src_head_rgb,
-                dsize=(self.cfg.src_head_size, self.cfg.src_head_size),
-                interpolation=cv2.INTER_AREA,
-            )  # resize to dino size
-        except:
-            src_head_rgb = np.zeros(
-                (self.cfg.src_head_size, self.cfg.src_head_size, 3), dtype=np.uint8
-            )
-        
-
-        src_head_rgb = (
-            torch.from_numpy(src_head_rgb / 255.0).float().permute(2, 0, 1).unsqueeze(0)
-        )  # [1, 3, H, W]
-
-        # save masked image for vis
-        save_ref_img_path = os.path.join(
-            dump_tmp_dir, "refer_" + os.path.basename(image_path)
-        )
-        vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
-            np.uint8
-        )
-        Image.fromarray(vis_ref_img).save(save_ref_img_path)
-
-        device = "cuda"
-        dtype = torch.float32
-        shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
-
-        smplx_params =  dict()
-        # cano pose setting
-        smplx_params['betas'] = shape_param.to(device)
-
-        smplx_params['root_pose'] = torch.zeros(1,1,3).to(device)
-        smplx_params['body_pose'] = torch.zeros(1,1,21, 3).to(device)
-        smplx_params['jaw_pose'] = torch.zeros(1, 1, 3).to(device)
-        smplx_params['leye_pose'] = torch.zeros(1, 1, 3).to(device)
-        smplx_params['reye_pose'] = torch.zeros(1, 1, 3).to(device)
-        smplx_params['lhand_pose'] = torch.zeros(1, 1, 15, 3).to(device)
-        smplx_params['rhand_pose'] = torch.zeros(1, 1, 15, 3).to(device)
-        smplx_params['expr'] = torch.zeros(1, 1, 100).to(device)
-        smplx_params['trans'] = torch.zeros(1, 1, 3).to(device)
-
-        self.model.to(dtype)
-
-        gs_app_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
-            image.unsqueeze(0).to(device, dtype),
-            src_head_rgb.unsqueeze(0).to(device, dtype),
-            None,
-            None,
-            None,
-            None,
-            None,
-            smplx_params={
-                k: v.to(device) for k, v in smplx_params.items()
-            },
-        )
-        smplx_params['transform_mat_neutral_pose'] = transform_mat_neutral_pose
-
-        output_gs = self.model.animation_infer_gs(gs_app_model_list, query_points, smplx_params)
-
-        output_gs_path = '_'.join(os.path.basename(image_path).split('.')[:-1])+'.ply'
-
-        print(f"save mesh to {os.path.join(dump_mesh_dir, output_gs_path)}")
-        output_gs.save_ply(os.path.join(dump_mesh_dir, output_gs_path))
-
 
     def infer_single(
         self,
@@ -620,13 +290,6 @@ class HumanLRMInferrer(Inferrer):
     ):
 
         source_size = self.cfg.source_size
-        render_size = self.cfg.render_size
-        # render_views = self.cfg.render_views
-        render_fps = self.cfg.render_fps
-        # mesh_size = self.cfg.mesh_size
-        # mesh_thres = self.cfg.mesh_thres
-        # frame_size = self.cfg.frame_size
-        # source_cam_dist = self.cfg.source_cam_dist if source_cam_dist is None else source_cam_dist
         aspect_standard = 5.0 / 3
         motion_img_need_mask = self.cfg.get("motion_img_need_mask", False)  # False
         vis_motion = self.cfg.get("vis_motion", False)  # False
@@ -839,25 +502,16 @@ class HumanLRMInferrer(Inferrer):
             except:
                 continue
 
-            if self.cfg.export_mesh is not None:
-                self.infer_mesh(
-                    image_path,
-                    dump_tmp_dir=dump_tmp_dir,
-                    dump_mesh_dir=dump_mesh_dir,
-                    shape_param=shape_pose.beta,
-                )
-            else:
-                self.infer_single(
-                    image_path,
-                    motion_seqs_dir=self.cfg.motion_seqs_dir,
-                    motion_img_dir=self.cfg.motion_img_dir,
-                    motion_video_read_fps=self.cfg.motion_video_read_fps,
-                    export_video=self.cfg.export_video,
-                    export_mesh=self.cfg.export_mesh,
-                    dump_tmp_dir=dump_tmp_dir,
-                    dump_image_dir=dump_image_dir,
-                    dump_video_path=dump_video_path,
-                    shape_param=shape_pose.beta,
-                )
 
-
+            self.infer_single(
+                image_path,
+                motion_seqs_dir=self.cfg.motion_seqs_dir,
+                motion_img_dir=self.cfg.motion_img_dir,
+                motion_video_read_fps=self.cfg.motion_video_read_fps,
+                export_video=self.cfg.export_video,
+                export_mesh=self.cfg.export_mesh,
+                dump_tmp_dir=dump_tmp_dir,
+                dump_image_dir=dump_image_dir,
+                dump_video_path=dump_video_path,
+                shape_param=shape_pose.beta,
+            )
