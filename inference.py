@@ -64,4 +64,4 @@ def parse_configs():
 if __name__ == "__main__":
     cfg = parse_configs()
     inferrer = HumanLRMInferrer(cfg)
-    inferrer.run()
+    inferrer.infer()

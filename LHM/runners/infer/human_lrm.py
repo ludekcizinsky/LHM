@@ -373,6 +373,8 @@ class HumanLRMInferrer(Inferrer):
         gs_model_save_path = save_dir_root / f"{shape_params_source}_gs.pt"
         torch.save(gs_model_list[0], gs_model_save_path)
 
+        return gs_model_list[0]
+
     def infer(self):
         
         # Inference per person
