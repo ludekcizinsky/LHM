@@ -2,7 +2,6 @@ einops
 roma
 accelerate
 smplx
-chumpy
 basicsr==1.4.2
 decord==0.6.0
 diffusers==0.32.0

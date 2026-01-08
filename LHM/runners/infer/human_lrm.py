@@ -280,8 +280,8 @@ class HumanLRMInferrer(Inferrer):
         assert len(self.image_paths) == len(self.estimated_shape_params), "Number of images and shape params do not match"
 
         # -- Hi4D GT shape params
-        if self.cfg.hi4d_gt_root_dir is not None:
-            gt_smplx_params_dir = Path(self.cfg.hi4d_gt_root_dir) / "smplx"
+        gt_smplx_params_dir = Path(self.cfg.hi4d_gt_root_dir) / "smplx"
+        if self.cfg.hi4d_gt_root_dir is not None and gt_smplx_params_dir.exists():
             first_frame_name = sorted(os.listdir(gt_smplx_params_dir))[0]
             gt_smplx_params_path = gt_smplx_params_dir / first_frame_name
             params = np.load(gt_smplx_params_path)
