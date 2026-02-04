@@ -20,15 +20,11 @@ def parse_configs():
     # Parse cli arguments
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--output_dir",
+        "--scene_dir",
         type=Path
     )
     parser.add_argument(
-        "--hi4d_gt_root_dir",
-        type=Path
-    )
-    parser.add_argument(
-        "--input_image_id",
+        "--input_image_idx",
         type=int
     )
     args, unknown = parser.parse_known_args()

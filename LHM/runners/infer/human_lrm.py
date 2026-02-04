@@ -237,7 +237,7 @@ class HumanLRMInferrer(Inferrer):
 
         # Config setup
         self.cfg = cfg
-        self.output_dir = Path(cfg.output_dir)
+        self.output_dir = Path(cfg.scene_dir)
         self.save_dir = self.output_dir / "canon_3dgs_lhm"
         os.makedirs(self.save_dir, exist_ok=True)
         print("\n--- Inference with config:")
@@ -256,40 +256,97 @@ class HumanLRMInferrer(Inferrer):
 
 
     def _load_inference_inputs(self):
+
+        # Get person ids based on individual masks
+        images_root = self.output_dir / "images"
+        cam_dirs = [p for p in images_root.iterdir() if p.is_dir()]
+        if len(cam_dirs) != 1:
+            raise ValueError(
+                f"Expected exactly one camera folder under {images_root}, found {len(cam_dirs)}"
+            )
+        cam_id = cam_dirs[0].name
+
+        seg_root = self.output_dir / "seg" / "img_seg_mask" / cam_id
+        if not seg_root.exists():
+            raise FileNotFoundError(f"Segmentation folder not found: {seg_root}")
+
+        person_ids = []
+        for p in seg_root.iterdir():
+            if not p.is_dir():
+                continue
+            if p.name == "all":
+                continue
+            if p.name.isdigit():
+                person_ids.append(int(p.name))
+        person_ids = sorted(person_ids)
+        if len(person_ids) == 0:
+            raise ValueError(f"No per-person masks found under {seg_root}")
+
+        # Resolve the reference frame by index into the sorted image list
+        image_dir = cam_dirs[0]
+        image_paths = list(image_dir.glob("*.jpg"))
+        if not image_paths:
+            image_paths = list(image_dir.glob("*.png"))
+        if not image_paths:
+            raise FileNotFoundError(f"No image frames found in {image_dir}")
+        try:
+            image_paths.sort(key=lambda p: int(p.stem))
+        except Exception:
+            image_paths.sort()
+
+        if self.cfg.input_image_idx < 0 or self.cfg.input_image_idx >= len(image_paths):
+            raise IndexError(
+                f"input_image_idx={self.cfg.input_image_idx} is out of range for {len(image_paths)} frames"
+            )
+        frame_path = image_paths[self.cfg.input_image_idx]
+        frame_stem = frame_path.stem
+
         # Load inputs for the inference
         # - Masked images
-        masked_images_dir = self.output_dir / "masked_images"
-        person_ids = sorted([pid for pid in os.listdir(masked_images_dir) if pid.isdigit()])
         self.image_paths = []
+        lhm_dir = self.output_dir / "misc" / "lhm"
+        lhm_dir.mkdir(parents=True, exist_ok=True)
+
+        rgb = cv2.imread(str(frame_path))
+        if rgb is None:
+            raise RuntimeError(f"Failed to read image: {frame_path}")
+
         for pid in person_ids:
-            image_path = masked_images_dir / pid / f"{self.cfg.input_image_id:04d}.png"
-            assert image_path.exists(), f"Image path does not exist: {image_path}"
-            self.image_paths.append(image_path)
+            mask_path = seg_root / f"{pid}" / f"{frame_stem}.png"
+            if not mask_path.exists():
+                raise FileNotFoundError(f"Mask not found: {mask_path}")
+
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise RuntimeError(f"Failed to read mask: {mask_path}")
+            if mask.shape[:2] != rgb.shape[:2]:
+                mask = cv2.resize(mask, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+            mask_bool = mask > 0
+            masked_rgb = np.zeros_like(rgb)
+            masked_rgb[mask_bool] = rgb[mask_bool]
+
+            masked_path = lhm_dir / f"person_{pid:02d}_{frame_stem}.png"
+            cv2.imwrite(str(masked_path), masked_rgb)
+            self.image_paths.append(str(masked_path))
 
         # - Shape params
-        # -- Estimated from human3r
-        shape_params_dir = self.output_dir / "motion_human3r"
-        self.estimated_shape_params = []
-        for pid in person_ids:
-            shaper_params_path = shape_params_dir / pid / "smplx_params" / "00000.json"
-            assert shaper_params_path.exists(), f"Shape params path does not exist: {shaper_params_path}"
-            with open(shaper_params_path, 'r') as f:
-                smplx_params = json.load(f)
-                betas = np.array(smplx_params['betas']) # [10,]
-                self.estimated_shape_params.append(betas)
-        assert len(self.image_paths) == len(self.estimated_shape_params), "Number of images and shape params do not match"
+        self.estimated_shape_params = [] # one array per person, each array is [10,]
+        smplx_path = self.output_dir / "smplx" / f"{frame_stem}.npz"
+        if not smplx_path.exists():
+            raise FileNotFoundError(f"SMPL-X file not found: {smplx_path}")
+        with np.load(smplx_path) as smplx_data:
+            if "betas" not in smplx_data:
+                raise KeyError(f"'betas' not found in SMPL-X file: {smplx_path}")
+            betas = smplx_data["betas"]
 
-        # -- Hi4D GT shape params
-        gt_smplx_params_dir = Path(self.cfg.hi4d_gt_root_dir) / "smplx"
-        if self.cfg.hi4d_gt_root_dir is not None and gt_smplx_params_dir.exists():
-            first_frame_name = sorted(os.listdir(gt_smplx_params_dir))[0]
-            gt_smplx_params_path = gt_smplx_params_dir / first_frame_name
-            params = np.load(gt_smplx_params_path)
-            betas = params['betas'] # [2, 10]
-            self.hi4d_gt_shape_params = [betas[i] for i in range(betas.shape[0])]
-            assert len(self.image_paths) == len(self.hi4d_gt_shape_params), "Number of images and shape params do not match"
-        else:
-            self.hi4d_gt_shape_params = list()
+        for pid in person_ids:
+            if pid >= betas.shape[0]:
+                raise IndexError(
+                    f"Person id {pid} out of range for betas shape {betas.shape} in {smplx_path}"
+                )
+            self.estimated_shape_params.append(betas[pid].astype(np.float32))
+
 
     def _build_model(self, cfg):
         from LHM.models import model_dict
@@ -312,7 +369,6 @@ class HumanLRMInferrer(Inferrer):
         self,
         image_path: str,
         shape_param: np.ndarray,
-        shape_params_source: str = "estimated",
         person_id: int = 0,
     ):
         # create save dir
@@ -341,7 +397,7 @@ class HumanLRMInferrer(Inferrer):
         )
 
         # - visualise and save
-        image_save_path = save_dir_root / f"{shape_params_source}_input_image.png"
+        image_save_path = save_dir_root / f"input_image.png"
         save_image(image, image_save_path)
 
         # prepare head image
@@ -357,7 +413,7 @@ class HumanLRMInferrer(Inferrer):
         )  # [1, 3, H, W]
 
         # - visualise and save
-        head_image_save_path = save_dir_root / f"{shape_params_source}_input_head.png"
+        head_image_save_path = save_dir_root / f"input_head.png"
         save_image(src_head_rgb, head_image_save_path)
 
 
@@ -371,7 +427,7 @@ class HumanLRMInferrer(Inferrer):
             src_head_rgb.unsqueeze(0).to(device, dtype),
             smplx_params={"betas": shape_param.to(device)}
         )
-        gs_model_save_path = save_dir_root / f"{shape_params_source}_gs.pt"
+        gs_model_save_path = save_dir_root / f"gs.pt"
         torch.save(gs_model_list[0], gs_model_save_path)
 
         return gs_model_list[0]
@@ -381,23 +437,15 @@ class HumanLRMInferrer(Inferrer):
         # Inference per person
         n_images = len(self.image_paths)
         estimated_canon_3dgs = []
-        hi4d_gt_canon_3dgs = []
         for pid in range(n_images):
             print(f"\n--- Inference for person {pid+1} / {n_images}")
             person_image_path = self.image_paths[pid]
             person_estimated_shape_params = self.estimated_shape_params[pid]
-            canon_gs = self.infer_single(person_image_path, person_estimated_shape_params, "human3r", pid)
+            canon_gs = self.infer_single(person_image_path, person_estimated_shape_params, pid)
             estimated_canon_3dgs.append(canon_gs)
 
-            if len(self.hi4d_gt_shape_params) > 0:
-                person_gt_shape_params = self.hi4d_gt_shape_params[pid]
-                canon_gs = self.infer_single(person_image_path, person_gt_shape_params, "hi4d", pid)
-                hi4d_gt_canon_3dgs.append(canon_gs)
         
         # Joined the outputs per person into a single dir
         save_dir_root = self.save_dir / f"union"
         os.makedirs(save_dir_root, exist_ok=True)
-        torch.save(estimated_canon_3dgs, save_dir_root / "human3r_gs.pt")
-
-        if len(hi4d_gt_canon_3dgs) > 0:
-            torch.save(hi4d_gt_canon_3dgs, save_dir_root / "hi4d_gs.pt")
+        torch.save(estimated_canon_3dgs, save_dir_root / "gs.pt")
